@@ -336,6 +336,28 @@ The harness validates the remote `chainId` against the configured network before
 
 Do not point multiple chain variables to the same fork URL unless you have explicitly verified the underlying chain for that fork.
 
+## Tenderly-Only Runtime Mode
+
+The project can run in a Tenderly-only mode without depending on Alchemy or Infura for the active RPC path.
+
+Enable it with:
+
+- `USE_TENDERLY_RPC_ONLY=true`
+
+In this mode:
+
+- `rpc_urls()` is sourced from the network-specific `TENDERLY_FORK_URL_*`
+- `ALCHEMY_KEY` is no longer required for the active RPC path
+- replay, benchmarking, payload building, and direct chain reads use the fork URL as the primary endpoint
+- live mempool streaming still requires an explicit `MEMPOOL_WS_URL` if you want websocket-driven pending-transaction runtime behavior
+
+This mode is intended for:
+
+- replay and decision calibration
+- runtime validation against real forked liquidity
+- executor integration against forked state
+- isolated chain-specific testing without external RPC rotation
+
 ## Benchmarking
 
 The project also includes a network benchmark mode for infrastructure validation.
@@ -383,6 +405,7 @@ Below is the core environment surface used by the active runtime.
 
 - `NETWORK`
 - `ALLOW_SEND`
+- `USE_TENDERLY_RPC_ONLY`
 - `CHAIN_ID`
 - `DASHBOARD_ADDR`
 - `MEMPOOL_WS_URL`
