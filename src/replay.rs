@@ -1,8 +1,8 @@
 use crate::config::Config;
-use crate::mev::adaptive::{AdaptivePolicy, AdaptiveQuoteInput, PreflightInput};
+use crate::mev::adaptive::{AdaptivePolicy, AdaptiveQuoteInput, ContextSignal, PreflightInput};
 use crate::mev::opportunity::wei_to_eth_f64;
 use crate::mev::runtime::{
-    build_v2_payload, decode_relevant_swap, fast_preflight_gate, passes_ev_gate,
+    build_payload, decode_relevant_swap, fast_preflight_gate, passes_ev_gate,
     passes_quality_gate,
 };
 use crate::storage::Storage;
@@ -58,6 +58,7 @@ pub async fn maybe_run_replay_harness(
     );
 
     let mut report = ReplayReport::default();
+    let mut decision_rows = Vec::new();
     let relay_paths = if config.builder_relays.is_empty() {
         vec![format!("rpc://{}", config.network)]
     } else {
@@ -73,6 +74,16 @@ pub async fn maybe_run_replay_harness(
             report.bump("decode_reject");
             continue;
         };
+        let hour_utc = case.hour_utc.unwrap_or(Utc::now().hour() as u8);
+        let context_signal = if let Ok(model) = adaptive.lock() {
+            model.context_signal(signal.router, hour_utc)
+        } else {
+            ContextSignal {
+                priority_score: 0.50,
+                toxicity_score: 0.50,
+                samples: 0,
+            }
+        };
 
         let gas_price = tx.max_fee_per_gas.or(tx.gas_price).unwrap_or_default();
         if gas_price.is_zero() {
@@ -80,9 +91,21 @@ pub async fn maybe_run_replay_harness(
             continue;
         }
 
-        let fast_gate = fast_preflight_gate(&signal, gas_price, min_large_swap_wei, &config);
+        let fast_gate = fast_preflight_gate(
+            &signal,
+            gas_price,
+            min_large_swap_wei,
+            &config,
+            context_signal,
+        );
         if !fast_gate.should_continue {
+            report.observe_labeled_outcome(false, &case);
             report.bump_reason("fast_preflight", fast_gate.reject_reason.unwrap_or("reject"));
+            decision_rows.push(ReplayDecisionRow::reject(
+                &case,
+                "fast_preflight",
+                fast_gate.reject_reason.unwrap_or("reject"),
+            ));
             continue;
         }
 
@@ -107,13 +130,28 @@ pub async fn maybe_run_replay_harness(
             continue;
         };
         if !preflight.should_continue {
+            report.observe_labeled_outcome(false, &case);
             report.bump_reason("preflight", preflight.reject_reason.unwrap_or("reject"));
+            decision_rows.push(ReplayDecisionRow::reject(
+                &case,
+                "preflight",
+                preflight.reject_reason.unwrap_or("reject"),
+            ));
             continue;
         }
 
-        let Some(payload) = build_v2_payload(provider.clone(), &config, &signal, gas_price).await
+        let Some(payload) = build_payload(
+            provider.clone(),
+            &config,
+            &signal,
+            gas_price,
+            context_signal,
+        )
+        .await
         else {
+            report.observe_labeled_outcome(false, &case);
             report.bump("payload_build_reject");
+            decision_rows.push(ReplayDecisionRow::reject(&case, "payload", "payload_build_reject"));
             continue;
         };
         report.payload_built += 1;
@@ -125,7 +163,9 @@ pub async fn maybe_run_replay_harness(
             std::time::Duration::from_millis(lookup_latency_ms as u64),
             min_profit_wei,
         ) {
+            report.observe_labeled_outcome(false, &case);
             report.bump("ev_gate_reject");
+            decision_rows.push(ReplayDecisionRow::reject(&case, "ev_gate", "ev_gate_reject"));
             continue;
         }
 
@@ -134,7 +174,13 @@ pub async fn maybe_run_replay_harness(
             .saturating_mul(U256::from(config.mev.gas_safety_margin_bps))
             / U256::from(10_000u64);
         if !passes_quality_gate(&config, &payload, execution_cost_wei) {
+            report.observe_labeled_outcome(false, &case);
             report.bump("quality_gate_reject");
+            decision_rows.push(ReplayDecisionRow::reject(
+                &case,
+                "quality_gate",
+                "quality_gate_reject",
+            ));
             continue;
         }
 
@@ -143,7 +189,9 @@ pub async fn maybe_run_replay_harness(
                 AdaptiveQuoteInput {
                     cluster,
                     pair: payload.pair,
-                    hour_utc: case.hour_utc.unwrap_or(Utc::now().hour() as u8),
+                    hour_utc,
+                    context_priority_score: context_signal.priority_score,
+                    context_toxicity_score: context_signal.toxicity_score,
                     expected_profit_wei: payload.expected_profit_wei,
                     execution_cost_wei,
                     gas_price_wei: gas_price,
@@ -160,14 +208,23 @@ pub async fn maybe_run_replay_harness(
         };
 
         if !quote.should_execute {
+            report.observe_labeled_outcome(false, &case);
             report.bump_reason("adaptive", quote.reject_reason.unwrap_or("reject"));
+            decision_rows.push(ReplayDecisionRow::reject(
+                &case,
+                "adaptive",
+                quote.reject_reason.unwrap_or("reject"),
+            ));
             continue;
         }
 
         report.execute_candidates += 1;
+        report.observe_labeled_outcome(true, &case);
+        decision_rows.push(ReplayDecisionRow::execute(&case, payload.expected_profit_wei, &quote));
     }
 
     print_report(&config, &report);
+    maybe_write_decisions(&decision_rows)?;
     Ok(true)
 }
 
@@ -181,6 +238,8 @@ struct ReplayInputCase {
     max_fee_per_gas_wei: Option<String>,
     lookup_latency_ms: Option<f64>,
     hour_utc: Option<u8>,
+    known_outcome: Option<String>,
+    realized_profit_eth: Option<f64>,
 }
 
 #[derive(Default)]
@@ -188,6 +247,10 @@ struct ReplayReport {
     total: u64,
     payload_built: u64,
     execute_candidates: u64,
+    true_positive: u64,
+    false_positive: u64,
+    true_negative: u64,
+    false_negative: u64,
     reasons: BTreeMap<String, u64>,
 }
 
@@ -198,6 +261,62 @@ impl ReplayReport {
 
     fn bump_reason(&mut self, stage: &str, reason: &str) {
         self.bump(&format!("{stage}:{reason}"));
+    }
+
+    fn observe_labeled_outcome(&mut self, executed: bool, case: &ReplayInputCase) {
+        let profitable = case
+            .known_outcome
+            .as_deref()
+            .map(is_positive_outcome)
+            .unwrap_or(false)
+            || case.realized_profit_eth.unwrap_or(0.0) > 0.0;
+        match (executed, profitable) {
+            (true, true) => self.true_positive += 1,
+            (true, false) => self.false_positive += 1,
+            (false, true) => self.false_negative += 1,
+            (false, false) => self.true_negative += 1,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct ReplayDecisionRow {
+    tx_hash: String,
+    stage: String,
+    decision: String,
+    reason: String,
+    expected_profit_eth: f64,
+    ev_real_usd: f64,
+    threshold_usd: f64,
+}
+
+impl ReplayDecisionRow {
+    fn reject(case: &ReplayInputCase, stage: &str, reason: &str) -> Self {
+        Self {
+            tx_hash: case.tx_hash.clone().unwrap_or_else(|| "synthetic".to_string()),
+            stage: stage.to_string(),
+            decision: "reject".to_string(),
+            reason: reason.to_string(),
+            expected_profit_eth: 0.0,
+            ev_real_usd: 0.0,
+            threshold_usd: 0.0,
+        }
+    }
+
+    fn execute(
+        case: &ReplayInputCase,
+        expected_profit_wei: U256,
+        quote: &crate::mev::adaptive::AdaptiveQuote,
+    ) -> Self {
+        Self {
+            tx_hash: case.tx_hash.clone().unwrap_or_else(|| "synthetic".to_string()),
+            stage: "adaptive".to_string(),
+            decision: "execute".to_string(),
+            reason: "passed".to_string(),
+            expected_profit_eth: wei_to_eth_f64(expected_profit_wei),
+            ev_real_usd: quote.ev_real_usd,
+            threshold_usd: quote.threshold_dynamic_usd,
+        }
     }
 }
 
@@ -267,6 +386,26 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn maybe_write_decisions(rows: &[ReplayDecisionRow]) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(path) = env::var("REPLAY_OUTPUT_PATH")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let mut out = String::new();
+    for row in rows {
+        out.push_str(&serde_json::to_string(row)?);
+        out.push('\n');
+    }
+    fs::write(path, out)?;
+    Ok(())
+}
+
+fn is_positive_outcome(outcome: &str) -> bool {
+    matches!(outcome, "included_success" | "execute" | "profitable")
+}
+
 fn print_report(config: &Config, report: &ReplayReport) {
     println!("=== Replay Harness ===");
     println!("Network: {}", config.network);
@@ -281,6 +420,14 @@ fn print_report(config: &Config, report: &ReplayReport) {
             report.execute_candidates as f64 * 100.0 / report.total as f64
         }
     );
+    let labeled_total = report.true_positive + report.false_positive + report.true_negative + report.false_negative;
+    if labeled_total > 0 {
+        println!("Labeled outcomes:");
+        println!("  true_positive -> {}", report.true_positive);
+        println!("  false_positive -> {}", report.false_positive);
+        println!("  true_negative -> {}", report.true_negative);
+        println!("  false_negative -> {}", report.false_negative);
+    }
     println!("Reject breakdown:");
     for (reason, count) in &report.reasons {
         println!("  {} -> {}", reason, count);
