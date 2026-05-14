@@ -289,6 +289,17 @@ Examples:
 
 The dashboard is intended for operational inspection, not public hosting.
 
+The static operational frontend lives under:
+
+- `web/static/index.html`
+- `web/static/styles.css`
+- `web/static/js/app.js`
+- `web/static/js/data.js`
+- `web/static/js/fx.js`
+- `web/static/js/radar.js`
+
+This frontend is part of the active project surface. It is focused on execution visibility, relay quality, treasury state, reject reasons, and live event inspection.
+
 ## Environment Variables
 
 Below is the core environment surface used by the active runtime.
@@ -417,6 +428,16 @@ The active project lives in this directory.
 ```text
 fee-extraction/
   Cargo.toml
+  web/
+    static/
+      index.html
+      styles.css
+      favicon.svg
+      js/
+        app.js
+        data.js
+        fx.js
+        radar.js
   src/
     main.rs
     benchmark.rs
