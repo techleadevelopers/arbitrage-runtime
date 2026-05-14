@@ -1,8 +1,16 @@
-use crate::mev::execution::contract_encoder::{encode_start_v2_flash_swap, EncodedSwapStep};
+use crate::mev::execution::contract_encoder::{
+    encode_start_v2_flash_swap, encode_start_v3_flash_swap, EncodedSwapStep, EncodedV3SwapStep,
+};
 use ethers::types::{Address, Bytes, U256};
 
 #[derive(Debug, Clone)]
 pub struct V2FlashSwapCall {
+    pub target_contract: Address,
+    pub calldata: Bytes,
+}
+
+#[derive(Debug, Clone)]
+pub struct V3FlashSwapCall {
     pub target_contract: Address,
     pub calldata: Bytes,
 }
@@ -22,6 +30,30 @@ pub fn build_v2_flashswap_call(
             pair,
             borrow_token,
             borrow_amount,
+            min_profit,
+            profit_token,
+            steps,
+        ),
+    }
+}
+
+pub fn build_v3_flashswap_call(
+    executor: Address,
+    pool: Address,
+    borrow_token: Address,
+    borrow_amount: U256,
+    fee_tier: u32,
+    min_profit: U256,
+    profit_token: Address,
+    steps: &[EncodedV3SwapStep],
+) -> V3FlashSwapCall {
+    V3FlashSwapCall {
+        target_contract: executor,
+        calldata: encode_start_v3_flash_swap(
+            pool,
+            borrow_token,
+            borrow_amount,
+            fee_tier,
             min_profit,
             profit_token,
             steps,
