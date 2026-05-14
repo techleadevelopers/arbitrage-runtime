@@ -336,28 +336,6 @@ The harness validates the remote `chainId` against the configured network before
 
 Do not point multiple chain variables to the same fork URL unless you have explicitly verified the underlying chain for that fork.
 
-## Tenderly-Only Runtime Mode
-
-The project can run in a Tenderly-only mode without depending on Alchemy or Infura for the active RPC path.
-
-Enable it with:
-
-- `USE_TENDERLY_RPC_ONLY=true`
-
-In this mode:
-
-- `rpc_urls()` is sourced from the network-specific `TENDERLY_FORK_URL_*`
-- `ALCHEMY_KEY` is no longer required for the active RPC path
-- replay, benchmarking, payload building, and direct chain reads use the fork URL as the primary endpoint
-- live mempool streaming still requires an explicit `MEMPOOL_WS_URL` if you want websocket-driven pending-transaction runtime behavior
-
-This mode is intended for:
-
-- replay and decision calibration
-- runtime validation against real forked liquidity
-- executor integration against forked state
-- isolated chain-specific testing without external RPC rotation
-
 ## Recommended Operational Split
 
 For the current project posture, the recommended split is:
@@ -392,7 +370,29 @@ In other words:
 
 - paid RPC remains the production center
 - Tenderly remains the fork/replay layer
-- `USE_TENDERLY_RPC_ONLY=true` stays available as an optional mode, not the default operating model
+- `USE_TENDERLY_RPC_ONLY=true` stays available only as an auxiliary mode, not the default operating model
+
+## Optional Tenderly-Only Mode
+
+The project can also run in a Tenderly-only mode without depending on Alchemy or Infura for the active RPC path.
+
+Enable it with:
+
+- `USE_TENDERLY_RPC_ONLY=true`
+
+In this mode:
+
+- `rpc_urls()` is sourced from the network-specific `TENDERLY_FORK_URL_*`
+- `ALCHEMY_KEY` is no longer required for the active RPC path
+- replay, benchmarking, payload building, and direct chain reads use the fork URL as the primary endpoint
+- live mempool streaming still requires an explicit `MEMPOOL_WS_URL` if you want websocket-driven pending-transaction runtime behavior
+
+This mode is useful for:
+
+- replay and decision calibration
+- runtime validation against real forked liquidity
+- executor integration against forked state
+- isolated chain-specific testing without external RPC rotation
 
 ## Benchmarking
 
