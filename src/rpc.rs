@@ -5,6 +5,7 @@ use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -36,6 +37,14 @@ struct RpcEndpointState {
     avg_latency: Option<Duration>,
     last_block: Option<u64>,
     last_block_at: Option<Instant>,
+    recent_burst_reservations: VecDeque<BurstReservation>,
+    last_selected_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BurstReservation {
+    reserved_at: Instant,
+    units: u32,
 }
 
 #[derive(Debug)]
@@ -88,6 +97,8 @@ pub struct RpcEndpointSnapshot {
     pub avg_latency_ms: Option<u128>,
     pub last_block: Option<u64>,
     pub block_age_secs: Option<u64>,
+    pub recent_burst_units: u32,
+    pub burst_capacity_units: u32,
 }
 
 impl RpcFleet {
@@ -97,7 +108,7 @@ impl RpcFleet {
         for (idx, (name, url)) in config.rpc_urls().into_iter().enumerate() {
             let kind = if name.starts_with("tenderly-") {
                 RpcKind::Tenderly
-            } else if idx == 0 {
+            } else if name.starts_with("alchemy-") {
                 RpcKind::Alchemy
             } else {
                 RpcKind::Infura
@@ -120,6 +131,8 @@ impl RpcFleet {
                     avg_latency: None,
                     last_block: None,
                     last_block_at: None,
+                    recent_burst_reservations: VecDeque::new(),
+                    last_selected_at: None,
                 }),
             }));
         }
@@ -183,6 +196,8 @@ impl RpcFleet {
                     block_age_secs: state
                         .last_block_at
                         .map(|instant| instant.elapsed().as_secs()),
+                    recent_burst_units: burst_load_units(&state, now),
+                    burst_capacity_units: endpoint_burst_capacity_units(endpoint.kind, false),
                 }
             })
             .collect()
@@ -210,6 +225,7 @@ impl RpcFleet {
         let top_n = candidates.len().min(3);
         let rotation = self.rotation.fetch_add(1, AtomicOrdering::Relaxed);
         let selected = &candidates[rotation % top_n].0;
+        self.reserve_burst_units(selected, endpoint_burst_cost_units(selected.kind, false), now);
 
         self.to_handle(selected)
     }
@@ -236,7 +252,9 @@ impl RpcFleet {
         }
 
         candidates.sort_by(|left, right| left.1.partial_cmp(&right.1).unwrap_or(Ordering::Equal));
-        self.to_handle(&candidates[0].0)
+        let selected = &candidates[0].0;
+        self.reserve_burst_units(selected, endpoint_burst_cost_units(selected.kind, true), now);
+        self.to_handle(selected)
     }
 
     fn endpoint_score(
@@ -258,6 +276,9 @@ impl RpcFleet {
             return None;
         }
 
+        let burst_capacity_units = endpoint_burst_capacity_units(endpoint.kind, send_mode);
+        let recent_burst_units = burst_load_units(&state, now);
+        let burst_ratio = recent_burst_units as f64 / burst_capacity_units.max(1) as f64;
         let latency_ms = state
             .avg_latency
             .map(|value| value.as_secs_f64() * 1000.0)
@@ -284,6 +305,22 @@ impl RpcFleet {
             } else {
                 0.0
             };
+        let burst_penalty = if burst_ratio >= 1.0 {
+            25_000.0 + (burst_ratio - 1.0) * 8_000.0
+        } else {
+            burst_ratio.powf(2.2) * 2_200.0
+        };
+        let recency_penalty = state
+            .last_selected_at
+            .map(|last| {
+                let elapsed_ms = now.saturating_duration_since(last).as_millis() as f64;
+                if elapsed_ms < 180.0 {
+                    (180.0 - elapsed_ms) * 2.4
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
 
         Some((
             endpoint.clone(),
@@ -292,6 +329,8 @@ impl RpcFleet {
                 + rate_limit_penalty
                 + stale_penalty
                 + infura_rate_limited_penalty
+                + burst_penalty
+                + recency_penalty
                 + kind_bias,
         ))
     }
@@ -337,6 +376,22 @@ impl RpcFleet {
         cache.updated_at = Instant::now();
         cache.read_scores = read_scores;
         cache.send_scores = send_scores;
+    }
+
+    fn reserve_burst_units(&self, endpoint: &Arc<RpcEndpoint>, units: u32, now: Instant) {
+        let mut state = endpoint.state.lock().expect("rpc endpoint state lock");
+        prune_burst_reservations(&mut state, now);
+        state.recent_burst_reservations.push_back(BurstReservation {
+            reserved_at: now,
+            units,
+        });
+        state.last_selected_at = Some(now);
+
+        let send_capacity = endpoint_burst_capacity_units(endpoint.kind, true);
+        let recent_send_units = burst_load_units(&state, now);
+        if recent_send_units >= send_capacity.saturating_mul(2) {
+            state.cooldown_until = Some(now + Duration::from_millis(900));
+        }
     }
 
     fn to_handle(&self, endpoint: &Arc<RpcEndpoint>) -> RpcHandle {
@@ -415,4 +470,49 @@ fn parse_hex_u256(value: &str) -> Result<U256, String> {
         return Ok(U256::zero());
     }
     U256::from_str_radix(trimmed, 16).map_err(|err| err.to_string())
+}
+
+const BURST_WINDOW_MS: u64 = 1_200;
+
+fn prune_burst_reservations(state: &mut RpcEndpointState, now: Instant) {
+    while matches!(
+        state.recent_burst_reservations.front(),
+        Some(item) if now.saturating_duration_since(item.reserved_at) > Duration::from_millis(BURST_WINDOW_MS)
+    ) {
+        state.recent_burst_reservations.pop_front();
+    }
+}
+
+fn burst_load_units(state: &RpcEndpointState, now: Instant) -> u32 {
+    state
+        .recent_burst_reservations
+        .iter()
+        .filter(|item| {
+            now.saturating_duration_since(item.reserved_at)
+                <= Duration::from_millis(BURST_WINDOW_MS)
+        })
+        .map(|item| item.units)
+        .sum()
+}
+
+fn endpoint_burst_capacity_units(kind: RpcKind, send_mode: bool) -> u32 {
+    match (kind, send_mode) {
+        (RpcKind::Alchemy, false) => 24,
+        (RpcKind::Alchemy, true) => 18,
+        (RpcKind::Infura, false) => 18,
+        (RpcKind::Infura, true) => 12,
+        (RpcKind::Tenderly, false) => 10,
+        (RpcKind::Tenderly, true) => 8,
+    }
+}
+
+fn endpoint_burst_cost_units(kind: RpcKind, send_mode: bool) -> u32 {
+    match (kind, send_mode) {
+        (RpcKind::Alchemy, false) => 1,
+        (RpcKind::Alchemy, true) => 7,
+        (RpcKind::Infura, false) => 1,
+        (RpcKind::Infura, true) => 6,
+        (RpcKind::Tenderly, false) => 2,
+        (RpcKind::Tenderly, true) => 8,
+    }
 }
