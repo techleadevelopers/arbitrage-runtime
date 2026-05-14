@@ -5,6 +5,8 @@ import {IArbitrageRuntimeExecutor} from "../interfaces/IArbitrageRuntimeExecutor
 
 interface IERC20Minimal {
     function balanceOf(address owner) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 value) external returns (bool);
     function transfer(address to, uint256 value) external returns (bool);
 }
 
@@ -24,6 +26,28 @@ interface IUniswapV3PoolLike {
         uint160 sqrtPriceLimitX96,
         bytes calldata data
     ) external returns (int256 amount0, int256 amount1);
+}
+
+interface IUniswapV2RouterLike {
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+}
+
+interface IUniswapV3RouterLike {
+    struct ExactInputParams {
+        bytes path;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+    }
+
+    function exactInput(ExactInputParams calldata params) external payable returns (uint256 amountOut);
 }
 
 abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
@@ -56,8 +80,6 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
     error NoExecutionInProgress();
     error UnknownExecution();
     error InvalidExecutionSource();
-    error RouterIntegrationNotReady();
-
     struct V2CallbackContext {
         bytes32 executionId;
         address pair;
@@ -375,6 +397,44 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
         if (amount == 0) return;
         bool ok = IERC20Minimal(token).transfer(to, amount);
         if (!ok) revert RepaymentFailed();
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        IERC20Minimal erc20 = IERC20Minimal(token);
+        uint256 current = erc20.allowance(address(this), spender);
+        if (current >= amount) return;
+        if (current != 0) {
+            bool resetOk = erc20.approve(spender, 0);
+            if (!resetOk) revert StepExecutionFailed(type(uint256).max);
+        }
+        bool ok = erc20.approve(spender, amount);
+        if (!ok) revert StepExecutionFailed(type(uint256).max);
+    }
+
+    function _currentAmountIn(uint256 requestedAmount, address tokenIn) internal view returns (uint256) {
+        if (requestedAmount == type(uint256).max) {
+            return _balanceOf(tokenIn);
+        }
+        return requestedAmount;
+    }
+
+    function _v3PathTokenIn(bytes memory path) internal pure returns (address tokenIn) {
+        if (path.length < 43) revert InvalidPath();
+        assembly {
+            tokenIn := shr(96, mload(add(path, 32)))
+        }
+    }
+
+    function _v3PathTokenOut(bytes memory path) internal pure returns (address tokenOut) {
+        if (path.length < 43) revert InvalidPath();
+        uint256 offset = path.length - 20;
+        assembly {
+            tokenOut := shr(96, mload(add(add(path, 32), offset)))
+        }
+    }
+
+    function _v2RepaymentAmount(uint256 borrowedAmount) internal pure returns (uint256) {
+        return ((borrowedAmount * 1000) / 997) + 1;
     }
 
     function _executeV2Step(
