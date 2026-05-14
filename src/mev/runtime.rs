@@ -1,8 +1,11 @@
 use crate::config::{Config, MonitoredTokenConfig};
 use crate::dashboard::DashboardHandle;
-use crate::mev::adaptive::{AdaptivePolicy, AdaptiveQuoteInput, ClusterKey, PreflightInput};
+use crate::mev::adaptive::{
+    AdaptivePolicy, AdaptiveQuoteInput, ClusterKey, ContextSignal, PreflightInput,
+};
 use crate::mev::amm::uniswap_v2::V2PoolState;
-use crate::mev::execution::payload_builder::{FeeExtractionBuildInput, PayloadBuilder};
+use crate::mev::amm::uniswap_v3::V3PoolState;
+use crate::mev::execution::payload_builder::{AmmRouteKind, FeeExtractionBuildInput, PayloadBuilder};
 use crate::mev::execution::ExecutionEngine;
 use crate::mev::opportunity::{roi_bps, wei_to_eth_f64, MevOpportunity};
 use crate::rpc::RpcFleet;
@@ -15,12 +18,23 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
+const MICROBATCH_WINDOW_MS: u64 = 45;
+const MICROBATCH_MAX_CANDIDATES: usize = 4;
+
 const SWAP_EXACT_TOKENS_FOR_TOKENS: [u8; 4] = [0x38, 0xed, 0x17, 0x39];
 const SWAP_EXACT_ETH_FOR_TOKENS: [u8; 4] = [0x7f, 0xf3, 0x6a, 0xb5];
 const SWAP_EXACT_TOKENS_FOR_ETH: [u8; 4] = [0x18, 0xcb, 0xaf, 0xe5];
 const SWAP_EXACT_TOKENS_FOR_TOKENS_SUPPORTING_FEE: [u8; 4] = [0x5c, 0x11, 0xd7, 0x95];
 const SWAP_EXACT_ETH_FOR_TOKENS_SUPPORTING_FEE: [u8; 4] = [0xb6, 0xf9, 0xde, 0x95];
 const SWAP_EXACT_TOKENS_FOR_ETH_SUPPORTING_FEE: [u8; 4] = [0x79, 0x1a, 0xc9, 0x47];
+const V3_EXACT_INPUT_SINGLE: [u8; 4] = [0x41, 0x4b, 0xf3, 0x89];
+const V3_EXACT_INPUT: [u8; 4] = [0xc0, 0x4b, 0x8d, 0x59];
+
+#[derive(Debug, Clone)]
+pub(crate) enum SwapKind {
+    V2,
+    V3 { fee_tier: u32, encoded_path: ethers::types::Bytes, hops: usize },
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct SwapSignal {
@@ -29,6 +43,16 @@ pub(crate) struct SwapSignal {
     pub(crate) notional_wei: U256,
     pub(crate) path: Vec<Address>,
     pub(crate) router: Address,
+    pub(crate) kind: SwapKind,
+}
+
+impl SwapSignal {
+    fn path_len(&self) -> usize {
+        match &self.kind {
+            SwapKind::V2 => self.path.len(),
+            SwapKind::V3 { hops, .. } => hops.saturating_add(1).max(self.path.len()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -39,6 +63,65 @@ pub(crate) struct FastPreflightDecision {
     pub(crate) estimated_gas_cost_usd: f64,
     pub(crate) competition_score_fast: f64,
     pub(crate) gas_ratio: f64,
+}
+
+struct PendingExecutionCandidate {
+    opportunity: MevOpportunity,
+    ev_real_usd: f64,
+    p_positive: f64,
+    capital_efficiency: f64,
+    relay_score: f64,
+    context_priority_score: f64,
+}
+
+impl PendingExecutionCandidate {
+    fn ranking_score(&self) -> f64 {
+        self.ev_real_usd.max(0.0)
+            * (0.65 + self.p_positive.clamp(0.0, 1.0) * 0.35)
+            * (0.70 + self.context_priority_score.clamp(0.0, 1.0) * 0.30)
+            * (0.72 + self.capital_efficiency.clamp(0.0, 1.0) * 0.28)
+            * (1.0 - self.relay_score.clamp(0.0, 1.0) * 0.20)
+    }
+}
+
+#[derive(Default)]
+struct MicroBatcher {
+    opened_at: Option<Instant>,
+    candidates: Vec<PendingExecutionCandidate>,
+}
+
+impl MicroBatcher {
+    fn push(&mut self, candidate: PendingExecutionCandidate) {
+        if self.opened_at.is_none() {
+            self.opened_at = Some(Instant::now());
+        }
+        self.candidates.push(candidate);
+    }
+
+    fn should_flush(&self) -> bool {
+        self.candidates.len() >= MICROBATCH_MAX_CANDIDATES
+            || self
+                .opened_at
+                .map(|opened| opened.elapsed() >= Duration::from_millis(MICROBATCH_WINDOW_MS))
+                .unwrap_or(false)
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.candidates.is_empty()
+    }
+
+    fn drain_best(&mut self) -> Option<(PendingExecutionCandidate, usize)> {
+        let (best_index, _) = self
+            .candidates
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.ranking_score().total_cmp(&right.ranking_score()))?;
+        let dropped = self.candidates.len().saturating_sub(1);
+        let best = self.candidates.swap_remove(best_index);
+        self.candidates.clear();
+        self.opened_at = None;
+        Some((best, dropped))
+    }
 }
 
 ethers::contract::abigen!(
@@ -54,6 +137,23 @@ ethers::contract::abigen!(
         function token0() external view returns (address)
         function token1() external view returns (address)
         function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)
+    ]"#,
+);
+
+ethers::contract::abigen!(
+    UniswapV3Factory,
+    r#"[
+        function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool)
+    ]"#,
+);
+
+ethers::contract::abigen!(
+    UniswapV3Pool,
+    r#"[
+        function token0() external view returns (address)
+        function token1() external view returns (address)
+        function liquidity() external view returns (uint128)
+        function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)
     ]"#,
 );
 
@@ -79,6 +179,7 @@ pub async fn run(
     refresh_historical_profiles(&adaptive, &storage, &dashboard);
     let executor = ExecutionEngine::new(config.clone(), rpc_fleet, dashboard.clone(), adaptive.clone());
     let mut last_profile_refresh = Instant::now();
+    let mut batcher = MicroBatcher::default();
 
     dashboard.event(
         "info",
@@ -89,6 +190,9 @@ pub async fn run(
     );
 
     while let Some(tx_hash) = stream.next().await {
+        if batcher.should_flush() {
+            flush_candidate_batch(&mut batcher, &executor, &dashboard).await?;
+        }
         if last_profile_refresh.elapsed() >= Duration::from_secs(60) {
             refresh_historical_profiles(&adaptive, &storage, &dashboard);
             last_profile_refresh = Instant::now();
@@ -116,13 +220,29 @@ pub async fn run(
         let Some(signal) = decode_relevant_swap(&tx, &config.monitored_tokens, min_large_swap_wei) else {
             continue;
         };
+        let hour_utc = chrono::Utc::now().hour() as u8;
+        let context_signal = if let Ok(model) = adaptive.lock() {
+            model.context_signal(signal.router, hour_utc)
+        } else {
+            ContextSignal {
+                priority_score: 0.50,
+                toxicity_score: 0.50,
+                samples: 0,
+            }
+        };
 
         let gas_price = tx.max_fee_per_gas.or(tx.gas_price).unwrap_or_default();
         if gas_price.is_zero() {
             debug!("fee extraction candidate skipped {:?}: missing gas price", tx.hash);
             continue;
         }
-        let fast_gate = fast_preflight_gate(&signal, gas_price, min_large_swap_wei, &config);
+        let fast_gate = fast_preflight_gate(
+            &signal,
+            gas_price,
+            min_large_swap_wei,
+            &config,
+            context_signal,
+        );
         if !fast_gate.should_continue {
             if let Some(reason) = fast_gate.reject_reason {
                 dashboard.record_reject_reason("fast_preflight", reason);
@@ -152,7 +272,7 @@ pub async fn run(
                 cluster,
                 notional_eth: wei_to_eth_f64(signal.notional_wei),
                 gas_price_wei: gas_price,
-                path_len: signal.path.len(),
+                path_len: signal.path_len(),
             })
         } else {
             continue;
@@ -179,7 +299,14 @@ pub async fn run(
             continue;
         }
 
-        let Some(payload) = build_v2_payload(provider.clone(), &config, &signal, gas_price).await else {
+        let Some(payload) = build_payload(
+            provider.clone(),
+            &config,
+            &signal,
+            gas_price,
+            context_signal,
+        )
+        .await else {
             continue;
         };
 
@@ -199,7 +326,9 @@ pub async fn run(
                 AdaptiveQuoteInput {
                     cluster,
                     pair: payload.pair,
-                    hour_utc: chrono::Utc::now().hour() as u8,
+                    hour_utc,
+                    context_priority_score: context_signal.priority_score,
+                    context_toxicity_score: context_signal.toxicity_score,
                     expected_profit_wei: payload.expected_profit_wei,
                     execution_cost_wei,
                     gas_price_wei: gas_price,
@@ -223,7 +352,7 @@ pub async fn run(
         dashboard.event(
             "info",
             format!(
-                "adaptive gate passed victim={:?} regime={} relay={} ev_real={:.2}usd threshold={:.2}usd p={:.2} comp={:.2} risk={:.2} builder={:.2} density={:.2} cluster={:.2} latency={:.2} gas_pressure={:.2} comp_penalty={:.2}usd risk_penalty={:.2}usd",
+                "adaptive gate passed victim={:?} regime={} relay={} ev_real={:.2}usd threshold={:.2}usd p={:.2} comp={:.2} risk={:.2} builder={:.2} density={:.2} cluster={:.2} latency={:.2} gas_pressure={:.2} comp_penalty={:.2}usd risk_penalty={:.2}usd path_penalty={:.2}usd context_toxicity={:.2}",
                 tx.hash,
                 quote.regime.as_str(),
                 quote.selected_relay.as_deref().unwrap_or("unknown"),
@@ -238,12 +367,37 @@ pub async fn run(
                 quote.latency_penalty,
                 quote.gas_pressure,
                 quote.competition_penalty_usd,
-                quote.risk_penalty_usd
+                quote.risk_penalty_usd,
+                quote.path_penalty_usd,
+                quote.context_toxicity_score
             ),
         );
 
         let opportunity = build_opportunity(&tx, &signal, payload, quote.selected_relay.clone());
-        executor.handle(opportunity).await?;
+        let capital_efficiency = opportunity
+            .execution_payload
+            .as_ref()
+            .map(|payload| {
+                let capital_eth = wei_to_eth_f64(payload.capital_committed_wei).max(1e-9);
+                (quote.ev_real_usd / capital_eth).max(0.0) / config.mev.eth_usd_price.max(1.0)
+            })
+            .unwrap_or_default()
+            .clamp(0.0, 1.0);
+        batcher.push(PendingExecutionCandidate {
+            opportunity,
+            ev_real_usd: quote.ev_real_usd,
+            p_positive: quote.p_positive,
+            capital_efficiency,
+            relay_score: quote.builder_pressure,
+            context_priority_score: quote.context_priority_score,
+        });
+        if batcher.should_flush() {
+            flush_candidate_batch(&mut batcher, &executor, &dashboard).await?;
+        }
+    }
+
+    if batcher.has_pending() {
+        flush_candidate_batch(&mut batcher, &executor, &dashboard).await?;
     }
 
     Ok(())
@@ -286,8 +440,9 @@ pub(crate) fn fast_preflight_gate(
     gas_price: U256,
     min_large_swap_wei: U256,
     config: &Config,
+    context_signal: ContextSignal,
 ) -> FastPreflightDecision {
-    if signal.path.len() < 2 {
+    if signal.path_len() < 2 {
         return FastPreflightDecision {
             should_continue: false,
             reject_reason: Some("invalid_path"),
@@ -310,7 +465,7 @@ pub(crate) fn fast_preflight_gate(
 
     let notional_eth = wei_to_eth_f64(signal.notional_wei);
     let notional_usd = notional_eth * config.mev.eth_usd_price;
-    let path_len = signal.path.len();
+    let path_len = signal.path_len();
     let gas_baseline_gwei = heuristic_gas_baseline_gwei(config);
     let gas_price_gwei = wei_to_gwei_f64(gas_price);
     let gas_ratio = (gas_price_gwei / gas_baseline_gwei.max(1e-9)).max(0.0);
@@ -322,7 +477,12 @@ pub(crate) fn fast_preflight_gate(
         1 => 0.00038,
         _ => 0.00060,
     };
-    let heuristic_factor = (selector_factor * size_factor * (1.0 - path_penalty)).max(0.00005);
+    let heuristic_factor = (selector_factor
+        * size_factor
+        * (1.0 - path_penalty)
+        * (0.88 + context_signal.priority_score.clamp(0.0, 1.0) * 0.18)
+        * (1.0 - context_signal.toxicity_score.clamp(0.0, 1.0) * 0.20))
+        .max(0.00005);
     let estimated_gas_cost_usd = wei_to_eth_f64(
         gas_price.saturating_mul(U256::from(
             config
@@ -339,10 +499,13 @@ pub(crate) fn fast_preflight_gate(
         1 => 0.48,
         _ => 0.72,
     };
+    let context_confidence = (context_signal.samples.min(24) as f64 / 24.0).clamp(0.0, 1.0);
     let path_risk = (path_len.saturating_sub(2).min(3) as f64) / 3.0;
     let competition_score_fast = (gas_pressure * 0.46
         + size_pressure * 0.34
-        + path_risk * 0.20)
+        + path_risk * 0.14
+        + context_signal.toxicity_score.clamp(0.0, 1.0) * (0.08 + context_confidence * 0.08)
+        - context_signal.priority_score.clamp(0.0, 1.0) * (0.03 + context_confidence * 0.05))
         .clamp(0.0, 1.0);
 
     let reject_reason = if ev_upper_bound_usd < config.mev.min_profit_usd * 1.5 {
@@ -365,7 +528,45 @@ pub(crate) fn fast_preflight_gate(
     }
 }
 
+async fn flush_candidate_batch(
+    batcher: &mut MicroBatcher,
+    executor: &ExecutionEngine,
+    dashboard: &DashboardHandle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some((best, dropped)) = batcher.drain_best() else {
+        return Ok(());
+    };
+    if dropped > 0 {
+        dashboard.event(
+            "info",
+            format!(
+                "microbatch selected best candidate and dropped {} lower-ranked candidates score={:.4} ev_real={:.2}usd p={:.2}",
+                dropped,
+                best.ranking_score(),
+                best.ev_real_usd,
+                best.p_positive
+            ),
+        );
+    }
+    executor.handle(best.opportunity).await
+}
+
 pub(crate) fn passes_ev_gate(
+    config: &Config,
+    payload: &crate::mev::execution::payload_builder::ExecutionPayload,
+    signal: &SwapSignal,
+    lookup_latency: std::time::Duration,
+    min_profit_wei: U256,
+) -> bool {
+    match signal.kind {
+        SwapKind::V2 => passes_ev_gate_v2(config, payload, signal, lookup_latency, min_profit_wei),
+        SwapKind::V3 { .. } => {
+            passes_ev_gate_v3(config, payload, signal, lookup_latency, min_profit_wei)
+        }
+    }
+}
+
+pub(crate) fn passes_ev_gate_v2(
     config: &Config,
     payload: &crate::mev::execution::payload_builder::ExecutionPayload,
     signal: &SwapSignal,
@@ -388,11 +589,60 @@ pub(crate) fn passes_ev_gate(
         && gas_budget_ok
 }
 
+pub(crate) fn passes_ev_gate_v3(
+    config: &Config,
+    payload: &crate::mev::execution::payload_builder::ExecutionPayload,
+    signal: &SwapSignal,
+    lookup_latency: std::time::Duration,
+    min_profit_wei: U256,
+) -> bool {
+    let lookup_is_fresh =
+        lookup_latency.as_millis() <= u128::from(config.mev.max_pending_age_ms.max(1));
+    let large_enough =
+        signal.notional_wei >= ethers::utils::parse_ether(config.mev.min_large_swap_eth.to_string()).unwrap_or_default();
+    let inevitable_impact = payload.price_impact_bps >= 6;
+    let profit_above_threshold = payload.expected_profit_wei >= min_profit_wei;
+    let net_ev_usd = wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price;
+    let gas_budget_ok = payload.gas_limit <= config.mev.max_gas_per_tx;
+
+    lookup_is_fresh
+        && large_enough
+        && inevitable_impact
+        && profit_above_threshold
+        && net_ev_usd >= config.mev.min_profit_usd
+        && gas_budget_ok
+}
+
+pub(crate) async fn build_payload<M: Middleware + 'static>(
+    provider: Arc<M>,
+    config: &Config,
+    signal: &SwapSignal,
+    gas_price: U256,
+    context_signal: ContextSignal,
+) -> Option<crate::mev::execution::payload_builder::ExecutionPayload> {
+    match &signal.kind {
+        SwapKind::V2 => build_v2_payload(provider, config, signal, gas_price, context_signal).await,
+        SwapKind::V3 { fee_tier, encoded_path, .. } => {
+            build_v3_payload(
+                provider,
+                config,
+                signal,
+                gas_price,
+                context_signal,
+                *fee_tier,
+                encoded_path.clone(),
+            )
+            .await
+        }
+    }
+}
+
 pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
     provider: Arc<M>,
     config: &Config,
     signal: &SwapSignal,
     gas_price: U256,
+    context_signal: ContextSignal,
 ) -> Option<crate::mev::execution::payload_builder::ExecutionPayload> {
     let factory = config.mev.uniswap_v2_factory?;
     let recipient = config.profit_address;
@@ -429,6 +679,71 @@ pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
             state_before: crate::mev::simulation::state_simulator::AmmState::UniswapV2(pool),
             capital_available_wei,
             gas_price_wei: gas_price,
+            context_priority_score: context_signal.priority_score,
+            context_toxicity_score: context_signal.toxicity_score,
+            route_kind: AmmRouteKind::UniswapV2,
+        },
+    )
+    .ok()
+}
+
+pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
+    provider: Arc<M>,
+    config: &Config,
+    signal: &SwapSignal,
+    gas_price: U256,
+    context_signal: ContextSignal,
+    fee_tier: u32,
+    encoded_path: ethers::types::Bytes,
+) -> Option<crate::mev::execution::payload_builder::ExecutionPayload> {
+    let factory = config.mev.uniswap_v3_factory?;
+    let recipient = config.profit_address;
+    let token_in = *signal.path.first()?;
+    let token_out = *signal.path.get(1)?;
+    let factory = UniswapV3Factory::new(factory, provider.clone());
+    let pool = factory
+        .get_pool(token_in, token_out, fee_tier)
+        .call()
+        .await
+        .ok()?;
+    if pool == Address::zero() {
+        return None;
+    }
+
+    let pool_contract = UniswapV3Pool::new(pool, provider.clone());
+    let token0 = pool_contract.token_0().call().await.ok()?;
+    let token1 = pool_contract.token_1().call().await.ok()?;
+    let liquidity = pool_contract.liquidity().call().await.ok()?;
+    let slot0 = pool_contract.slot_0().call().await.ok()?;
+    let state = V3PoolState {
+        pool,
+        token0,
+        token1,
+        sqrt_price_x96: slot0.0,
+        liquidity: U256::from(liquidity),
+        current_tick: slot0.1,
+        fee_bps: fee_tier as u64 / 100,
+        initialized_ticks: Vec::new(),
+    };
+    let capital_available_wei = ethers::utils::parse_ether(config.mev.capital_eth.to_string()).ok()?;
+    PayloadBuilder::build_fee_extraction_v3(
+        config,
+        FeeExtractionBuildInput {
+            router: signal.router,
+            pair: pool,
+            recipient,
+            token_in,
+            token_out,
+            victim_amount_in: signal.amount_in,
+            state_before: crate::mev::simulation::state_simulator::AmmState::UniswapV3(state),
+            capital_available_wei,
+            gas_price_wei: gas_price,
+            context_priority_score: context_signal.priority_score,
+            context_toxicity_score: context_signal.toxicity_score,
+            route_kind: AmmRouteKind::UniswapV3 {
+                fee_tier,
+                path: encoded_path,
+            },
         },
     )
     .ok()
@@ -461,6 +776,7 @@ pub(crate) fn decode_relevant_swap(
                 notional_wei: tx.value,
                 path: decoded.get(1).and_then(token_as_address_vec)?,
                 router,
+                kind: SwapKind::V2,
             }
         }
         SWAP_EXACT_TOKENS_FOR_TOKENS
@@ -484,6 +800,78 @@ pub(crate) fn decode_relevant_swap(
                 notional_wei: U256::zero(),
                 path: decoded.get(2).and_then(token_as_address_vec)?,
                 router,
+                kind: SwapKind::V2,
+            }
+        }
+        V3_EXACT_INPUT_SINGLE => {
+            let decoded = abi::decode(
+                &[ParamType::Tuple(vec![
+                    ParamType::Address,
+                    ParamType::Address,
+                    ParamType::Uint(24),
+                    ParamType::Address,
+                    ParamType::Uint(256),
+                    ParamType::Uint(256),
+                    ParamType::Uint(256),
+                    ParamType::Uint(160),
+                ])],
+                args,
+            )
+            .ok()?;
+            let params = decoded.first()?;
+            let Token::Tuple(values) = params else {
+                return None;
+            };
+            let token_in = token_as_address(values.first()?)?;
+            let token_out = token_as_address(values.get(1)?)?;
+            let fee_tier = token_as_uint(values.get(2)?)?.as_u32();
+            let amount_in = token_as_uint(values.get(5)?)?;
+            SwapSignal {
+                selector,
+                amount_in,
+                notional_wei: U256::zero(),
+                path: vec![token_in, token_out],
+                router,
+                kind: SwapKind::V3 {
+                    fee_tier,
+                    encoded_path: encode_v3_path(token_in, fee_tier, token_out),
+                    hops: 1,
+                },
+            }
+        }
+        V3_EXACT_INPUT => {
+            let decoded = abi::decode(
+                &[ParamType::Tuple(vec![
+                    ParamType::Bytes,
+                    ParamType::Address,
+                    ParamType::Uint(256),
+                    ParamType::Uint(256),
+                    ParamType::Uint(256),
+                ])],
+                args,
+            )
+            .ok()?;
+            let params = decoded.first()?;
+            let Token::Tuple(values) = params else {
+                return None;
+            };
+            let path_bytes = match values.first()? {
+                Token::Bytes(value) => value.clone(),
+                _ => return None,
+            };
+            let parsed = parse_v3_path(&path_bytes)?;
+            let amount_in = token_as_uint(values.get(3)?)?;
+            SwapSignal {
+                selector,
+                amount_in,
+                notional_wei: U256::zero(),
+                path: vec![parsed.token_in, parsed.token_out],
+                router,
+                kind: SwapKind::V3 {
+                    fee_tier: parsed.first_fee_tier,
+                    encoded_path: ethers::types::Bytes::from(path_bytes),
+                    hops: parsed.hops,
+                },
             }
         }
         _ => return None,
@@ -523,6 +911,8 @@ fn selector(tx: &Transaction) -> Option<[u8; 4]> {
 
 fn selector_heuristic_factor(selector: [u8; 4]) -> f64 {
     match selector {
+        V3_EXACT_INPUT_SINGLE => 1.16,
+        V3_EXACT_INPUT => 1.04,
         SWAP_EXACT_ETH_FOR_TOKENS | SWAP_EXACT_ETH_FOR_TOKENS_SUPPORTING_FEE => 1.18,
         SWAP_EXACT_TOKENS_FOR_ETH | SWAP_EXACT_TOKENS_FOR_ETH_SUPPORTING_FEE => 1.08,
         SWAP_EXACT_TOKENS_FOR_TOKENS | SWAP_EXACT_TOKENS_FOR_TOKENS_SUPPORTING_FEE => 0.94,
@@ -547,6 +937,38 @@ fn fast_path_penalty(path_len: usize) -> f64 {
         4 => 0.30,
         _ => 0.42,
     }
+}
+
+struct ParsedV3Path {
+    token_in: Address,
+    token_out: Address,
+    first_fee_tier: u32,
+    hops: usize,
+}
+
+fn parse_v3_path(path: &[u8]) -> Option<ParsedV3Path> {
+    if path.len() < 43 {
+        return None;
+    }
+    let token_in = Address::from_slice(&path[0..20]);
+    let first_fee_tier = u32::from_be_bytes([0, path[20], path[21], path[22]]);
+    let token_out = Address::from_slice(&path[path.len() - 20..]);
+    let hops = (path.len().saturating_sub(20)) / 23;
+    Some(ParsedV3Path {
+        token_in,
+        token_out,
+        first_fee_tier,
+        hops,
+    })
+}
+
+fn encode_v3_path(token_in: Address, fee_tier: u32, token_out: Address) -> ethers::types::Bytes {
+    let mut out = Vec::with_capacity(43);
+    out.extend_from_slice(token_in.as_bytes());
+    let fee = fee_tier.to_be_bytes();
+    out.extend_from_slice(&fee[1..]);
+    out.extend_from_slice(token_out.as_bytes());
+    ethers::types::Bytes::from(out)
 }
 
 fn heuristic_gas_baseline_gwei(config: &Config) -> f64 {
