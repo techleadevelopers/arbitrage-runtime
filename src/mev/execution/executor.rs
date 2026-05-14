@@ -7,7 +7,7 @@ use crate::mev::adaptive::{ClusterKey, ContextualOutcomeKind, RelayQuote, Shared
 use crate::mev::execution::payload_builder::AmmRouteKind;
 use crate::mev::opportunity::{wei_to_eth_f64, MevOpportunity};
 use crate::mev::pnl::tracker::{ExecutionResult, PnlTracker};
-use crate::rpc::RpcFleet;
+use crate::rpc::{RpcFleet, RpcHandle};
 use ethers::contract::abigen;
 use ethers::prelude::*;
 use ethers::types::transaction::eip2718::TypedTransaction;
@@ -33,6 +33,14 @@ pub struct ExecutionEngine {
     adaptive: SharedAdaptivePolicy,
     last_treasury_signal: Arc<Mutex<Option<TreasurySignal>>>,
     capital_budget: Arc<Mutex<CapitalBudget>>,
+}
+
+struct SendContext {
+    endpoint: RpcHandle,
+    hot_balance: U256,
+    chain_nonce: U256,
+    gas_price: U256,
+    block: U64,
 }
 
 impl ExecutionEngine {
@@ -85,17 +93,17 @@ impl ExecutionEngine {
             return Ok(());
         };
 
-        let endpoint = self.rpc_fleet.send_endpoint();
-        let provider = endpoint.provider.clone();
         let wallet = self
             .config
             .executor_private_key
             .parse::<LocalWallet>()?
             .with_chain_id(self.config.chain_id);
         let wallet_address = wallet.address();
-        let hot_balance = provider
-            .get_balance(wallet_address, Some(BlockNumber::Pending.into()))
-            .await?;
+        let send_context = self
+            .load_send_context(wallet_address)
+            .await
+            .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
+        let hot_balance = send_context.hot_balance;
         let hot_balance_eth = wei_to_eth_f64(hot_balance);
         let buffer_status = self.hot_wallet_status(hot_balance_eth);
         self.dashboard.set_executor_balance(hot_balance_eth, buffer_status);
@@ -124,13 +132,14 @@ impl ExecutionEngine {
             );
             return Ok(());
         }
-        let chain_nonce = provider
-            .get_transaction_count(wallet_address, Some(BlockNumber::Pending.into()))
-            .await?;
-        let gas_price = provider.get_gas_price().await?;
-        payload.tx = sign_executor_transaction(&wallet, &payload, chain_nonce, gas_price).await?;
-        let block = provider.get_block_number().await?;
-        let target_block = (block + 1).as_u64();
+        payload.tx = sign_executor_transaction(
+            &wallet,
+            &payload,
+            send_context.chain_nonce,
+            send_context.gas_price,
+        )
+        .await?;
+        let target_block = (send_context.block + 1).as_u64();
         let cluster = ClusterKey {
             router: opportunity.router,
             token_in: opportunity.token_in,
@@ -185,43 +194,71 @@ impl ExecutionEngine {
         }
 
         if !self.config.uses_bundle_relays() {
-            let started = std::time::Instant::now();
-            let pending = provider.send_raw_transaction(payload.tx.clone()).await?;
-            let tx_hash = pending.tx_hash();
-            let submit_latency_ms = started.elapsed().as_millis() as f64;
-            let relay_label = format!("rpc://{}", endpoint.name);
-            if let Ok(mut adaptive) = self.adaptive.lock() {
-                adaptive.record_submit_success_for_relay(&relay_label, submit_latency_ms);
+            let mut submit_endpoints = vec![send_context.endpoint.clone()];
+            for endpoint in self.rpc_fleet.send_candidates(3) {
+                if endpoint.id != send_context.endpoint.id {
+                    submit_endpoints.push(endpoint);
+                }
             }
-            self.dashboard.record_latency(
-                "fee_rpc_submit",
-                submit_latency_ms as u128,
-                None,
-                Some(&endpoint.name),
-            );
-            self.dashboard.event(
-                "success",
-                format!(
-                    "fee extraction tx submitted victim={:?} path={} tx={:?} expected_profit={:.6} ETH",
-                    opportunity.victim_tx,
-                    format_submit_path(&payload.amm_kind, &relay_label),
-                    tx_hash,
-                    wei_to_eth_f64(payload.expected_profit_wei)
-                ),
-            );
-            let realized = self
-                .observe_realized_pnl(
-                    provider.clone(),
-                    tx_hash,
-                    &opportunity,
-                    &payload,
-                    &relay_label,
-                    target_block,
-                    submit_latency_ms,
-                )
-                .await?;
-            self.record_result(&realized);
-            return Ok(());
+
+            let mut last_submit_error: Option<String> = None;
+            for endpoint in submit_endpoints {
+                let started = std::time::Instant::now();
+                match endpoint.provider.send_raw_transaction(payload.tx.clone()).await {
+                    Ok(pending) => {
+                        let tx_hash = pending.tx_hash();
+                        let submit_latency_ms = started.elapsed().as_millis() as f64;
+                        self.rpc_fleet.record_success(
+                            endpoint.id,
+                            started.elapsed(),
+                            Some(target_block),
+                        );
+                        let relay_label = format!("rpc://{}", endpoint.name);
+                        if let Ok(mut adaptive) = self.adaptive.lock() {
+                            adaptive.record_submit_success_for_relay(&relay_label, submit_latency_ms);
+                        }
+                        self.dashboard.record_latency(
+                            "fee_rpc_submit",
+                            submit_latency_ms as u128,
+                            None,
+                            Some(&endpoint.name),
+                        );
+                        self.dashboard.event(
+                            "success",
+                            format!(
+                                "fee extraction tx submitted victim={:?} path={} tx={:?} expected_profit={:.6} ETH",
+                                opportunity.victim_tx,
+                                format_submit_path(&payload.amm_kind, &relay_label),
+                                tx_hash,
+                                wei_to_eth_f64(payload.expected_profit_wei)
+                            ),
+                        );
+                        let realized = self
+                            .observe_realized_pnl(
+                                endpoint.id,
+                                tx_hash,
+                                &opportunity,
+                                &payload,
+                                &relay_label,
+                                target_block,
+                                submit_latency_ms,
+                            )
+                            .await?;
+                        self.record_result(&realized);
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        let err_text = err.to_string();
+                        self.rpc_fleet
+                            .record_failure(endpoint.id, RpcFleet::classify_failure(&err_text));
+                        last_submit_error = Some(err_text);
+                    }
+                }
+            }
+
+            return Err(last_submit_error
+                .unwrap_or_else(|| "all rpc submit endpoints failed".to_string())
+                .into());
         }
 
         let mut last_error: Option<String> = None;
@@ -234,9 +271,10 @@ impl ExecutionEngine {
                 }
             };
             let relay_signer = wallet.clone();
-            let flashbots_client = SignerMiddleware::new(provider.clone(), wallet.clone());
+            let flashbots_client =
+                SignerMiddleware::new(send_context.endpoint.provider.clone(), wallet.clone());
             let flashbots = FlashbotsMiddleware::new(flashbots_client, relay_url, relay_signer);
-            let bundle = self.build_bundle(block, &opportunity, &payload);
+            let bundle = self.build_bundle(send_context.block, &opportunity, &payload);
             let started = std::time::Instant::now();
 
             match flashbots
@@ -268,7 +306,7 @@ impl ExecutionEngine {
                         "fee_bundle_submit",
                         submit_latency_ms as u128,
                         None,
-                        Some(&format!("{} via {}", endpoint.name, relay.relay)),
+                        Some(&format!("{} via {}", send_context.endpoint.name, relay.relay)),
                     );
                     self.dashboard.event(
                         "success",
@@ -283,7 +321,7 @@ impl ExecutionEngine {
                     );
                     let realized = self
                         .observe_realized_pnl(
-                            provider.clone(),
+                            send_context.endpoint.id,
                             tx_hash,
                             &opportunity,
                             &payload,
@@ -348,7 +386,7 @@ impl ExecutionEngine {
 
     async fn observe_realized_pnl(
         &self,
-        provider: Arc<Provider<Http>>,
+        preferred_endpoint_id: usize,
         tx_hash: H256,
         opportunity: &MevOpportunity,
         payload: &crate::mev::execution::payload_builder::ExecutionPayload,
@@ -364,7 +402,27 @@ impl ExecutionEngine {
             selector: opportunity.selector,
         };
         for _ in 0..12 {
-            if let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? {
+            for handle in self.read_probe_handles(preferred_endpoint_id) {
+                let receipt_started = std::time::Instant::now();
+                let receipt = match handle.provider.get_transaction_receipt(tx_hash).await {
+                    Ok(receipt) => {
+                        self.rpc_fleet
+                            .record_success(handle.id, receipt_started.elapsed(), None);
+                        receipt
+                    }
+                    Err(err) => {
+                        let err_text = err.to_string();
+                        self.rpc_fleet.record_failure(
+                            handle.id,
+                            RpcFleet::classify_failure(&err_text),
+                        );
+                        continue;
+                    }
+                };
+
+                let Some(receipt) = receipt else {
+                    continue;
+                };
                 let gas_used = receipt.gas_used.unwrap_or_default().as_u64();
                 let effective_gas_price = receipt.effective_gas_price.unwrap_or_default();
                 let gas_paid_wei = receipt
@@ -373,7 +431,7 @@ impl ExecutionEngine {
                     .saturating_mul(effective_gas_price);
                 let success = receipt.status.map(|status| status.as_u64() == 1).unwrap_or(false);
                 let realized_profit = if success {
-                    self.realized_profit_eth(provider.clone(), payload, &receipt, gas_paid_wei)
+                    self.realized_profit_eth(handle.provider.clone(), payload, &receipt, gas_paid_wei)
                         .await
                         .unwrap_or_else(|| wei_to_eth_f64(payload.expected_profit_wei) - wei_to_eth_f64(gas_paid_wei))
                 } else {
@@ -529,6 +587,80 @@ impl ExecutionEngine {
         let delta_tokens = balance_delta.to_string().parse::<f64>().ok()? / token_units;
         let gross_eth = delta_tokens * token_meta.price_eth;
         Some(gross_eth - wei_to_eth_f64(gas_paid_wei))
+    }
+
+    async fn load_send_context(&self, wallet_address: Address) -> Result<SendContext, String> {
+        let mut last_error: Option<String> = None;
+        for endpoint in self.rpc_fleet.send_candidates(3) {
+            let started = std::time::Instant::now();
+            let result = async {
+                let hot_balance = endpoint
+                    .provider
+                    .get_balance(wallet_address, Some(BlockNumber::Pending.into()))
+                    .await
+                    .map_err(|err| err.to_string())?;
+                let chain_nonce = endpoint
+                    .provider
+                    .get_transaction_count(wallet_address, Some(BlockNumber::Pending.into()))
+                    .await
+                    .map_err(|err| err.to_string())?;
+                let gas_price = endpoint
+                    .provider
+                    .get_gas_price()
+                    .await
+                    .map_err(|err| err.to_string())?;
+                let block = endpoint
+                    .provider
+                    .get_block_number()
+                    .await
+                    .map_err(|err| err.to_string())?;
+
+                Ok::<_, String>(SendContext {
+                    endpoint: endpoint.clone(),
+                    hot_balance,
+                    chain_nonce,
+                    gas_price,
+                    block,
+                })
+            }
+            .await;
+
+            match result {
+                Ok(context) => {
+                    self.rpc_fleet.record_success(
+                        context.endpoint.id,
+                        started.elapsed(),
+                        Some(context.block.as_u64()),
+                    );
+                    return Ok(context);
+                }
+                Err(err) => {
+                    self.rpc_fleet
+                        .record_failure(endpoint.id, RpcFleet::classify_failure(&err));
+                    last_error = Some(format!("{} via {}", err, endpoint.name));
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| "no rpc endpoint available for send context".to_string()))
+    }
+
+    fn read_probe_handles(&self, preferred_endpoint_id: usize) -> Vec<RpcHandle> {
+        let mut handles = Vec::new();
+        if let Some(primary) = self
+            .rpc_fleet
+            .all_handles()
+            .into_iter()
+            .find(|handle| handle.id == preferred_endpoint_id)
+        {
+            handles.push(primary);
+        }
+        for handle in self.rpc_fleet.read_candidates(3) {
+            if !handles.iter().any(|existing| existing.id == handle.id) {
+                handles.push(handle);
+            }
+        }
+        handles
     }
 
     fn record_result(&self, result: &ExecutionResult) {
