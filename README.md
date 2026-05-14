@@ -2,10 +2,10 @@
 
 `arbitrage-runtime` is a Rust execution engine for deterministic on-chain arbitrage and fee extraction around pending AMM swaps.
 
-The system is designed for production-grade private operation, with emphasis on:
+The system is designed for private adversarial operation, with emphasis on:
 
 - mempool-first opportunity detection
-- deterministic AMM impact modeling
+- deterministic AMM impact modeling across Uniswap V2 and V3 style paths
 - selective execution under adversarial conditions
 - adaptive gating calibrated by realized outcomes
 - chain-specific execution behavior for BNB Chain and Polygon
@@ -93,7 +93,33 @@ Execution is direct-RPC oriented.
 - direct raw transaction submission
 - no assumption that Flashbots-style flow is the center of the ecosystem
 
-This split is deliberate. The engine does not treat BNB or Polygon as “smaller Ethereum”.
+This split is deliberate. The engine does not treat BNB or Polygon as "smaller Ethereum".
+
+## AMM Coverage
+
+The active runtime supports two AMM impact paths.
+
+### Uniswap V2 path
+
+- pending V2-style swap decoding
+- reserve-based post-victim state reconstruction
+- reverse-path sizing and ROI selection
+- V2 flashswap-oriented execution payload
+
+### Uniswap V3 path
+
+- pending `exactInputSingle` decoding
+- pending `exactInput` decoding for encoded V3 path bytes
+- pool lookup through the configured V3 factory
+- minimal pool-state read:
+  - `slot0`
+  - `liquidity`
+  - current tick
+  - fee tier
+- concentrated-liquidity impact approximation
+- V3 flashswap-oriented execution payload
+
+The runtime keeps V2 and V3 gates separate on purpose. It does not force one pricing model to impersonate the other.
 
 ## Adaptive Decision Layer
 
@@ -230,6 +256,43 @@ Execution outcomes are persisted with contextual fields such as:
 
 These records are then reused for historical calibration.
 
+## Executor ABI Expectations
+
+The Rust runtime now emits two execution call families.
+
+The on-chain executor contract referenced by `MEV_EXECUTOR_ADDRESS` must support both if you want dual-path V2/V3 execution in production.
+
+### Expected V2 executor entrypoint
+
+```solidity
+function startV2FlashSwap(
+    address pair,
+    address borrowToken,
+    uint256 borrowAmount,
+    uint256 minProfit,
+    address profitToken,
+    tuple(address router, address[] path, uint256 amountIn, uint256 minOut)[] memory steps
+) external;
+```
+
+### Expected V3 executor entrypoint
+
+```solidity
+function startV3FlashSwap(
+    address pool,
+    address borrowToken,
+    uint256 borrowAmount,
+    uint24 feeTier,
+    uint256 minProfit,
+    address profitToken,
+    tuple(address router, bytes path, uint256 amountIn, uint256 minOut)[] memory steps
+) external;
+```
+
+### Important note
+
+If the on-chain executor only supports the V2 selector, the runtime can still detect and model V3 opportunities, but live V3 execution will not succeed until the contract is upgraded to match the V3 ABI above.
+
 ## Replay Harness
 
 The project includes a replay harness for non-live evaluation on forked environments.
@@ -359,6 +422,7 @@ Below is the core environment surface used by the active runtime.
 ### Contracts
 
 - `MEV_UNISWAP_V2_FACTORY`
+- `MEV_UNISWAP_V3_FACTORY`
 - `MEV_EXECUTOR_ADDRESS`
 
 ### Fork replay
@@ -366,6 +430,7 @@ Below is the core environment surface used by the active runtime.
 - `RUN_REPLAY_HARNESS`
 - `REPLAY_INPUT_PATH`
 - `REPLAY_LIMIT`
+- `REPLAY_OUTPUT_PATH`
 - `TENDERLY_FORK_URL_BNB`
 - `TENDERLY_FORK_URL_POLYGON`
 - `TENDERLY_FORK_URL_ETHEREUM`
@@ -412,7 +477,7 @@ The engine is intentionally narrow.
 It is strong where it is explicit:
 
 - pending swap parsing
-- AMM V2 impact path
+- AMM V2 and V3 impact paths
 - chain-aware execution routing
 - relay-aware adaptive gating
 - historical contextual calibration
