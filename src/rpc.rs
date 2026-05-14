@@ -27,6 +27,15 @@ impl RpcKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcFailureKind {
+    Timeout,
+    RateLimited,
+    Stale,
+    Transport,
+    Remote,
+}
+
 #[derive(Debug)]
 struct RpcEndpointState {
     failures: u32,
@@ -77,7 +86,6 @@ pub struct RpcHandle {
 #[derive(Debug)]
 pub struct RpcFleet {
     endpoints: Vec<Arc<RpcEndpoint>>,
-    rotation: AtomicUsize,
     read_preference: RpcPreference,
     send_preference: RpcPreference,
     score_cache: Mutex<ScoreCacheState>,
@@ -148,14 +156,118 @@ impl RpcFleet {
                 send_scores: vec![None; endpoints.len()],
             }),
             endpoints,
-            rotation: AtomicUsize::new(0),
             read_preference: config.rpc_read_preference,
             send_preference: config.rpc_send_preference,
         })
     }
 
-    pub fn send_endpoint(&self) -> RpcHandle {
-        self.select_send_endpoint()
+    pub fn read_candidates(&self, limit: usize) -> Vec<RpcHandle> {
+        self.select_candidates(false, limit)
+    }
+
+    pub fn send_candidates(&self, limit: usize) -> Vec<RpcHandle> {
+        self.select_candidates(true, limit)
+    }
+
+    pub fn reserve_read_selection(&self, endpoint_id: usize) {
+        self.reserve_selection(endpoint_id, false);
+    }
+
+    pub fn reserve_send_selection(&self, endpoint_id: usize) {
+        self.reserve_selection(endpoint_id, true);
+    }
+
+    pub fn record_success(
+        &self,
+        endpoint_id: usize,
+        latency: Duration,
+        observed_block: Option<u64>,
+    ) {
+        let now = Instant::now();
+        let Some(endpoint) = self.endpoints.iter().find(|endpoint| endpoint.id == endpoint_id) else {
+            return;
+        };
+        let mut state = endpoint.state.lock().expect("rpc endpoint state lock");
+        prune_burst_reservations(&mut state, now);
+        state.avg_latency = Some(match state.avg_latency {
+            Some(previous) => Duration::from_secs_f64(
+                previous.as_secs_f64() * 0.72 + latency.as_secs_f64() * 0.28,
+            ),
+            None => latency,
+        });
+        state.failures = state.failures.saturating_sub(1);
+        state.timeout_failures = state.timeout_failures.saturating_sub(1);
+        state.rate_limit_failures = state.rate_limit_failures.saturating_sub(1);
+        state.stale_failures = state.stale_failures.saturating_sub(1);
+        if let Some(block) = observed_block {
+            state.last_block = Some(block);
+            state.last_block_at = Some(now);
+        }
+        if matches!(state.cooldown_until, Some(until) if until <= now) {
+            state.cooldown_until = None;
+        }
+        drop(state);
+        self.invalidate_score_cache();
+    }
+
+    pub fn record_failure(&self, endpoint_id: usize, kind: RpcFailureKind) {
+        let now = Instant::now();
+        let Some(endpoint) = self.endpoints.iter().find(|endpoint| endpoint.id == endpoint_id) else {
+            return;
+        };
+        let mut state = endpoint.state.lock().expect("rpc endpoint state lock");
+        prune_burst_reservations(&mut state, now);
+        state.failures = state.failures.saturating_add(1);
+        let cooldown = match kind {
+            RpcFailureKind::RateLimited => {
+                state.rate_limit_failures = state.rate_limit_failures.saturating_add(1);
+                Duration::from_secs((2u64.saturating_pow(state.rate_limit_failures.min(5))) * 2)
+            }
+            RpcFailureKind::Timeout => {
+                state.timeout_failures = state.timeout_failures.saturating_add(1);
+                Duration::from_millis(400u64.saturating_mul(2u64.saturating_pow(state.timeout_failures.min(5))))
+            }
+            RpcFailureKind::Stale => {
+                state.stale_failures = state.stale_failures.saturating_add(1);
+                Duration::from_millis(900)
+            }
+            RpcFailureKind::Transport => Duration::from_millis(700),
+            RpcFailureKind::Remote => Duration::from_millis(500),
+        };
+        let until = now + cooldown.min(Duration::from_secs(90));
+        state.cooldown_until = Some(match state.cooldown_until {
+            Some(existing) if existing > until => existing,
+            _ => until,
+        });
+        drop(state);
+        self.invalidate_score_cache();
+    }
+
+    pub fn classify_failure(error: &str) -> RpcFailureKind {
+        let lower = error.to_ascii_lowercase();
+        if lower.contains("429")
+            || lower.contains("rate limit")
+            || lower.contains("too many requests")
+            || lower.contains("throughput limit")
+        {
+            RpcFailureKind::RateLimited
+        } else if lower.contains("timeout")
+            || lower.contains("timed out")
+            || lower.contains("deadline exceeded")
+        {
+            RpcFailureKind::Timeout
+        } else if lower.contains("stale") {
+            RpcFailureKind::Stale
+        } else if lower.contains("connection")
+            || lower.contains("socket")
+            || lower.contains("dns")
+            || lower.contains("econnreset")
+            || lower.contains("broken pipe")
+        {
+            RpcFailureKind::Transport
+        } else {
+            RpcFailureKind::Remote
+        }
     }
 
     pub fn endpoint_count(&self) -> usize {
@@ -203,58 +315,39 @@ impl RpcFleet {
             .collect()
     }
 
-    fn select_endpoint(&self) -> RpcHandle {
+    fn select_candidates(&self, send_mode: bool, limit: usize) -> Vec<RpcHandle> {
         let now = Instant::now();
+        let preference = if send_mode {
+            self.send_preference
+        } else {
+            self.read_preference
+        };
         let mut candidates: Vec<(Arc<RpcEndpoint>, f64)> = self
             .endpoints
             .iter()
-            .filter(|endpoint| self.matches_preference(endpoint.kind, self.read_preference))
-            .filter_map(|endpoint| self.endpoint_score(endpoint, now, false, true))
+            .filter(|endpoint| self.matches_preference(endpoint.kind, preference))
+            .filter_map(|endpoint| self.endpoint_score(endpoint, now, send_mode, true))
             .collect();
 
         if candidates.is_empty() {
             candidates = self
                 .endpoints
                 .iter()
-                .map(|endpoint| (endpoint.clone(), 10_000.0))
+                .filter_map(|endpoint| self.endpoint_score(endpoint, now, send_mode, true))
                 .collect();
         }
 
         candidates.sort_by(|left, right| left.1.partial_cmp(&right.1).unwrap_or(Ordering::Equal));
-
         let top_n = candidates.len().min(3);
-        let rotation = self.rotation.fetch_add(1, AtomicOrdering::Relaxed);
-        let selected = &candidates[rotation % top_n].0;
-        self.reserve_burst_units(selected, endpoint_burst_cost_units(selected.kind, false), now);
-
-        self.to_handle(selected)
-    }
-
-    fn select_send_endpoint(&self) -> RpcHandle {
-        let now = Instant::now();
-        let mut candidates: Vec<(Arc<RpcEndpoint>, f64)> = self
-            .endpoints
-            .iter()
-            .filter(|endpoint| self.matches_preference(endpoint.kind, self.send_preference))
-            .filter_map(|endpoint| self.endpoint_score(endpoint, now, true, true))
-            .collect();
-
-        if candidates.is_empty() {
-            candidates = self
-                .endpoints
-                .iter()
-                .filter_map(|endpoint| self.endpoint_score(endpoint, now, true, true))
-                .collect();
+        if top_n > 1 {
+            let rotation = self.rotation.fetch_add(1, AtomicOrdering::Relaxed) % top_n;
+            candidates[..top_n].rotate_left(rotation);
         }
-
-        if candidates.is_empty() {
-            return self.select_endpoint();
-        }
-
-        candidates.sort_by(|left, right| left.1.partial_cmp(&right.1).unwrap_or(Ordering::Equal));
-        let selected = &candidates[0].0;
-        self.reserve_burst_units(selected, endpoint_burst_cost_units(selected.kind, true), now);
-        self.to_handle(selected)
+        candidates
+            .into_iter()
+            .take(limit.max(1))
+            .map(|(endpoint, _)| self.to_handle(&endpoint))
+            .collect()
     }
 
     fn endpoint_score(
@@ -378,6 +471,14 @@ impl RpcFleet {
         cache.send_scores = send_scores;
     }
 
+    fn reserve_selection(&self, endpoint_id: usize, send_mode: bool) {
+        let now = Instant::now();
+        let Some(endpoint) = self.endpoints.iter().find(|endpoint| endpoint.id == endpoint_id) else {
+            return;
+        };
+        self.reserve_burst_units(endpoint, endpoint_burst_cost_units(endpoint.kind, send_mode), now);
+    }
+
     fn reserve_burst_units(&self, endpoint: &Arc<RpcEndpoint>, units: u32, now: Instant) {
         let mut state = endpoint.state.lock().expect("rpc endpoint state lock");
         prune_burst_reservations(&mut state, now);
@@ -392,6 +493,13 @@ impl RpcFleet {
         if recent_send_units >= send_capacity.saturating_mul(2) {
             state.cooldown_until = Some(now + Duration::from_millis(900));
         }
+        drop(state);
+        self.invalidate_score_cache();
+    }
+
+    fn invalidate_score_cache(&self) {
+        let mut cache = self.score_cache.lock().expect("rpc score cache lock");
+        cache.updated_at = Instant::now() - Duration::from_secs(2);
     }
 
     fn to_handle(&self, endpoint: &Arc<RpcEndpoint>) -> RpcHandle {
