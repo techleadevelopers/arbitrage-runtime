@@ -25,6 +25,7 @@ pub struct Config {
     pub network: String,
     pub chain_id: u64,
     pub allow_send: bool,
+    pub tenderly_rpc_only: bool,
     pub alchemy_key: String,
     pub infura_ids: Vec<String>,
     pub flashbots_relay: String,
@@ -107,11 +108,19 @@ impl Config {
             .map(|value| value.trim().to_lowercase())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| cli.network.to_lowercase());
+        let tenderly_rpc_only = env::var("USE_TENDERLY_RPC_ONLY")
+            .unwrap_or_else(|_| "false".to_string())
+            .trim()
+            .eq_ignore_ascii_case("true");
         let allow_send = env::var("ALLOW_SEND")
             .unwrap_or_else(|_| "false".to_string())
             .trim()
             .eq_ignore_ascii_case("true");
-        let alchemy_key = required_env("ALCHEMY_KEY")?;
+        let alchemy_key = if tenderly_rpc_only {
+            env::var("ALCHEMY_KEY").unwrap_or_default().trim().to_string()
+        } else {
+            required_env("ALCHEMY_KEY")?
+        };
         let flashbots_relay = if network == "ethereum" {
             required_env("FLASHBOTS_RELAY")?
         } else {
@@ -289,6 +298,7 @@ impl Config {
             network,
             chain_id,
             allow_send,
+            tenderly_rpc_only,
             alchemy_key,
             infura_ids,
             flashbots_relay,
@@ -312,6 +322,13 @@ impl Config {
     }
 
     pub fn rpc_urls(&self) -> Vec<(String, String)> {
+        if self.tenderly_rpc_only {
+            return self
+                .fork_rpc_url()
+                .map(|url| vec![(format!("tenderly-{}", self.network), url)])
+                .unwrap_or_default();
+        }
+
         let mut urls = Vec::with_capacity(self.infura_ids.len() + 1);
         if let Some(alchemy_url) = alchemy_url_for_network(&self.network, &self.alchemy_key) {
             urls.push(("alchemy-primary".to_string(), alchemy_url));
@@ -332,6 +349,12 @@ impl Config {
     }
 
     pub fn mempool_ws_url(&self) -> Option<String> {
+        if self.tenderly_rpc_only {
+            return self
+                .mempool_ws_url
+                .clone()
+                .filter(|value| !value.is_empty());
+        }
         self.mempool_ws_url
             .clone()
             .or_else(|| alchemy_ws_url_for_network(&self.network, &self.alchemy_key))
