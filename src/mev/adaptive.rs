@@ -55,6 +55,8 @@ pub struct AdaptiveQuoteInput {
     pub cluster: ClusterKey,
     pub pair: Address,
     pub hour_utc: u8,
+    pub context_priority_score: f64,
+    pub context_toxicity_score: f64,
     pub expected_profit_wei: U256,
     pub execution_cost_wei: U256,
     pub gas_price_wei: U256,
@@ -100,11 +102,14 @@ pub struct AdaptiveQuote {
     pub risk_score: f64,
     pub competition_penalty_usd: f64,
     pub risk_penalty_usd: f64,
+    pub path_penalty_usd: f64,
     pub mempool_density: f64,
     pub cluster_heat: f64,
     pub builder_pressure: f64,
     pub latency_penalty: f64,
     pub gas_pressure: f64,
+    pub context_priority_score: f64,
+    pub context_toxicity_score: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -173,6 +178,32 @@ struct HistoricalProfileKey {
     hour_utc: u8,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ContextSignal {
+    pub priority_score: f64,
+    pub toxicity_score: f64,
+    pub samples: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq)]
+struct RouterHourKey {
+    router: Address,
+    hour_utc: u8,
+}
+
+impl PartialEq for RouterHourKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.router == other.router && self.hour_utc == other.hour_utc
+    }
+}
+
+impl Hash for RouterHourKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.router.hash(state);
+        self.hour_utc.hash(state);
+    }
+}
+
 impl PartialEq for HistoricalProfileKey {
     fn eq(&self, other: &Self) -> bool {
         self.router == other.router && self.pair == other.pair && self.hour_utc == other.hour_utc
@@ -212,6 +243,7 @@ pub struct AdaptivePolicy {
     relay_stats: HashMap<String, RelayStats>,
     relay_context_stats: HashMap<(String, ClusterKey), RelayContextStats>,
     historical_profiles: HashMap<HistoricalProfileKey, HistoricalOutcomeStats>,
+    router_hour_profiles: HashMap<RouterHourKey, ContextSignal>,
     chain_competition_mult: f64,
     chain_risk_mult: f64,
     chain_threshold_mult: f64,
@@ -276,6 +308,7 @@ impl AdaptivePolicy {
             relay_stats: HashMap::new(),
             relay_context_stats: HashMap::new(),
             historical_profiles: HashMap::new(),
+            router_hour_profiles: HashMap::new(),
             chain_competition_mult,
             chain_risk_mult,
             chain_threshold_mult,
@@ -284,22 +317,75 @@ impl AdaptivePolicy {
 
     pub fn apply_historical_profiles(&mut self, profiles: Vec<HistoricalOutcomeProfile>) {
         self.historical_profiles.clear();
+        self.router_hour_profiles.clear();
+        let mut router_hour_rollup: HashMap<RouterHourKey, Vec<HistoricalOutcomeStats>> = HashMap::new();
         for profile in profiles {
+            let stats = HistoricalOutcomeStats {
+                samples: profile.samples,
+                success_rate: profile.success_rate,
+                accepted_not_included_rate: profile.accepted_not_included_rate,
+                revert_rate: profile.revert_rate,
+                realized_capture: profile.realized_capture,
+            };
             self.historical_profiles.insert(
                 HistoricalProfileKey {
                     router: profile.router,
                     pair: profile.pair,
                     hour_utc: profile.hour_utc,
                 },
-                HistoricalOutcomeStats {
-                    samples: profile.samples,
-                    success_rate: profile.success_rate,
-                    accepted_not_included_rate: profile.accepted_not_included_rate,
-                    revert_rate: profile.revert_rate,
-                    realized_capture: profile.realized_capture,
+                stats.clone(),
+            );
+            router_hour_rollup
+                .entry(RouterHourKey {
+                    router: profile.router,
+                    hour_utc: profile.hour_utc,
+                })
+                .or_default()
+                .push(stats);
+        }
+        for (key, values) in router_hour_rollup {
+            let samples = values.iter().map(|value| value.samples).sum::<u64>().max(1);
+            let weighted = |f: fn(&HistoricalOutcomeStats) -> f64| {
+                values
+                    .iter()
+                    .map(|value| f(value) * value.samples as f64)
+                    .sum::<f64>()
+                    / samples as f64
+            };
+            let success_rate = weighted(|value| value.success_rate);
+            let miss_rate = weighted(|value| value.accepted_not_included_rate);
+            let revert_rate = weighted(|value| value.revert_rate);
+            let realized_capture = weighted(|value| value.realized_capture);
+            let priority_score = (success_rate * 0.46
+                + realized_capture.clamp(0.0, 1.0) * 0.34
+                + (1.0 - miss_rate).clamp(0.0, 1.0) * 0.12
+                + (1.0 - revert_rate).clamp(0.0, 1.0) * 0.08)
+                .clamp(0.0, 1.0);
+            let toxicity_score = ((1.0 - success_rate).clamp(0.0, 1.0) * 0.28
+                + miss_rate.clamp(0.0, 1.0) * 0.36
+                + revert_rate.clamp(0.0, 1.0) * 0.22
+                + (1.0 - realized_capture).clamp(0.0, 1.0) * 0.14)
+                .clamp(0.0, 1.0);
+            self.router_hour_profiles.insert(
+                key,
+                ContextSignal {
+                    priority_score,
+                    toxicity_score,
+                    samples,
                 },
             );
         }
+    }
+
+    pub fn context_signal(&self, router: Address, hour_utc: u8) -> ContextSignal {
+        self.router_hour_profiles
+            .get(&RouterHourKey { router, hour_utc })
+            .copied()
+            .unwrap_or(ContextSignal {
+                priority_score: 0.50,
+                toxicity_score: 0.50,
+                samples: 0,
+            })
     }
 
     pub fn observe_lookup_latency(&mut self, latency_ms: f64) {
@@ -471,6 +557,8 @@ impl AdaptivePolicy {
             historical_calibration.regime_shift,
         );
 
+        let context_priority_score = input.context_priority_score.clamp(0.0, 1.5);
+        let context_toxicity_score = input.context_toxicity_score.clamp(0.0, 1.0);
         let competition_score = (self.competition_score(
             cluster_heat,
             mempool_density,
@@ -480,6 +568,8 @@ impl AdaptivePolicy {
             builder_pressure,
             regime,
         ) * self.chain_competition_mult
+            * (1.0 + (1.0 - context_priority_score.clamp(0.0, 1.0)) * 0.06)
+            * (1.0 + context_toxicity_score * 0.20)
             * historical_calibration.competition_mult.max(1e-9))
             .clamp(0.0, 1.0);
         let risk_score = (self.risk_score(
@@ -491,6 +581,8 @@ impl AdaptivePolicy {
             builder_pressure,
             regime,
         ) * self.chain_risk_mult
+            * (1.0 + context_toxicity_score * 0.24)
+            * (1.0 - context_priority_score.clamp(0.0, 1.0) * 0.08)
             * historical_calibration.risk_mult.max(1e-9))
             .clamp(0.0, 1.0);
 
@@ -532,8 +624,19 @@ impl AdaptivePolicy {
                 builder_pressure,
                 regime,
             );
-        let ev_real_usd =
-            p_positive * expected_profit_usd - gas_cost_usd - competition_penalty_usd - risk_penalty_usd;
+        let path_penalty_usd = self.path_execution_penalty_usd(
+            expected_profit_usd,
+            builder_pressure,
+            failure_pressure,
+            latency_penalty,
+            gas_pressure,
+            context_toxicity_score,
+        );
+        let ev_real_usd = p_positive * expected_profit_usd
+            - gas_cost_usd
+            - competition_penalty_usd
+            - risk_penalty_usd
+            - path_penalty_usd;
 
         let threshold_dynamic_usd = self.dynamic_threshold(
             mempool_density,
@@ -545,6 +648,8 @@ impl AdaptivePolicy {
             builder_pressure,
             regime,
         ) * self.chain_threshold_mult
+            * (1.0 + context_toxicity_score * 0.18)
+            * (1.0 - context_priority_score.clamp(0.0, 1.0) * 0.08)
             * historical_calibration.threshold_mult.max(1e-9);
         let threshold_dynamic_usd = if let Some(profile) = historical.as_ref() {
             let threshold_penalty = (profile.accepted_not_included_rate * 0.34
@@ -590,11 +695,14 @@ impl AdaptivePolicy {
             risk_score,
             competition_penalty_usd,
             risk_penalty_usd,
+            path_penalty_usd,
             mempool_density,
             cluster_heat,
             builder_pressure,
             latency_penalty,
             gas_pressure,
+            context_priority_score,
+            context_toxicity_score,
         }
     }
 
@@ -1107,6 +1215,24 @@ impl AdaptivePolicy {
         self.base_threshold_usd * regime_base * continuous
     }
 
+    fn path_execution_penalty_usd(
+        &self,
+        expected_profit_usd: f64,
+        builder_pressure: f64,
+        failure_pressure: f64,
+        latency_penalty: f64,
+        gas_pressure: f64,
+        context_toxicity_score: f64,
+    ) -> f64 {
+        let path_stress = (builder_pressure * 0.34
+            + failure_pressure * 0.24
+            + latency_penalty * 0.18
+            + gas_pressure * 0.12
+            + context_toxicity_score * 0.12)
+            .clamp(0.0, 1.0);
+        expected_profit_usd * path_stress * 0.18
+    }
+
     fn min_probability_threshold(&self, regime: MarketRegime) -> f64 {
         match regime {
             MarketRegime::Calm => 0.54,
@@ -1514,6 +1640,7 @@ mod tests {
                 executor_target_buffer_eth: 0.3,
                 executor_max_buffer_eth: 1.0,
                 uniswap_v2_factory: Some(Address::from_low_u64_be(20)),
+                uniswap_v3_factory: Some(Address::from_low_u64_be(22)),
                 mev_executor: Some(Address::from_low_u64_be(21)),
             },
         }
@@ -1545,6 +1672,8 @@ mod tests {
             cluster,
             pair,
             hour_utc: 14,
+            context_priority_score: 0.50,
+            context_toxicity_score: 0.50,
             expected_profit_wei: ethers::utils::parse_ether("0.01").unwrap(),
             execution_cost_wei: ethers::utils::parse_ether("0.001").unwrap(),
             gas_price_wei: U256::from(80_000_000_000u64),
@@ -1595,6 +1724,8 @@ mod tests {
                 cluster,
                 pair,
                 hour_utc: 10,
+                context_priority_score: 0.50,
+                context_toxicity_score: 0.50,
                 expected_profit_wei: ethers::utils::parse_ether("0.01").unwrap(),
                 execution_cost_wei: ethers::utils::parse_ether("0.001").unwrap(),
                 gas_price_wei: U256::from(3_000_000_000u64),
