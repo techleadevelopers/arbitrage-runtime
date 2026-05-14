@@ -4,6 +4,7 @@ use crate::dashboard::{
     TreasuryRecommendationUpdate,
 };
 use crate::mev::adaptive::{ClusterKey, ContextualOutcomeKind, RelayQuote, SharedAdaptivePolicy};
+use crate::mev::execution::payload_builder::AmmRouteKind;
 use crate::mev::opportunity::{wei_to_eth_f64, MevOpportunity};
 use crate::mev::pnl::tracker::{ExecutionResult, PnlTracker};
 use crate::rpc::RpcFleet;
@@ -203,7 +204,7 @@ impl ExecutionEngine {
                 format!(
                     "fee extraction tx submitted victim={:?} path={} tx={:?} expected_profit={:.6} ETH",
                     opportunity.victim_tx,
-                    relay_label,
+                    format_submit_path(&payload.amm_kind, &relay_label),
                     tx_hash,
                     wei_to_eth_f64(payload.expected_profit_wei)
                 ),
@@ -274,7 +275,7 @@ impl ExecutionEngine {
                         format!(
                             "fee extraction bundle submitted victim={:?} relay={} bundle={:?} tx={:?} expected_profit={:.6} ETH",
                             opportunity.victim_tx,
-                            relay.relay,
+                            format_submit_path(&payload.amm_kind, &relay.relay),
                             bundle_hash,
                             tx_hash,
                             wei_to_eth_f64(payload.expected_profit_wei)
@@ -896,6 +897,13 @@ fn relay_snapshot(quote: &RelayQuote) -> RelaySnapshot {
     }
 }
 
+fn format_submit_path(amm_kind: &AmmRouteKind, relay: &str) -> String {
+    match amm_kind {
+        AmmRouteKind::UniswapV2 => format!("v2@{relay}"),
+        AmmRouteKind::UniswapV3 { fee_tier, .. } => format!("v3:{}@{relay}", fee_tier),
+    }
+}
+
 async fn sign_executor_transaction(
     wallet: &LocalWallet,
     payload: &crate::mev::execution::payload_builder::ExecutionPayload,
@@ -986,6 +994,7 @@ mod tests {
                 executor_target_buffer_eth: 0.3,
                 executor_max_buffer_eth: 1.0,
                 uniswap_v2_factory: Some(Address::from_low_u64_be(20)),
+                uniswap_v3_factory: Some(Address::from_low_u64_be(22)),
                 mev_executor: Some(Address::from_low_u64_be(21)),
             },
         }
