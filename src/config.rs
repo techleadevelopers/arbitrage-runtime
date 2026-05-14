@@ -69,6 +69,7 @@ pub struct MevConfig {
     pub executor_target_buffer_eth: f64,
     pub executor_max_buffer_eth: f64,
     pub uniswap_v2_factory: Option<Address>,
+    pub uniswap_v3_factory: Option<Address>,
     pub mev_executor: Option<Address>,
 }
 
@@ -260,6 +261,10 @@ impl Config {
                 .unwrap_or_else(|_| "1.00".to_string())
                 .parse::<f64>()?,
             uniswap_v2_factory: env::var("MEV_UNISWAP_V2_FACTORY")
+                .ok()
+                .map(|value| value.trim().parse::<Address>())
+                .transpose()?,
+            uniswap_v3_factory: env::var("MEV_UNISWAP_V3_FACTORY")
                 .ok()
                 .map(|value| value.trim().parse::<Address>())
                 .transpose()?,
