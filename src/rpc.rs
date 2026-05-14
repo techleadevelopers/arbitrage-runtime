@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpcKind {
+    Tenderly,
     Alchemy,
     Infura,
 }
@@ -18,6 +19,7 @@ pub enum RpcKind {
 impl RpcKind {
     fn as_str(self) -> &'static str {
         match self {
+            RpcKind::Tenderly => "tenderly",
             RpcKind::Alchemy => "alchemy",
             RpcKind::Infura => "infura",
         }
@@ -93,7 +95,9 @@ impl RpcFleet {
         let mut endpoints = Vec::new();
 
         for (idx, (name, url)) in config.rpc_urls().into_iter().enumerate() {
-            let kind = if idx == 0 {
+            let kind = if name.starts_with("tenderly-") {
+                RpcKind::Tenderly
+            } else if idx == 0 {
                 RpcKind::Alchemy
             } else {
                 RpcKind::Infura
@@ -267,6 +271,8 @@ impl RpcFleet {
             0.0
         };
         let kind_bias = match (endpoint.kind, send_mode) {
+            (RpcKind::Tenderly, true) => -80.0,
+            (RpcKind::Tenderly, false) => -120.0,
             (RpcKind::Alchemy, true) => 0.0,
             (RpcKind::Alchemy, false) => -100.0,
             (RpcKind::Infura, true) => -50.0,
