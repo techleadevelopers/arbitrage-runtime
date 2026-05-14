@@ -45,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Network: {}", config.network);
     info!("Chain id: {}", config.chain_id);
     info!("Allow send: {}", config.allow_send);
+    info!("Tenderly RPC only: {}", config.tenderly_rpc_only);
     info!("Vault wallet: {:?}", config.vault_address);
     info!("Executor wallet: {:?}", config.executor_address);
     info!("Profit wallet: {:?}", config.profit_address);
@@ -63,6 +64,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     info!("Storage: {}", config.storage_path.display());
     info!("RPC endpoints configured: {}", rpc_fleet.endpoint_count());
+    if config.tenderly_rpc_only {
+        info!(
+            "Tenderly fork RPC: {}",
+            config
+                .fork_rpc_url()
+                .unwrap_or_else(|| "<missing fork url>".to_string())
+        );
+    }
     info!("Dashboard: http://{}", config.dashboard_addr);
     info!("Fee extraction enabled: {}", config.mev.enabled);
     info!(
