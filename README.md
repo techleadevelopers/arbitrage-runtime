@@ -358,6 +358,42 @@ This mode is intended for:
 - executor integration against forked state
 - isolated chain-specific testing without external RPC rotation
 
+## Recommended Operational Split
+
+For the current project posture, the recommended split is:
+
+### Live runtime
+
+Use your paid production RPC providers as the center of the active runtime:
+
+- Alchemy
+- Infura
+- any other paid low-latency RPC path you control
+
+This is the preferred mode for:
+
+- live mempool operation
+- real execution routing
+- production latency
+- relay competition
+
+### Fork and replay runtime
+
+Use `TENDERLY_FORK_URL_*` as the center of the forked evaluation path.
+
+This is the preferred mode for:
+
+- replay harness
+- payload validation
+- executor integration testing against real forked liquidity
+- scenario review without touching live capital
+
+In other words:
+
+- paid RPC remains the production center
+- Tenderly remains the fork/replay layer
+- `USE_TENDERLY_RPC_ONLY=true` stays available as an optional mode, not the default operating model
+
 ## Benchmarking
 
 The project also includes a network benchmark mode for infrastructure validation.
