@@ -293,6 +293,10 @@ function startV3FlashSwap(
 
 If the on-chain executor only supports the V2 selector, the runtime can still detect and model V3 opportunities, but live V3 execution will not succeed until the contract is upgraded to match the V3 ABI above.
 
+The canonical Solidity interface for this executor surface lives at:
+
+- `contracts/interfaces/IArbitrageRuntimeExecutor.sol`
+
 ## Replay Harness
 
 The project includes a replay harness for non-live evaluation on forked environments.
