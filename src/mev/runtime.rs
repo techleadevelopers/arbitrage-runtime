@@ -177,7 +177,12 @@ pub async fn run(
     let min_profit_wei = ethers::utils::parse_ether(config.mev.min_net_profit_eth.to_string())?;
     let adaptive = AdaptivePolicy::shared(&config);
     refresh_historical_profiles(&adaptive, &storage, &dashboard);
-    let executor = ExecutionEngine::new(config.clone(), rpc_fleet, dashboard.clone(), adaptive.clone());
+    let executor = ExecutionEngine::new(
+        config.clone(),
+        rpc_fleet.clone(),
+        dashboard.clone(),
+        adaptive.clone(),
+    );
     let mut last_profile_refresh = Instant::now();
     let mut batcher = MicroBatcher::default();
 
@@ -299,8 +304,8 @@ pub async fn run(
             continue;
         }
 
-        let Some(payload) = build_payload(
-            provider.clone(),
+        let Some(payload) = build_payload_with_fallback(
+            &rpc_fleet,
             &config,
             &signal,
             gas_price,
@@ -635,6 +640,32 @@ pub(crate) async fn build_payload<M: Middleware + 'static>(
             .await
         }
     }
+}
+
+async fn build_payload_with_fallback(
+    rpc_fleet: &RpcFleet,
+    config: &Config,
+    signal: &SwapSignal,
+    gas_price: U256,
+    context_signal: ContextSignal,
+) -> Option<crate::mev::execution::payload_builder::ExecutionPayload> {
+    for handle in rpc_fleet.read_candidates(3) {
+        rpc_fleet.reserve_read_selection(handle.id);
+        let started = Instant::now();
+        if let Some(payload) = build_payload(
+            handle.provider.clone(),
+            config,
+            signal,
+            gas_price,
+            context_signal,
+        )
+        .await
+        {
+            rpc_fleet.record_success(handle.id, started.elapsed(), None);
+            return Some(payload);
+        }
+    }
+    None
 }
 
 pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
