@@ -296,6 +296,14 @@ If the on-chain executor only supports the V2 selector, the runtime can still de
 The canonical Solidity interface for this executor surface lives at:
 
 - `contracts/interfaces/IArbitrageRuntimeExecutor.sol`
+- `contracts/base/ArbitrageRuntimeExecutorBase.sol`
+- `contracts/ArbitrageRuntimeExecutor.sol`
+
+Contract roles:
+
+- `IArbitrageRuntimeExecutor.sol`: canonical ABI surface expected by the Rust runtime
+- `ArbitrageRuntimeExecutorBase.sol`: production-shaped state machine with authorization, callbacks, execution lifecycle, and min-profit enforcement hooks
+- `ArbitrageRuntimeExecutor.sol`: deployable stub that still requires router integration and debt-settlement implementation for live profitability
 
 ## Replay Harness
 
