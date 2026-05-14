@@ -86,6 +86,7 @@ pub struct RpcHandle {
 #[derive(Debug)]
 pub struct RpcFleet {
     endpoints: Vec<Arc<RpcEndpoint>>,
+    rotation: AtomicUsize,
     read_preference: RpcPreference,
     send_preference: RpcPreference,
     score_cache: Mutex<ScoreCacheState>,
@@ -156,6 +157,7 @@ impl RpcFleet {
                 send_scores: vec![None; endpoints.len()],
             }),
             endpoints,
+            rotation: AtomicUsize::new(0),
             read_preference: config.rpc_read_preference,
             send_preference: config.rpc_send_preference,
         })
