@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>arbitrage-runtime // Control Surface</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Orbitron:wght@500;700;900&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/pixi.js@7.4.2/dist/pixi.min.js"></script>
+</head>
+<body>
+  <canvas id="fx-canvas"></canvas>
+  <div class="scanline"></div>
+  <div class="vignette"></div>
+
+  <header class="hud-header">
+    <div class="brand">
+      <div class="brand-glyph" aria-hidden="true">
+        <span class="glyph-ring"></span>
+        <span class="glyph-core">A</span>
+      </div>
+      <div class="brand-text">
+        <div class="brand-line">ARBITRAGE RUNTIME</div>
+        <div class="brand-sub">execution observability // real-time control surface</div>
+      </div>
+    </div>
+
+    <div class="header-meta">
+      <div class="meta-cell">
+        <span class="meta-label">RUNTIME</span>
+        <span id="meta-runtime" class="meta-value">--</span>
+      </div>
+      <div class="meta-cell">
+        <span class="meta-label">REGIME</span>
+        <span id="meta-regime" class="meta-value">--</span>
+      </div>
+      <div class="meta-cell">
+        <span class="meta-label">NETWORK</span>
+        <span id="meta-network" class="meta-value">--</span>
+      </div>
+      <div class="meta-cell">
+        <span class="meta-label">SEND PATH</span>
+        <span id="meta-send-path" class="meta-value">--</span>
+      </div>
+      <div class="meta-cell">
+        <span class="meta-label">ALLOW SEND</span>
+        <span id="meta-allow-send" class="meta-value">--</span>
+      </div>
+      <div class="meta-cell wide">
+        <span class="meta-label">EXECUTOR</span>
+        <span id="meta-executor" class="meta-value mono">--</span>
+      </div>
+      <div class="meta-cell">
+        <span class="meta-label">UPLINK</span>
+        <span id="meta-uplink" class="meta-value status-on"><span class="dot"></span> LIVE</span>
+      </div>
+      <div class="meta-cell">
+        <span class="meta-label">UPTIME</span>
+        <span id="meta-uptime" class="meta-value">00:00:00</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="layout-shell">
+    <aside class="sidebar">
+      <nav class="side-nav">
+        <a class="nav-item active" data-view="command" href="#command">
+          <span class="nav-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 4v5c0 5-3.5 9-8 10-4.5-1-8-5-8-10V7z"/><path d="M9 12h6"/><path d="M12 9v6"/></svg>
+          </span>
+          <span class="nav-label">COMMAND</span>
+        </a>
+        <a class="nav-item" data-view="execution" href="#execution">
+          <span class="nav-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h12"/><path d="M13 5l7 7-7 7"/><path d="M4 5h4v4"/><path d="M4 19h4v-4"/></svg>
+          </span>
+          <span class="nav-label">EXECUTION</span>
+        </a>
+        <a class="nav-item" data-view="relays" href="#relays">
+          <span class="nav-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="5" rx="1.5"/><rect x="3" y="15" width="18" height="5" rx="1.5"/><circle cx="7" cy="6.5" r="0.9" fill="currentColor"/><circle cx="7" cy="17.5" r="0.9" fill="currentColor"/><path d="M11 6.5h7M11 17.5h7"/></svg>
+          </span>
+          <span class="nav-label">RELAYS</span>
+        </a>
+        <a class="nav-item" data-view="treasury" href="#treasury">
+          <span class="nav-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h12v4"/><path d="M3 7v11a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-3"/><path d="M21 11h-5a2 2 0 0 0 0 4h5z"/><circle cx="17" cy="13" r="0.8" fill="currentColor"/></svg>
+          </span>
+          <span class="nav-label">TREASURY</span>
+        </a>
+        <a class="nav-item" data-view="events" href="#events">
+          <span class="nav-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 7 9 12 5 17"/><line x1="12" y1="18" x2="20" y2="18"/></svg>
+          </span>
+          <span class="nav-label">EVENTS</span>
+        </a>
+      </nav>
+
+      <div class="side-foot">
+        <div class="side-foot-label">LIVE STATE</div>
+        <div class="side-foot-line"><span class="dot ok"></span> execution surface active</div>
+        <div class="side-foot-line"><span class="dot ok"></span> relay telemetry loaded</div>
+      </div>
+    </aside>
+
+    <main class="hud-main">
+      <section class="view active" data-view="command">
+        <div class="hud-grid">
+          <section class="stat-strip">
+            <div class="stat-card neon-cyan">
+              <div class="stat-label">OPPORTUNITIES SEEN</div>
+              <div class="stat-value" id="stat-opportunities">0</div>
+              <div class="stat-foot">fast rejects <span id="stat-fast-rejects">0</span></div>
+            </div>
+            <div class="stat-card neon-magenta">
+              <div class="stat-label">EXECUTIONS</div>
+              <div class="stat-value" id="stat-executions">0</div>
+              <div class="stat-foot">current acceptance <span id="stat-acceptance">0.0%</span></div>
+            </div>
+            <div class="stat-card neon-green">
+              <div class="stat-label">REALIZED PNL</div>
+              <div class="stat-value" id="stat-realized-pnl">0.000000</div>
+              <div class="stat-foot">tracked from outcomes</div>
+            </div>
+            <div class="stat-card neon-red">
+              <div class="stat-label">REJECT LOAD</div>
+              <div class="stat-value" id="stat-reject-load">0</div>
+              <div class="stat-foot">active reject reasons <span id="stat-reject-types">0</span></div>
+            </div>
+            <div class="stat-card neon-amber stat-card-hero">
+              <div class="stat-label">EXECUTION STATUS</div>
+              <div class="stat-value" id="stat-execution-status">HOLD</div>
+              <div class="stat-foot">treasury <span id="stat-treasury-action">hold</span> // path <span id="stat-send-path">--</span></div>
+            </div>
+          </section>
+
+          <section class="panel panel-latency">
+            <div class="panel-head">
+              <h2>
+                <span class="panel-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.4" fill="currentColor"/><path d="M12 12L20 7"/></svg>
+                </span>
+                PIPELINE RADAR
+              </h2>
+              <span class="panel-tag">latency and throughput surface</span>
+            </div>
+            <div class="panel-body latency-body">
+              <div class="latency-radar">
+                <canvas id="radar-canvas" width="320" height="320"></canvas>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel panel-residual">
+            <div class="panel-head">
+              <h2>
+                <span class="panel-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7 21h10"/><path d="M12 17v4"/><path d="M6 4h12v4a6 6 0 0 1-12 0z"/><path d="M6 5H3v2a3 3 0 0 0 3 3"/><path d="M18 5h3v2a3 3 0 0 1-3 3"/></svg>
+                </span>
+                OUTCOME SURFACE
+              </h2>
+              <span class="panel-tag">latest realized execution outcomes</span>
+            </div>
+            <div class="panel-body">
+              <table class="data-table" id="outcome-table">
+                <thead>
+                  <tr>
+                    <th>TIME</th>
+                    <th>RELAY/PATH</th>
+                    <th>PAIR</th>
+                    <th>OUTCOME</th>
+                    <th>EXPECTED</th>
+                    <th>REALIZED</th>
+                  </tr>
+                </thead>
+                <tbody id="outcome-body"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" data-view="execution">
+        <div class="view-head">
+          <h1 class="view-title"><span class="title-bracket">»</span> EXECUTION OBSERVABILITY</h1>
+          <p class="view-sub">Runtime state, reject distribution, pipeline health and live wallets</p>
+        </div>
+
+        <div class="ops-toolbar">
+          <div class="ops-stat">
+            <span class="ops-stat-label">RUNTIME</span>
+            <span class="ops-stat-value" id="exec-runtime">--</span>
+          </div>
+          <div class="ops-stat">
+            <span class="ops-stat-label">REGIME</span>
+            <span class="ops-stat-value" id="exec-regime">--</span>
+          </div>
+          <div class="ops-stat">
+            <span class="ops-stat-label">SEND PATH</span>
+            <span class="ops-stat-value" id="exec-send-path">--</span>
+          </div>
+          <div class="ops-stat">
+            <span class="ops-stat-label">HOT WALLETS</span>
+            <span class="ops-stat-value" id="exec-hot-wallets">0</span>
+          </div>
+        </div>
+
+        <div class="layout-two">
+          <section class="panel">
+            <div class="panel-head">
+              <h2><span class="panel-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6h16M4 12h16M4 18h10"/></svg></span> REJECT REASONS</h2>
+              <span class="panel-tag">live gate pressure</span>
+            </div>
+            <div class="panel-body">
+              <table class="op-table">
+                <thead>
+                  <tr><th>STAGE</th><th>REASON</th><th>COUNT</th></tr>
+                </thead>
+                <tbody id="reject-body"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2><span class="panel-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 7a2 2 0 0 1 2-2h12v4"/><path d="M3 7v11a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-3"/><path d="M21 11h-5a2 2 0 0 0 0 4h5z"/></svg></span> HOT WALLETS</h2>
+              <span class="panel-tag">balance and execution posture</span>
+            </div>
+            <div class="panel-body op-table-wrap">
+              <table class="op-table">
+                <thead>
+                  <tr><th>WALLET</th><th>BALANCE</th><th>RPC</th></tr>
+                </thead>
+                <tbody id="wallet-body"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" data-view="relays">
+        <div class="view-head">
+          <h1 class="view-title"><span class="title-bracket">»</span> RELAY + RPC OBSERVABILITY</h1>
+          <p class="view-sub">Execution path quality, relay ranking and RPC fleet health</p>
+        </div>
+
+        <div class="layout-two">
+          <section class="panel">
+            <div class="panel-head">
+              <h2><span class="panel-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="4" width="18" height="5" rx="1.5"/><rect x="3" y="15" width="18" height="5" rx="1.5"/></svg></span> RELAY RANKING</h2>
+              <span class="panel-tag">selected execution paths</span>
+            </div>
+            <div class="panel-body op-table-wrap">
+              <table class="op-table">
+                <thead>
+                  <tr><th>RELAY</th><th>SCORE</th><th>PRESSURE</th><th>ACCEPT</th><th>INCLUDE</th><th>WIN</th><th>MISS</th></tr>
+                </thead>
+                <tbody id="relay-body"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2><span class="panel-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3v18"/><path d="M3 12h18"/></svg></span> RPC FLEET</h2>
+              <span class="panel-tag">read and send surface</span>
+            </div>
+            <div class="panel-body">
+              <div class="rpc-ops-grid" id="rpc-grid"></div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" data-view="treasury">
+        <div class="view-head">
+          <h1 class="view-title"><span class="title-bracket">»</span> TREASURY + CUSTODY STATE</h1>
+          <p class="view-sub">Executor buffer, vault/profit roles and rebalance trail</p>
+        </div>
+
+        <div class="layout-two">
+          <section class="panel">
+            <div class="panel-head">
+              <h2><span class="panel-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 7a2 2 0 0 1 2-2h12v4"/><path d="M3 7v11a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-3"/><path d="M21 11h-5a2 2 0 0 0 0 4h5z"/></svg></span> TREASURY CONTROL</h2>
+              <span class="panel-tag">executor wallet posture</span>
+            </div>
+            <div class="panel-body treasury-grid">
+              <div class="treasury-card">
+                <div class="metric-label">VAULT</div>
+                <div class="treasury-mono" id="treasury-vault">--</div>
+              </div>
+              <div class="treasury-card">
+                <div class="metric-label">EXECUTOR</div>
+                <div class="treasury-mono" id="treasury-executor">--</div>
+              </div>
+              <div class="treasury-card">
+                <div class="metric-label">PROFIT</div>
+                <div class="treasury-mono" id="treasury-profit">--</div>
+              </div>
+              <div class="treasury-card">
+                <div class="metric-label">BALANCE</div>
+                <div class="metric-value-small" id="treasury-balance">--</div>
+              </div>
+              <div class="treasury-card">
+                <div class="metric-label">BUFFER STATUS</div>
+                <div class="metric-value-small" id="treasury-status">--</div>
+              </div>
+              <div class="treasury-card">
+                <div class="metric-label">ACTION</div>
+                <div class="metric-value-small" id="treasury-action">--</div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2><span class="panel-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><polyline points="5 7 9 12 5 17"/><line x1="12" y1="18" x2="20" y2="18"/></svg></span> REBALANCE TRAIL</h2>
+              <span class="panel-tag">latest treasury recommendations</span>
+            </div>
+            <div class="panel-body op-table-wrap">
+              <table class="op-table">
+                <thead>
+                  <tr><th>TIME</th><th>ACTION</th><th>STATUS</th><th>AMOUNT</th><th>BALANCE</th></tr>
+                </thead>
+                <tbody id="treasury-body"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" data-view="events">
+        <div class="view-head">
+          <h1 class="view-title"><span class="title-bracket">»</span> LIVE EVENT STREAM</h1>
+          <p class="view-sub">Operational tail for runtime state, execution, treasury and relay events</p>
+        </div>
+        <div class="panel">
+          <div class="panel-body console" id="event-console"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <footer class="hud-foot">
+    <span>// mempool -> impact -> adaptive gate -> execution -> realized outcome</span>
+    <span class="foot-right">FPS <span id="foot-fps">60</span> · TICK <span id="foot-tick">0</span></span>
+  </footer>
+
+  <script type="module" src="/js/data.js"></script>
+  <script type="module" src="/js/fx.js"></script>
+  <script type="module" src="/js/radar.js"></script>
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>
