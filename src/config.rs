@@ -26,7 +26,7 @@ pub struct Config {
     pub chain_id: u64,
     pub allow_send: bool,
     pub tenderly_rpc_only: bool,
-    pub alchemy_key: String,
+    pub alchemy_keys: Vec<String>,
     pub infura_ids: Vec<String>,
     pub flashbots_relay: String,
     pub builder_relays: Vec<String>,
@@ -116,10 +116,14 @@ impl Config {
             .unwrap_or_else(|_| "false".to_string())
             .trim()
             .eq_ignore_ascii_case("true");
-        let alchemy_key = if tenderly_rpc_only {
-            env::var("ALCHEMY_KEY").unwrap_or_default().trim().to_string()
+        let alchemy_keys = if tenderly_rpc_only {
+            parse_alchemy_keys()
         } else {
-            required_env("ALCHEMY_KEY")?
+            let keys = parse_alchemy_keys();
+            if keys.is_empty() {
+                return Err("environment variable ALCHEMY_KEY is not configured".into());
+            }
+            keys
         };
         let flashbots_relay = if network == "ethereum" {
             required_env("FLASHBOTS_RELAY")?
@@ -299,7 +303,7 @@ impl Config {
             chain_id,
             allow_send,
             tenderly_rpc_only,
-            alchemy_key,
+            alchemy_keys,
             infura_ids,
             flashbots_relay,
             builder_relays,
@@ -329,9 +333,11 @@ impl Config {
                 .unwrap_or_default();
         }
 
-        let mut urls = Vec::with_capacity(self.infura_ids.len() + 1);
-        if let Some(alchemy_url) = alchemy_url_for_network(&self.network, &self.alchemy_key) {
-            urls.push(("alchemy-primary".to_string(), alchemy_url));
+        let mut urls = Vec::with_capacity(self.infura_ids.len() + self.alchemy_keys.len());
+        for (idx, alchemy_key) in self.alchemy_keys.iter().enumerate() {
+            if let Some(alchemy_url) = alchemy_url_for_network(&self.network, alchemy_key) {
+                urls.push((format!("alchemy-{}", idx + 1), alchemy_url));
+            }
         }
 
         for (idx, infura_id) in self
@@ -357,7 +363,11 @@ impl Config {
         }
         self.mempool_ws_url
             .clone()
-            .or_else(|| alchemy_ws_url_for_network(&self.network, &self.alchemy_key))
+            .or_else(|| {
+                self.alchemy_keys
+                    .first()
+                    .and_then(|key| alchemy_ws_url_for_network(&self.network, key))
+            })
     }
 
     pub fn uses_bundle_relays(&self) -> bool {
@@ -391,6 +401,32 @@ fn required_env(name: &str) -> Result<String, Box<dyn std::error::Error>> {
         return Err(format!("environment variable {name} is not configured").into());
     }
     Ok(trimmed.to_string())
+}
+
+fn parse_alchemy_keys() -> Vec<String> {
+    let mut keys = Vec::new();
+
+    if let Ok(value) = env::var("ALCHEMY_KEY") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            keys.push(trimmed.to_string());
+        }
+    }
+
+    for idx in 2..=8 {
+        if let Ok(value) = env::var(format!("ALCHEMY_KEY_{idx}")) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty()
+                && !keys
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+            {
+                keys.push(trimmed.to_string());
+            }
+        }
+    }
+
+    keys
 }
 
 fn is_placeholder(value: &str) -> bool {
