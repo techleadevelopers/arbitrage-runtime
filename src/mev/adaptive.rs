@@ -1591,7 +1591,7 @@ mod tests {
                 _ => 1,
             },
             allow_send: true,
-            alchemy_key: "test".to_string(),
+            alchemy_keys: vec!["test".to_string()],
             infura_ids: Vec::new(),
             flashbots_relay: "https://relay.flashbots.net".to_string(),
             builder_relays: vec![
