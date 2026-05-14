@@ -303,7 +303,7 @@ Contract roles:
 
 - `IArbitrageRuntimeExecutor.sol`: canonical ABI surface expected by the Rust runtime
 - `ArbitrageRuntimeExecutorBase.sol`: production-shaped state machine with authorization, callbacks, execution lifecycle, and min-profit enforcement hooks
-- `ArbitrageRuntimeExecutor.sol`: deployable stub that still requires router integration and debt-settlement implementation for live profitability
+- `ArbitrageRuntimeExecutor.sol`: concrete ERC20-routed executor with V2 router execution, V3 exactInput execution, V2 flashswap repayment, and V3 callback settlement
 
 ## Replay Harness
 
