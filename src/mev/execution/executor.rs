@@ -108,6 +108,20 @@ impl ExecutionEngine {
         let buffer_status = self.hot_wallet_status(hot_balance_eth);
         self.dashboard.set_executor_balance(hot_balance_eth, buffer_status);
         self.maybe_emit_treasury_signal(hot_balance_eth);
+        if let Some(max_gas_price_wei) = self.config.mev.max_gas_price_wei() {
+            if send_context.gas_price > max_gas_price_wei {
+                self.dashboard.event(
+                    "warn",
+                    format!(
+                        "fee extraction blocked victim={:?}: rpc gas price {:.2} gwei exceeds cap {} gwei",
+                        opportunity.victim_tx,
+                        wei_to_gwei_f64(send_context.gas_price),
+                        self.config.mev.max_gas_price_gwei.unwrap_or_default()
+                    ),
+                );
+                return Ok(());
+            }
+        }
         if hot_balance_eth < self.config.mev.executor_min_buffer_eth {
             self.dashboard.event(
                 "warn",
@@ -203,6 +217,7 @@ impl ExecutionEngine {
 
             let mut last_submit_error: Option<String> = None;
             for endpoint in submit_endpoints {
+                self.rpc_fleet.reserve_send_selection(endpoint.id);
                 let started = std::time::Instant::now();
                 match endpoint.provider.send_raw_transaction(payload.tx.clone()).await {
                     Ok(pending) => {
@@ -401,15 +416,11 @@ impl ExecutionEngine {
             token_out: opportunity.token_out,
             selector: opportunity.selector,
         };
-        for _ in 0..12 {
+        for _ in 0..10 {
             for handle in self.read_probe_handles(preferred_endpoint_id) {
                 let receipt_started = std::time::Instant::now();
                 let receipt = match handle.provider.get_transaction_receipt(tx_hash).await {
-                    Ok(receipt) => {
-                        self.rpc_fleet
-                            .record_success(handle.id, receipt_started.elapsed(), None);
-                        receipt
-                    }
+                    Ok(receipt) => receipt,
                     Err(err) => {
                         let err_text = err.to_string();
                         self.rpc_fleet.record_failure(
@@ -423,6 +434,8 @@ impl ExecutionEngine {
                 let Some(receipt) = receipt else {
                     continue;
                 };
+                self.rpc_fleet
+                    .record_success(handle.id, receipt_started.elapsed(), None);
                 let gas_used = receipt.gas_used.unwrap_or_default().as_u64();
                 let effective_gas_price = receipt.effective_gas_price.unwrap_or_default();
                 let gas_paid_wei = receipt
@@ -502,7 +515,7 @@ impl ExecutionEngine {
                 );
                 return Ok(result);
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
 
         self.dashboard.event(
@@ -592,28 +605,20 @@ impl ExecutionEngine {
     async fn load_send_context(&self, wallet_address: Address) -> Result<SendContext, String> {
         let mut last_error: Option<String> = None;
         for endpoint in self.rpc_fleet.send_candidates(3) {
+            self.rpc_fleet.reserve_send_selection(endpoint.id);
             let started = std::time::Instant::now();
             let result = async {
-                let hot_balance = endpoint
-                    .provider
-                    .get_balance(wallet_address, Some(BlockNumber::Pending.into()))
-                    .await
-                    .map_err(|err| err.to_string())?;
-                let chain_nonce = endpoint
-                    .provider
-                    .get_transaction_count(wallet_address, Some(BlockNumber::Pending.into()))
-                    .await
-                    .map_err(|err| err.to_string())?;
-                let gas_price = endpoint
-                    .provider
-                    .get_gas_price()
-                    .await
-                    .map_err(|err| err.to_string())?;
-                let block = endpoint
-                    .provider
-                    .get_block_number()
-                    .await
-                    .map_err(|err| err.to_string())?;
+                let (hot_balance, chain_nonce, gas_price, block) = tokio::try_join!(
+                    endpoint
+                        .provider
+                        .get_balance(wallet_address, Some(BlockNumber::Pending.into())),
+                    endpoint
+                        .provider
+                        .get_transaction_count(wallet_address, Some(BlockNumber::Pending.into())),
+                    endpoint.provider.get_gas_price(),
+                    endpoint.provider.get_block_number(),
+                )
+                .map_err(|err| err.to_string())?;
 
                 Ok::<_, String>(SendContext {
                     endpoint: endpoint.clone(),
@@ -1012,6 +1017,10 @@ fn signed_tx_hash(raw: &Bytes) -> H256 {
     H256::from(ethers::utils::keccak256(raw.as_ref()))
 }
 
+fn wei_to_gwei_f64(value: U256) -> f64 {
+    value.to_string().parse::<f64>().unwrap_or(0.0) / 1e9
+}
+
 fn relay_snapshot(quote: &RelayQuote) -> RelaySnapshot {
     RelaySnapshot {
         relay: quote.relay.clone(),
@@ -1103,7 +1112,7 @@ mod tests {
             rpc_send_preference: RpcPreference::Auto,
             storage_path: PathBuf::from("test.sqlite"),
             dashboard_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8787),
-            mempool_ws_url: None,
+            mempool_ws_urls: Vec::new(),
             mev: MevConfig {
                 enabled: true,
                 capital_eth: 0.5,
@@ -1117,6 +1126,7 @@ mod tests {
                 gas_safety_margin_bps: 12_500,
                 max_pending_age_ms: 1500,
                 max_gas_per_tx: 260_000,
+                max_gas_price_gwei: Some(30),
                 max_price_impact_bps: 250,
                 slippage_protection_bps: 50,
                 min_profit_usd: 2.0,
