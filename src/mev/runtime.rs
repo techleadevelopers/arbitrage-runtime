@@ -250,6 +250,15 @@ pub async fn run(
         if let Some(max_gas_price_wei) = config.mev.max_gas_price_wei() {
             if gas_price > max_gas_price_wei {
                 dashboard.record_reject_reason("gas_price_cap", "victim_gas_price_above_cap");
+                dashboard.event(
+                    "warn",
+                    format!(
+                        "opportunity skipped victim={:?}: gas price {:.2} gwei above cap {} gwei",
+                        tx.hash,
+                        wei_to_gwei_f64(gas_price),
+                        config.mev.max_gas_price_gwei.unwrap_or_default()
+                    ),
+                );
                 debug!(
                     "fee extraction candidate skipped {:?}: victim gas price {} gwei exceeds cap {} gwei",
                     tx.hash,
