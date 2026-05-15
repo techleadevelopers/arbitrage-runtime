@@ -1,6 +1,6 @@
 use clap::Parser;
 use ethers::signers::{LocalWallet, Signer};
-use ethers::types::Address;
+use ethers::types::{Address, U256};
 use serde::Deserialize;
 use std::env;
 use std::net::SocketAddr;
@@ -43,7 +43,7 @@ pub struct Config {
     pub rpc_send_preference: RpcPreference,
     pub storage_path: PathBuf,
     pub dashboard_addr: SocketAddr,
-    pub mempool_ws_url: Option<String>,
+    pub mempool_ws_urls: Vec<String>,
     pub mev: MevConfig,
 }
 
@@ -61,6 +61,7 @@ pub struct MevConfig {
     pub gas_safety_margin_bps: u64,
     pub max_pending_age_ms: u64,
     pub max_gas_per_tx: u64,
+    pub max_gas_price_gwei: Option<u64>,
     pub max_price_impact_bps: u64,
     pub slippage_protection_bps: u64,
     pub min_profit_usd: f64,
@@ -207,10 +208,7 @@ impl Config {
         let dashboard_addr = env::var("DASHBOARD_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:8787".to_string())
             .parse::<SocketAddr>()?;
-        let mempool_ws_url = env::var("MEMPOOL_WS_URL")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        let mempool_ws_urls = parse_mempool_ws_urls(&network, tenderly_rpc_only, &alchemy_keys);
         let mev = MevConfig {
             enabled: env::var("MEV_ENGINE_ENABLED")
                 .unwrap_or_else(|_| "false".to_string())
@@ -249,6 +247,12 @@ impl Config {
             max_gas_per_tx: env::var("MEV_MAX_GAS_PER_TX")
                 .unwrap_or_else(|_| "260000".to_string())
                 .parse::<u64>()?,
+            max_gas_price_gwei: env::var("MEV_MAX_GAS_PRICE_GWEI")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(|value| value.parse::<u64>())
+                .transpose()?,
             max_price_impact_bps: env::var("MEV_MAX_PRICE_IMPACT_BPS")
                 .unwrap_or_else(|_| "250".to_string())
                 .parse::<u64>()?,
@@ -320,7 +324,7 @@ impl Config {
             rpc_send_preference,
             storage_path,
             dashboard_addr,
-            mempool_ws_url,
+            mempool_ws_urls,
             mev,
         })
     }
@@ -354,20 +358,17 @@ impl Config {
         urls
     }
 
-    pub fn mempool_ws_url(&self) -> Option<String> {
+    pub fn mempool_ws_urls(&self) -> Vec<String> {
         if self.tenderly_rpc_only {
-            return self
-                .mempool_ws_url
-                .clone()
-                .filter(|value| !value.is_empty());
+            return self.mempool_ws_urls.clone();
         }
-        self.mempool_ws_url
-            .clone()
-            .or_else(|| {
-                self.alchemy_keys
-                    .first()
-                    .and_then(|key| alchemy_ws_url_for_network(&self.network, key))
-            })
+        if !self.mempool_ws_urls.is_empty() {
+            return self.mempool_ws_urls.clone();
+        }
+        self.alchemy_keys
+            .iter()
+            .filter_map(|key| alchemy_ws_url_for_network(&self.network, key))
+            .collect()
     }
 
     pub fn uses_bundle_relays(&self) -> bool {
@@ -386,6 +387,13 @@ impl Config {
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
+    }
+}
+
+impl MevConfig {
+    pub fn max_gas_price_wei(&self) -> Option<U256> {
+        self.max_gas_price_gwei
+            .map(|value| U256::from(value).saturating_mul(U256::from(1_000_000_000u64)))
     }
 }
 
@@ -427,6 +435,44 @@ fn parse_alchemy_keys() -> Vec<String> {
     }
 
     keys
+}
+
+fn parse_mempool_ws_urls(network: &str, tenderly_rpc_only: bool, alchemy_keys: &[String]) -> Vec<String> {
+    let mut urls: Vec<String> = Vec::new();
+
+    if let Ok(value) = env::var("MEMPOOL_WS_URL") {
+        for item in value.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+            if !urls
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(item))
+            {
+                urls.push(item.to_string());
+            }
+        }
+    }
+
+    for idx in 2..=6 {
+        if let Ok(value) = env::var(format!("MEMPOOL_WS_URL_{idx}")) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty()
+                && !urls
+                    .iter()
+                    .any(|existing: &String| existing.eq_ignore_ascii_case(trimmed))
+            {
+                urls.push(trimmed.to_string());
+            }
+        }
+    }
+
+    if urls.is_empty() && !tenderly_rpc_only {
+        for key in alchemy_keys {
+            if let Some(ws_url) = alchemy_ws_url_for_network(network, key) {
+                urls.push(ws_url);
+            }
+        }
+    }
+
+    urls
 }
 
 fn is_placeholder(value: &str) -> bool {
