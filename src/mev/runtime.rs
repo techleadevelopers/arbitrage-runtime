@@ -13,9 +13,11 @@ use crate::storage::Storage;
 use chrono::Timelike;
 use ethers::abi::{self, ParamType, Token};
 use ethers::providers::{Middleware, Provider, StreamExt, Ws};
-use ethers::types::{Address, Transaction, U256};
+use ethers::types::{Address, H256, Transaction, U256};
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 const MICROBATCH_WINDOW_MS: u64 = 45;
@@ -33,7 +35,11 @@ const V3_EXACT_INPUT: [u8; 4] = [0xc0, 0x4b, 0x8d, 0x59];
 #[derive(Debug, Clone)]
 pub(crate) enum SwapKind {
     V2,
-    V3 { fee_tier: u32, encoded_path: ethers::types::Bytes, hops: usize },
+    V3 {
+        fee_tier: u32,
+        encoded_path: ethers::types::Bytes,
+        hops: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -163,16 +169,15 @@ pub async fn run(
     dashboard: DashboardHandle,
     storage: Storage,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(ws_url) = config.mempool_ws_url() else {
+    let ws_urls = config.mempool_ws_urls();
+    if ws_urls.is_empty() {
         return Err("fee extraction runtime requires MEMPOOL websocket URL".into());
-    };
+    }
     if !config.allow_send {
         return Err("fee extraction runtime requires ALLOW_SEND=true".into());
     }
 
-    let ws = Ws::connect(ws_url.clone()).await?;
-    let provider = Arc::new(Provider::new(ws));
-    let mut stream = provider.subscribe_pending_txs().await?;
+    let mut tx_hash_stream = connect_mempool_fan_in(&ws_urls, &dashboard);
     let min_large_swap_wei = ethers::utils::parse_ether(config.mev.min_large_swap_eth.to_string())?;
     let min_profit_wei = ethers::utils::parse_ether(config.mev.min_net_profit_eth.to_string())?;
     let adaptive = AdaptivePolicy::shared(&config);
@@ -190,11 +195,14 @@ pub async fn run(
         "info",
         format!(
             "fee extraction runtime connected to {} min_large_swap={:.3} ETH min_profit={:.6} ETH",
-            ws_url, config.mev.min_large_swap_eth, config.mev.min_net_profit_eth
+            ws_urls.join(" | "), config.mev.min_large_swap_eth, config.mev.min_net_profit_eth
         ),
     );
 
-    while let Some(tx_hash) = stream.next().await {
+    let mut seen_hashes = HashSet::new();
+    let mut seen_order = VecDeque::new();
+
+    while let Some(tx_hash) = tx_hash_stream.recv().await {
         if batcher.should_flush() {
             flush_candidate_batch(&mut batcher, &executor, &dashboard).await?;
         }
@@ -202,14 +210,12 @@ pub async fn run(
             refresh_historical_profiles(&adaptive, &storage, &dashboard);
             last_profile_refresh = Instant::now();
         }
+        if !mark_seen_tx(&mut seen_hashes, &mut seen_order, tx_hash) {
+            continue;
+        }
         let lookup_started = Instant::now();
-        let tx = match provider.get_transaction(tx_hash).await {
-            Ok(Some(tx)) => tx,
-            Ok(None) => continue,
-            Err(err) => {
-                warn!("pending tx lookup failed for {:?}: {}", tx_hash, err);
-                continue;
-            }
+        let Some(tx) = lookup_pending_tx(&rpc_fleet, tx_hash).await else {
+            continue;
         };
 
         dashboard.record_latency(
@@ -240,6 +246,18 @@ pub async fn run(
         if gas_price.is_zero() {
             debug!("fee extraction candidate skipped {:?}: missing gas price", tx.hash);
             continue;
+        }
+        if let Some(max_gas_price_wei) = config.mev.max_gas_price_wei() {
+            if gas_price > max_gas_price_wei {
+                dashboard.record_reject_reason("gas_price_cap", "victim_gas_price_above_cap");
+                debug!(
+                    "fee extraction candidate skipped {:?}: victim gas price {} gwei exceeds cap {} gwei",
+                    tx.hash,
+                    wei_to_gwei_f64(gas_price),
+                    config.mev.max_gas_price_gwei.unwrap_or_default()
+                );
+                continue;
+            }
         }
         let fast_gate = fast_preflight_gate(
             &signal,
@@ -425,6 +443,82 @@ fn build_opportunity(
         selector: signal.selector,
         preferred_relay,
     }
+}
+
+fn connect_mempool_fan_in(
+    ws_urls: &[String],
+    dashboard: &DashboardHandle,
+) -> mpsc::UnboundedReceiver<H256> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    for ws_url in ws_urls.iter().cloned() {
+        let tx = tx.clone();
+        let dashboard = dashboard.clone();
+        tokio::spawn(async move {
+            loop {
+                match Ws::connect(ws_url.clone()).await {
+                    Ok(ws) => {
+                        dashboard.event("info", format!("mempool ws connected {}", ws_url));
+                        let provider = Provider::new(ws);
+                        let subscribe_result = provider.subscribe_pending_txs().await;
+                        match subscribe_result {
+                            Ok(mut stream) => {
+                                while let Some(hash) = stream.next().await {
+                                    if tx.send(hash).is_err() {
+                                        return;
+                                    }
+                                }
+                                dashboard.event("warn", format!("mempool ws stream ended {}", ws_url));
+                            }
+                            Err(err) => {
+                                dashboard.event("warn", format!("mempool ws subscribe failed {}: {}", ws_url, err));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        dashboard.event("warn", format!("mempool ws connect failed {}: {}", ws_url, err));
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(900)).await;
+            }
+        });
+    }
+    rx
+}
+
+fn mark_seen_tx(
+    seen_hashes: &mut HashSet<H256>,
+    seen_order: &mut VecDeque<H256>,
+    tx_hash: H256,
+) -> bool {
+    if seen_hashes.contains(&tx_hash) {
+        return false;
+    }
+    seen_hashes.insert(tx_hash);
+    seen_order.push_back(tx_hash);
+    while seen_order.len() > 8_192 {
+        if let Some(old) = seen_order.pop_front() {
+            seen_hashes.remove(&old);
+        }
+    }
+    true
+}
+
+async fn lookup_pending_tx(rpc_fleet: &RpcFleet, tx_hash: H256) -> Option<Transaction> {
+    for handle in rpc_fleet.read_candidates(3) {
+        rpc_fleet.reserve_read_selection(handle.id);
+        let started = Instant::now();
+        match handle.provider.get_transaction(tx_hash).await {
+            Ok(Some(tx)) => {
+                rpc_fleet.record_success(handle.id, started.elapsed(), Some(tx.block_number.unwrap_or_default().as_u64()));
+                return Some(tx);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                rpc_fleet.record_failure(handle.id, RpcFleet::classify_failure(&err.to_string()));
+            }
+        }
+    }
+    None
 }
 
 pub(crate) fn passes_quality_gate(
@@ -624,10 +718,14 @@ pub(crate) async fn build_payload<M: Middleware + 'static>(
     signal: &SwapSignal,
     gas_price: U256,
     context_signal: ContextSignal,
-) -> Option<crate::mev::execution::payload_builder::ExecutionPayload> {
+) -> Result<crate::mev::execution::payload_builder::ExecutionPayload, String> {
     match &signal.kind {
         SwapKind::V2 => build_v2_payload(provider, config, signal, gas_price, context_signal).await,
-        SwapKind::V3 { fee_tier, encoded_path, .. } => {
+        SwapKind::V3 {
+            fee_tier,
+            encoded_path,
+            ..
+        } => {
             build_v3_payload(
                 provider,
                 config,
@@ -652,7 +750,7 @@ async fn build_payload_with_fallback(
     for handle in rpc_fleet.read_candidates(3) {
         rpc_fleet.reserve_read_selection(handle.id);
         let started = Instant::now();
-        if let Some(payload) = build_payload(
+        match build_payload(
             handle.provider.clone(),
             config,
             signal,
@@ -661,8 +759,13 @@ async fn build_payload_with_fallback(
         )
         .await
         {
-            rpc_fleet.record_success(handle.id, started.elapsed(), None);
-            return Some(payload);
+            Ok(payload) => {
+                rpc_fleet.record_success(handle.id, started.elapsed(), None);
+                return Some(payload);
+            }
+            Err(err) => {
+                rpc_fleet.record_failure(handle.id, RpcFleet::classify_failure(&err));
+            }
         }
     }
     None
@@ -674,21 +777,39 @@ pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
     signal: &SwapSignal,
     gas_price: U256,
     context_signal: ContextSignal,
-) -> Option<crate::mev::execution::payload_builder::ExecutionPayload> {
-    let factory = config.mev.uniswap_v2_factory?;
+) -> Result<crate::mev::execution::payload_builder::ExecutionPayload, String> {
+    let factory = config
+        .mev
+        .uniswap_v2_factory
+        .ok_or_else(|| "missing uniswap v2 factory".to_string())?;
     let recipient = config.profit_address;
-    let token_in = *signal.path.first()?;
-    let token_out = *signal.path.get(1)?;
+    let token_in = *signal
+        .path
+        .first()
+        .ok_or_else(|| "missing token_in".to_string())?;
+    let token_out = *signal
+        .path
+        .get(1)
+        .ok_or_else(|| "missing token_out".to_string())?;
     let factory = UniswapV2Factory::new(factory, provider.clone());
-    let pair = factory.get_pair(token_in, token_out).call().await.ok()?;
+    let pair = factory
+        .get_pair(token_in, token_out)
+        .call()
+        .await
+        .map_err(|err| err.to_string())?;
     if pair == Address::zero() {
-        return None;
+        return Err("v2 pair not found".to_string());
     }
 
     let pair_contract = UniswapV2Pair::new(pair, provider.clone());
-    let token0 = pair_contract.token_0().call().await.ok()?;
-    let token1 = pair_contract.token_1().call().await.ok()?;
-    let reserves = pair_contract.get_reserves().call().await.ok()?;
+    let token0_method = pair_contract.token_0();
+    let token1_method = pair_contract.token_1();
+    let reserves_method = pair_contract.get_reserves();
+    let token0_call = token0_method.call();
+    let token1_call = token1_method.call();
+    let reserves_call = reserves_method.call();
+    let (token0, token1, reserves) = tokio::try_join!(token0_call, token1_call, reserves_call)
+    .map_err(|err| err.to_string())?;
     let pool = V2PoolState {
         pair,
         token0,
@@ -697,7 +818,8 @@ pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
         reserve1: U256::from(reserves.1),
         fee_bps: 30,
     };
-    let capital_available_wei = ethers::utils::parse_ether(config.mev.capital_eth.to_string()).ok()?;
+    let capital_available_wei =
+        ethers::utils::parse_ether(config.mev.capital_eth.to_string()).map_err(|err| err.to_string())?;
     PayloadBuilder::build_fee_extraction_v2(
         config,
         FeeExtractionBuildInput {
@@ -715,7 +837,6 @@ pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
             route_kind: AmmRouteKind::UniswapV2,
         },
     )
-    .ok()
 }
 
 pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
@@ -726,26 +847,42 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
     context_signal: ContextSignal,
     fee_tier: u32,
     encoded_path: ethers::types::Bytes,
-) -> Option<crate::mev::execution::payload_builder::ExecutionPayload> {
-    let factory = config.mev.uniswap_v3_factory?;
+) -> Result<crate::mev::execution::payload_builder::ExecutionPayload, String> {
+    let factory = config
+        .mev
+        .uniswap_v3_factory
+        .ok_or_else(|| "missing uniswap v3 factory".to_string())?;
     let recipient = config.profit_address;
-    let token_in = *signal.path.first()?;
-    let token_out = *signal.path.get(1)?;
+    let token_in = *signal
+        .path
+        .first()
+        .ok_or_else(|| "missing token_in".to_string())?;
+    let token_out = *signal
+        .path
+        .get(1)
+        .ok_or_else(|| "missing edge token_out".to_string())?;
     let factory = UniswapV3Factory::new(factory, provider.clone());
     let pool = factory
         .get_pool(token_in, token_out, fee_tier)
         .call()
         .await
-        .ok()?;
+        .map_err(|err| err.to_string())?;
     if pool == Address::zero() {
-        return None;
+        return Err("v3 pool not found".to_string());
     }
 
     let pool_contract = UniswapV3Pool::new(pool, provider.clone());
-    let token0 = pool_contract.token_0().call().await.ok()?;
-    let token1 = pool_contract.token_1().call().await.ok()?;
-    let liquidity = pool_contract.liquidity().call().await.ok()?;
-    let slot0 = pool_contract.slot_0().call().await.ok()?;
+    let token0_method = pool_contract.token_0();
+    let token1_method = pool_contract.token_1();
+    let liquidity_method = pool_contract.liquidity();
+    let slot0_method = pool_contract.slot_0();
+    let token0_call = token0_method.call();
+    let token1_call = token1_method.call();
+    let liquidity_call = liquidity_method.call();
+    let slot0_call = slot0_method.call();
+    let (token0, token1, liquidity, slot0) =
+        tokio::try_join!(token0_call, token1_call, liquidity_call, slot0_call)
+    .map_err(|err| err.to_string())?;
     let state = V3PoolState {
         pool,
         token0,
@@ -756,7 +893,8 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
         fee_bps: fee_tier as u64 / 100,
         initialized_ticks: Vec::new(),
     };
-    let capital_available_wei = ethers::utils::parse_ether(config.mev.capital_eth.to_string()).ok()?;
+    let capital_available_wei =
+        ethers::utils::parse_ether(config.mev.capital_eth.to_string()).map_err(|err| err.to_string())?;
     PayloadBuilder::build_fee_extraction_v3(
         config,
         FeeExtractionBuildInput {
@@ -777,7 +915,6 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
             },
         },
     )
-    .ok()
 }
 
 pub(crate) fn decode_relevant_swap(
@@ -865,9 +1002,9 @@ pub(crate) fn decode_relevant_swap(
                 router,
                 kind: SwapKind::V3 {
                     fee_tier,
-                    encoded_path: encode_v3_path(token_in, fee_tier, token_out),
+                    encoded_path: encode_v3_path(token_out, fee_tier, token_in),
                     hops: 1,
-                },
+        },
             }
         }
         V3_EXACT_INPUT => {
@@ -896,13 +1033,17 @@ pub(crate) fn decode_relevant_swap(
                 selector,
                 amount_in,
                 notional_wei: U256::zero(),
-                path: vec![parsed.token_in, parsed.token_out],
+                path: vec![parsed.token_in, parsed.edge_token_out],
                 router,
                 kind: SwapKind::V3 {
                     fee_tier: parsed.first_fee_tier,
-                    encoded_path: ethers::types::Bytes::from(path_bytes),
+                    encoded_path: encode_v3_path(
+                        parsed.edge_token_out,
+                        parsed.first_fee_tier,
+                        parsed.token_in,
+                    ),
                     hops: parsed.hops,
-                },
+        },
             }
         }
         _ => return None,
@@ -972,7 +1113,7 @@ fn fast_path_penalty(path_len: usize) -> f64 {
 
 struct ParsedV3Path {
     token_in: Address,
-    token_out: Address,
+    edge_token_out: Address,
     first_fee_tier: u32,
     hops: usize,
 }
@@ -982,12 +1123,12 @@ fn parse_v3_path(path: &[u8]) -> Option<ParsedV3Path> {
         return None;
     }
     let token_in = Address::from_slice(&path[0..20]);
+    let edge_token_out = Address::from_slice(&path[23..43]);
     let first_fee_tier = u32::from_be_bytes([0, path[20], path[21], path[22]]);
-    let token_out = Address::from_slice(&path[path.len() - 20..]);
     let hops = (path.len().saturating_sub(20)) / 23;
     Some(ParsedV3Path {
         token_in,
-        token_out,
+        edge_token_out,
         first_fee_tier,
         hops,
     })
