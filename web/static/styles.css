@@ -263,6 +263,7 @@ body { position: relative; min-height: 100vh; padding: 12px; }
 
 .panel-latency  { grid-column: 1 / 2; grid-row: 2; }
 .panel-residual { grid-column: 2 / 3; grid-row: 2; }
+.panel-wallet-ops { grid-column: 1 / -1; }
 
 /* ===== Panels ===== */
 .panel {
@@ -1218,9 +1219,95 @@ body { position: relative; min-height: 100vh; padding: 12px; }
   text-shadow: 0 0 6px rgba(0,245,255,0.35);
 }
 
+.wallet-pulse-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.wallet-pulse-card,
+.wallet-station {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--cyan);
+  border-radius: 4px;
+  background: linear-gradient(180deg, rgba(0,245,255,0.04), rgba(0,245,255,0));
+}
+
+.wallet-pulse-card.profit,
+.wallet-station.profit { border-left-color: var(--green); }
+.wallet-pulse-card.vault,
+.wallet-station.vault { border-left-color: var(--amber); }
+.wallet-pulse-card.control,
+.wallet-station.control { border-left-color: var(--violet); }
+
+.wallet-pulse-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.wallet-pulse-role,
+.wallet-station-label {
+  font-family: 'Orbitron', sans-serif;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--cyan);
+}
+
+.wallet-pulse-status,
+.wallet-station-status {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  color: var(--muted);
+}
+
+.wallet-pulse-addr,
+.wallet-station-addr {
+  font-size: 11px;
+  color: var(--text);
+  word-break: break-all;
+}
+
+.wallet-pulse-metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.metric-value-mini,
+.wallet-station-balance {
+  display: block;
+  margin-top: 4px;
+  font-family: 'Orbitron', sans-serif;
+  font-size: 16px;
+  color: var(--green);
+  text-shadow: 0 0 6px rgba(108,255,139,0.35);
+}
+
+.wallet-station-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.wallet-station-note {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
 @media (max-width: 1100px) {
   .layout-two {
     grid-template-columns: 1fr;
+  }
+
+  .wallet-pulse-grid,
+  .wallet-station-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
@@ -1241,5 +1328,10 @@ body { position: relative; min-height: 100vh; padding: 12px; }
   #relay-body td:nth-child(6),
   #relay-body td:nth-child(7) {
     font-size: 10px;
+  }
+
+  .wallet-pulse-grid,
+  .wallet-station-grid {
+    grid-template-columns: 1fr;
   }
 }
