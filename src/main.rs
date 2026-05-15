@@ -81,6 +81,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.mev.min_roi_bps
     );
     info!(
+        "Gas guardrails: max_gas_per_tx={} max_gas_price={} gwei",
+        config.mev.max_gas_per_tx,
+        config
+            .mev
+            .max_gas_price_gwei
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "disabled".to_string())
+    );
+    info!(
         "Executor buffer: min={:.4} ETH target={:.4} ETH max={:.4} ETH",
         config.mev.executor_min_buffer_eth,
         config.mev.executor_target_buffer_eth,
