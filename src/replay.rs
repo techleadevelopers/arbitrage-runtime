@@ -140,7 +140,7 @@ pub async fn maybe_run_replay_harness(
             continue;
         }
 
-        let Some(payload) = build_payload(
+        let Ok(payload) = build_payload(
             provider.clone(),
             &config,
             &signal,
