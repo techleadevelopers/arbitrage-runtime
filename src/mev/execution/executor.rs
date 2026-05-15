@@ -264,6 +264,33 @@ impl ExecutionEngine {
                     }
                     Err(err) => {
                         let err_text = err.to_string();
+                        if is_insufficient_funds_error(&err_text) {
+                            let estimated_cost_wei = send_context
+                                .gas_price
+                                .saturating_mul(U256::from(payload.gas_limit))
+                                .saturating_add(payload.value);
+                            self.dashboard.event(
+                                "error",
+                                format!(
+                                    "execution failed victim={:?}: insufficient funds for gas/value via {} required_estimated_cost={:.6} ETH gas_price={:.2} gwei gas_limit={}",
+                                    opportunity.victim_tx,
+                                    endpoint.name,
+                                    wei_to_eth_f64(estimated_cost_wei),
+                                    wei_to_gwei_f64(send_context.gas_price),
+                                    payload.gas_limit
+                                ),
+                            );
+                        } else {
+                            self.dashboard.event(
+                                "warn",
+                                format!(
+                                    "fee extraction rpc submit failed victim={:?} via {}: {}",
+                                    opportunity.victim_tx,
+                                    endpoint.name,
+                                    err_text
+                                ),
+                            );
+                        }
                         self.rpc_fleet
                             .record_failure(endpoint.id, RpcFleet::classify_failure(&err_text));
                         last_submit_error = Some(err_text);
@@ -1019,6 +1046,14 @@ fn signed_tx_hash(raw: &Bytes) -> H256 {
 
 fn wei_to_gwei_f64(value: U256) -> f64 {
     value.to_string().parse::<f64>().unwrap_or(0.0) / 1e9
+}
+
+fn is_insufficient_funds_error(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("insufficient funds")
+        || lowered.contains("insufficient balance")
+        || lowered.contains("funds for gas")
+        || lowered.contains("not enough funds")
 }
 
 fn relay_snapshot(quote: &RelayQuote) -> RelaySnapshot {
