@@ -1,6 +1,6 @@
 const $ = (id) => document.getElementById(id);
 
-const VIEWS = ["command", "execution", "relays", "treasury", "events"];
+const VIEWS = ["command", "wallets", "execution", "relays", "treasury", "events"];
 let currentView = "command";
 let lastEventCount = 0;
 const startedAt = Date.now();
@@ -69,6 +69,58 @@ function deriveTotals(s) {
   return { realizedPnl, rejectLoad, opportunities, executions, acceptance };
 }
 
+function buildWalletModel(s) {
+  const outcomes = s.execution_outcomes || [];
+  const realizedPnl = outcomes.reduce((sum, item) => sum + Number(item.realized_profit_eth || 0), 0);
+  const executorBalance = Number(s.executor_balance_eth || 0);
+  const treasuryAction = s.treasury_action || "hold";
+  const lastOutcome = outcomes[0] || null;
+  const systemWallets = [
+    {
+      role: "executor",
+      label: "EXECUTOR",
+      address: s.executor_address || "--",
+      balanceEth: executorBalance,
+      pnlEth: realizedPnl,
+      status: s.executor_buffer_status || "unknown",
+      note: "hot execution wallet"
+    },
+    {
+      role: "profit",
+      label: "PROFIT",
+      address: s.profit_address || "--",
+      balanceEth: realizedPnl > 0 ? realizedPnl : 0,
+      pnlEth: realizedPnl,
+      status: realizedPnl > 0 ? "harvesting" : "idle",
+      note: "receives realized edge"
+    },
+    {
+      role: "vault",
+      label: "VAULT",
+      address: s.vault_address || "--",
+      balanceEth: 0,
+      pnlEth: 0,
+      status: treasuryAction.includes("sweep") ? "receiving" : "standby",
+      note: "cold reserve / treasury sink"
+    },
+    {
+      role: "control",
+      label: "CONTROL",
+      address: s.control_address || "--",
+      balanceEth: 0,
+      pnlEth: 0,
+      status: "control",
+      note: "coordination / admin path"
+    }
+  ];
+
+  return {
+    realizedPnl,
+    systemWallets,
+    lastOutcome
+  };
+}
+
 function sendPath(s) {
   return s.network === "ethereum" ? "bundle-relay" : "direct-rpc";
 }
@@ -91,6 +143,10 @@ function renderHeader(s) {
     ? '<span class="dot ok"></span> LIVE'
     : '<span class="dot warn"></span> SIM';
   $("meta-uptime").textContent = fmtDuration(Date.now() - startedAt);
+  const wallets = buildWalletModel(s);
+  $("side-wallets").textContent = wallets.systemWallets.length;
+  $("side-pnl").textContent = wallets.realizedPnl.toFixed(6);
+  $("side-path").textContent = sendPath(s).toUpperCase();
 }
 
 function renderCommand(s) {
@@ -121,7 +177,50 @@ function renderCommand(s) {
     `).join("")
     : '<tr><td colspan="6">No execution outcomes yet</td></tr>';
 
+  const walletPulse = $("wallet-pulse-grid");
+  const wallets = buildWalletModel(s).systemWallets;
+  walletPulse.innerHTML = wallets.map((wallet) => `
+    <div class="wallet-pulse-card ${escapeHtml(wallet.role)}">
+      <div class="wallet-pulse-head">
+        <span class="wallet-pulse-role">${escapeHtml(wallet.label)}</span>
+        <span class="wallet-pulse-status">${escapeHtml(String(wallet.status).toUpperCase())}</span>
+      </div>
+      <div class="wallet-pulse-addr mono">${fmtAddr(wallet.address)}</div>
+      <div class="wallet-pulse-metrics">
+        <div><span class="metric-label">BALANCE</span><span class="metric-value-mini">${Number(wallet.balanceEth || 0).toFixed(6)} ETH</span></div>
+        <div><span class="metric-label">PNL</span><span class="metric-value-mini">${Number(wallet.pnlEth || 0).toFixed(6)} ETH</span></div>
+      </div>
+    </div>
+  `).join("");
+
   if (window.__CRS_RADAR__) window.__CRS_RADAR__.setStages(s.latency_metrics || []);
+}
+
+function renderWallets(s) {
+  const wallets = buildWalletModel(s);
+  $("wallet-executor-balance").textContent = `${Number(s.executor_balance_eth || 0).toFixed(6)} ETH`;
+  $("wallet-buffer-status").textContent = (s.executor_buffer_status || "--").toUpperCase();
+  $("wallet-realized-pnl").textContent = `${wallets.realizedPnl.toFixed(6)} ETH`;
+  $("wallet-treasury-action").textContent = (s.treasury_action || "hold").toUpperCase();
+
+  $("wallet-station-grid").innerHTML = wallets.systemWallets.map((wallet) => `
+    <article class="wallet-station ${escapeHtml(wallet.role)}">
+      <div class="wallet-station-label">${escapeHtml(wallet.label)}</div>
+      <div class="wallet-station-addr mono">${escapeHtml(wallet.address)}</div>
+      <div class="wallet-station-balance">${Number(wallet.balanceEth || 0).toFixed(6)} ETH</div>
+      <div class="wallet-station-note">${escapeHtml(wallet.note)}</div>
+      <div class="wallet-station-status">${escapeHtml(String(wallet.status).toUpperCase())}</div>
+    </article>
+  `).join("");
+
+  $("wallet-profit-body").innerHTML = wallets.systemWallets.map((wallet) => `
+    <tr>
+      <td class="mono">${fmtAddr(wallet.address)}</td>
+      <td>${escapeHtml(wallet.label)}</td>
+      <td class="num">${Number(wallet.pnlEth || 0).toFixed(6)} ETH</td>
+      <td>${escapeHtml(wallets.lastOutcome ? wallets.lastOutcome.outcome : "no outcome yet")}</td>
+    </tr>
+  `).join("");
 }
 
 function renderExecution(s) {
@@ -129,6 +228,7 @@ function renderExecution(s) {
   $("exec-regime").textContent = (s.market_regime || "--").toUpperCase();
   $("exec-send-path").textContent = sendPath(s).toUpperCase();
   $("exec-hot-wallets").textContent = (s.hot_wallets || []).length;
+  $("exec-realized-rate").textContent = `${buildWalletModel(s).realizedPnl.toFixed(6)} ETH`;
 
   const rejectBody = $("reject-body");
   const rejects = s.reject_reasons || [];
@@ -251,6 +351,8 @@ function frame() {
 
   if (currentView === "command") {
     renderCommand(snap);
+  } else if (currentView === "wallets") {
+    renderWallets(snap);
   } else if (currentView === "execution") {
     renderExecution(snap);
   } else if (currentView === "relays") {
