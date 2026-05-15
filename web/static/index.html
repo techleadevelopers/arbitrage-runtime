@@ -73,6 +73,12 @@
           </span>
           <span class="nav-label">COMMAND</span>
         </a>
+        <a class="nav-item" data-view="wallets" href="#wallets">
+          <span class="nav-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h12v4"/><path d="M3 7v11a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-3"/><path d="M21 11h-5a2 2 0 0 0 0 4h5z"/><circle cx="17" cy="13" r="0.8" fill="currentColor"/></svg>
+          </span>
+          <span class="nav-label">WALLETS</span>
+        </a>
         <a class="nav-item" data-view="execution" href="#execution">
           <span class="nav-icon" aria-hidden="true">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h12"/><path d="M13 5l7 7-7 7"/><path d="M4 5h4v4"/><path d="M4 19h4v-4"/></svg>
@@ -101,8 +107,9 @@
 
       <div class="side-foot">
         <div class="side-foot-label">LIVE STATE</div>
-        <div class="side-foot-line"><span class="dot ok"></span> execution surface active</div>
-        <div class="side-foot-line"><span class="dot ok"></span> relay telemetry loaded</div>
+        <div class="side-foot-line"><span class="dot ok"></span> wallets online <span id="side-wallets">0</span></div>
+        <div class="side-foot-line"><span class="dot ok"></span> pnl live <span id="side-pnl">0.000000</span></div>
+        <div class="side-foot-line"><span class="dot ok"></span> active path <span id="side-path">--</span></div>
       </div>
     </aside>
 
@@ -180,6 +187,74 @@
               </table>
             </div>
           </section>
+
+          <section class="panel panel-wallet-ops">
+            <div class="panel-head">
+              <h2>
+                <span class="panel-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h12v4"/><path d="M3 7v11a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-3"/><path d="M21 11h-5a2 2 0 0 0 0 4h5z"/></svg>
+                </span>
+                WALLET PULSE
+              </h2>
+              <span class="panel-tag">executor, profit and vault posture</span>
+            </div>
+            <div class="panel-body">
+              <div class="wallet-pulse-grid" id="wallet-pulse-grid"></div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" data-view="wallets">
+        <div class="view-head">
+          <h1 class="view-title"><span class="title-bracket">Â»</span> WALLET OPERATIONS</h1>
+          <p class="view-sub">Executor, vault, profit and system wallet posture under live PnL</p>
+        </div>
+
+        <div class="ops-toolbar">
+          <div class="ops-stat">
+            <span class="ops-stat-label">EXECUTOR BALANCE</span>
+            <span class="ops-stat-value" id="wallet-executor-balance">--</span>
+          </div>
+          <div class="ops-stat">
+            <span class="ops-stat-label">BUFFER STATUS</span>
+            <span class="ops-stat-value" id="wallet-buffer-status">--</span>
+          </div>
+          <div class="ops-stat">
+            <span class="ops-stat-label">REALIZED PNL</span>
+            <span class="ops-stat-value" id="wallet-realized-pnl">--</span>
+          </div>
+          <div class="ops-stat">
+            <span class="ops-stat-label">TREASURY ACTION</span>
+            <span class="ops-stat-value" id="wallet-treasury-action">--</span>
+          </div>
+        </div>
+
+        <div class="layout-two">
+          <section class="panel">
+            <div class="panel-head">
+              <h2><span class="panel-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 7a2 2 0 0 1 2-2h12v4"/><path d="M3 7v11a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-3"/></svg></span> SYSTEM WALLETS</h2>
+              <span class="panel-tag">real-time control balances</span>
+            </div>
+            <div class="panel-body">
+              <div class="wallet-station-grid" id="wallet-station-grid"></div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2><span class="panel-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 19h16"/><path d="M7 15l4-4 3 3 5-6"/></svg></span> PROFIT FLOW</h2>
+              <span class="panel-tag">latest wallet-attributed outcomes</span>
+            </div>
+            <div class="panel-body op-table-wrap">
+              <table class="op-table">
+                <thead>
+                  <tr><th>WALLET</th><th>ROLE</th><th>REALIZED</th><th>LAST OUTCOME</th></tr>
+                </thead>
+                <tbody id="wallet-profit-body"></tbody>
+              </table>
+            </div>
+          </section>
         </div>
       </section>
 
@@ -205,6 +280,10 @@
           <div class="ops-stat">
             <span class="ops-stat-label">HOT WALLETS</span>
             <span class="ops-stat-value" id="exec-hot-wallets">0</span>
+          </div>
+          <div class="ops-stat">
+            <span class="ops-stat-label">REALIZED RATE</span>
+            <span class="ops-stat-value" id="exec-realized-rate">0.000000</span>
           </div>
         </div>
 
