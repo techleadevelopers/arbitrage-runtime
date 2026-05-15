@@ -1617,7 +1617,7 @@ mod tests {
             rpc_send_preference: RpcPreference::Auto,
             storage_path: PathBuf::from("test.sqlite"),
             dashboard_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8787),
-            mempool_ws_url: None,
+            mempool_ws_urls: Vec::new(),
             mev: MevConfig {
                 enabled: true,
                 capital_eth: 0.5,
@@ -1631,6 +1631,7 @@ mod tests {
                 gas_safety_margin_bps: 12_500,
                 max_pending_age_ms: 1500,
                 max_gas_per_tx: 260_000,
+                max_gas_price_gwei: Some(30),
                 max_price_impact_bps: 250,
                 slippage_protection_bps: 50,
                 min_profit_usd: 2.0,
