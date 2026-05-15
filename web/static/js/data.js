@@ -63,7 +63,8 @@ class DataSource {
       sweeps_succeeded: 39,
       sweeps_failed: 11,
       hot_wallets: [
-        { address: executor, balance_eth: "0.482100", rpc: "primary-send" }
+        { address: executor, balance_eth: "0.482100", rpc: "primary-send" },
+        { address: profit, balance_eth: "0.014820", rpc: "profit-ledger" }
       ],
       top_residual_wallets: [],
       rpc_endpoints: [
@@ -76,7 +77,9 @@ class DataSource {
           rate_limit_failures: 0,
           timeout_failures: 0,
           stale_failures: 0,
-          cooldown_remaining_secs: 0
+          cooldown_remaining_secs: 0,
+          recent_burst_units: 8,
+          burst_capacity_units: 18
         },
         {
           name: "read-a",
@@ -87,7 +90,9 @@ class DataSource {
           rate_limit_failures: 1,
           timeout_failures: 0,
           stale_failures: 0,
-          cooldown_remaining_secs: 0
+          cooldown_remaining_secs: 0,
+          recent_burst_units: 4,
+          burst_capacity_units: 24
         }
       ],
       recent_events: [],
@@ -183,6 +188,11 @@ class DataSource {
           submit_latency_ms: 73,
           finalization_latency_ms: 2010
         }
+      ],
+      wallet_station: [
+        { role: "executor", address: executor, balance_eth: 0.4821, status: "healthy" },
+        { role: "profit", address: profit, balance_eth: 0.01482, status: "harvesting" },
+        { role: "vault", address: vault, balance_eth: 2.941, status: "standby" }
       ]
     };
   }
