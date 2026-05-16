@@ -95,6 +95,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.mev.latency_trace_warn_us
     );
     info!(
+        "Pool cache: state_ttl_ms={}",
+        config.mev.pool_state_cache_ttl_ms
+    );
+    info!(
         "Executor buffer: min={:.4} ETH target={:.4} ETH max={:.4} ETH",
         config.mev.executor_min_buffer_eth,
         config.mev.executor_target_buffer_eth,
