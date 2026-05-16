@@ -43,6 +43,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 revm = { version = "3.5.0", default-features = false, features = ["std"] }
 ndarray = "0.15"
 core_affinity = "0.8"
+libc = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemallocator = "0.5"
