@@ -91,11 +91,13 @@ The runtime is adversarial by design. It assumes:
 Performance numbers should be treated as operational evidence only when backed by local benchmark output, replay output, or live dashboard screenshots. The most useful evidence for this system is not theoretical complexity; it is measured rejection quality, latency, inclusion quality, gas avoided, and realized outcome tracking.
 
 ### 1. Internal Execution Stats (Local Latency Profile)
-Measured locally via `std::time::Instant` precision hooks under simulated or replayed load profiles:
+Measured locally via `std::time::Instant` precision hooks under simulated or replayed load profiles. These millisecond-scale numbers describe the operational pipeline with realistic runtime overhead: queueing, async scheduling, cache access, payload work, and normal process noise.
 *   **Mempool Ingestion to Decoding (`runtime.rs`):** $< 1.15 \text{ ms}$
 *   **Post-Victim Impact Modeling & Sizing (`payload_builder.rs`):** $< 0.82 \text{ ms}$
 *   **EV/Gas Gate & Payload Serialization (`executor.rs`):** $< 0.48 \text{ ms}$
 *   **Total Internal Pipeline Latency (End-to-End):** $\sim 2.45 \text{ ms}$
+
+The isolated `RUN_RUNTIME_LOAD_TEST` hot-gate benchmark is a different measurement. In `--release`, it measures only decode, cheap preflight, adaptive preflight, and adaptive quote without RPC, payload lookup, relay submission, dashboard IO, or receipt observation. Dedicated hardware can therefore show microsecond-level hot-gate latency while the broader operational profile remains millisecond-scale.
 
 ### 2. Throughput Metrics
 *   **Peak Message Processing:** $15,000+ \text{ transactions/second}$ (simulated via high-density historical Polygon mempool dumps).
@@ -137,11 +139,11 @@ The practical effect is simple: volatile nodes, toxic hours, weak relays, and ba
 
 The operational EV threshold can be represented in GitHub-safe math as:
 
-$$
+```math
 \mathrm{EV}_{\mathrm{threshold}}
 = \frac{\mathrm{BaseThreshold}}{\hat{p}}
 \cdot \left(1 + \sigma_{\mathrm{latency}}^{2}\right)
-$$
+```
 
 Where:
 
@@ -171,15 +173,13 @@ This feedback loop is what makes the system stateful. It is more important than 
 
 A compact reward mapping for post-execution calibration is:
 
-$$
+```math
 R =
 \Delta_{\mathrm{realizedPnL}} \cdot \mathbf{1}_{\mathrm{success}}
 -
-\left(
-  c \cdot \Delta t_{\mathrm{finalization}} \cdot G_{\mathrm{price}}
-\right)
+\left(c \cdot \Delta t_{\mathrm{finalization}} \cdot G_{\mathrm{price}}\right)
 \cdot \mathbf{1}_{\mathrm{revert}}
-$$
+```
 
 Where:
 
@@ -271,6 +271,8 @@ rather than brute-force transaction spam.
 # Operational Benchmarks
 
 ## Internal Performance Metrics
+
+These values describe the broader internal runtime pipeline. Do not compare them directly with adversarial hot-gate load-test output, which intentionally excludes network, payload, persistence, dashboard, and executor finalization overhead.
 
 | Metric | p50 | p95 | p99 |
 |--------|-----|-----|-----|
@@ -688,6 +690,8 @@ Mempool WS → Dedup → Lookup/Decode → Fast Preflight → Adaptive Preflight
 
 ## Latency Budget (End-to-End)
 
+This budget is for the operational pipeline, not the isolated `RUN_RUNTIME_LOAD_TEST` hot-gate benchmark. The load test is intentionally narrower and can produce microsecond-scale stage timings in optimized `--release` runs.
+
 | Stage | Target | P95 | P99 |
 |-------|--------|-----|-----|
 | Mempool → Decode | <1.15ms | 1.5ms | 2.0ms |
@@ -1090,6 +1094,8 @@ Useful knobs:
 
 Baseline output reports throughput, pass/reject rates, and p50/p95/p99/max latency per stage. Treat this as the latency baseline for the core runtime. Full replay and network benchmarks remain separate because RPC, state lookup, relay behavior, and fork simulation measure different risks.
 
+Interpret adversarial load-test latency as isolated hot-path latency. A dedicated `cargo run --release` run can report microsecond-scale or sub-microsecond stage timings because it excludes IO and execution overhead. The millisecond values earlier in this README describe broader runtime profiles and should be used for operational end-to-end budgeting.
+
 The adversarial profile mixes:
 
 - malformed calldata
@@ -1167,6 +1173,8 @@ This frontend is part of the active project surface. It is focused on execution 
 
 Below is the core environment surface used by the active runtime.
 
+For BNB Chain configuration, use the `_BSC` suffix as the canonical operator-facing convention, for example `RPC_URL_BSC`, `MEMPOOL_WS_URL_BSC`, and `MEV_MAX_GAS_PRICE_GWEI_BSC`. The code also accepts `_BNB` aliases for backward compatibility, but new `.env` files should prefer `_BSC`.
+
 ### Core runtime
 
 - `NETWORK`
@@ -1176,7 +1184,6 @@ Below is the core environment surface used by the active runtime.
 - `DASHBOARD_ADDR`
 - `MEMPOOL_WS_URL`
 - `MEMPOOL_WS_URL_BSC`
-- `MEMPOOL_WS_URL_BNB`
 - `MEMPOOL_WS_URL_POLYGON`
 - `STORAGE_PATH`
 
@@ -1187,7 +1194,6 @@ Below is the core environment surface used by the active runtime.
 - `RPC_URL_3`
 - `RPC_URL_4`
 - `RPC_URL_BSC`
-- `RPC_URL_BNB`
 - `RPC_URL_POLYGON`
 - `ALCHEMY_KEY`
 - `FLASHBOTS_RELAY`
@@ -1214,7 +1220,6 @@ Below is the core environment surface used by the active runtime.
 - `MEV_MAX_GAS_PER_TX`
 - `MEV_MAX_GAS_PRICE_GWEI`
 - `MEV_MAX_GAS_PRICE_GWEI_BSC`
-- `MEV_MAX_GAS_PRICE_GWEI_BNB`
 - `MEV_MAX_GAS_PRICE_GWEI_POLYGON`
 - `MEV_MAX_PRICE_IMPACT_BPS`
 - `MEV_SLIPPAGE_PROTECTION_BPS`
@@ -1291,10 +1296,12 @@ BNB Chain is supported by the runtime decision model, but live operation should 
 
 Provide at least:
 
-- `RPC_URL_BSC` or `RPC_URL_BNB`
-- `MEMPOOL_WS_URL_BSC` or `MEMPOOL_WS_URL_BNB`
+- `RPC_URL_BSC`
+- `MEMPOOL_WS_URL_BSC`
 
 This matters because the generic provider autoconstruction for BNB should not rely on Ethereum/Arbitrum/Polygon-only provider assumptions.
+
+`RPC_URL_BNB` and `MEMPOOL_WS_URL_BNB` remain accepted as backward-compatible aliases, but `_BSC` is the documented canonical suffix.
 
 ### Network benchmark
 
