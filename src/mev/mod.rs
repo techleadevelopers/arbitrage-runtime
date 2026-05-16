@@ -1,5 +1,6 @@
 pub mod adaptive;
 pub mod amm;
+pub mod cache;
 pub mod execution;
 pub mod opportunity;
 pub mod pnl;
