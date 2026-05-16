@@ -9,6 +9,8 @@ This directory stores measured runtime load-test outputs used as operational evi
 
 ## Interpretation
 
+These artifacts should be compared across repeated runs before being used as a performance claim.
+
 Use these files to compare:
 
 - `total_hot_gate.p50`, `p95`, `p99`, and `max`
