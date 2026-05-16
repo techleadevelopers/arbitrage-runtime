@@ -406,9 +406,6 @@ The runtime is built for adversarial environments and assumes hostile execution 
 
 
 ## Enterprise Signal Boosters
-
-### Suggested README Badges
-
 ```markdown
 ![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)
 ![Solidity](https://img.shields.io/badge/solidity-0.8.x-blue.svg)
@@ -418,7 +415,7 @@ The runtime is built for adversarial environments and assumes hostile execution 
 ![Replay Harness](https://img.shields.io/badge/replay-harness-yellow.svg)
 ![82% Coverage](https://img.shields.io/badge/coverage-82%25-brightgreen.svg)
 ![Production-Oriented](https://img.shields.io/badge/production-ready-darkblue.svg)
-
+```
 ## Architecture Diagram
 
 The system operates as a zero-copy, linear, multi-threaded pipeline using bounded asynchronous communication primitives.
