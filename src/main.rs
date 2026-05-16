@@ -7,6 +7,13 @@ mod rpc;
 mod storage;
 mod wallets;
 
+#[cfg(unix)]
+use jemallocator::Jemalloc;
+
+#[cfg(unix)]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 use benchmark::maybe_run_network_benchmark;
 use config::Config;
 use dashboard::DashboardHandle;
