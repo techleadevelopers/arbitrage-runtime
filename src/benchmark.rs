@@ -1,16 +1,109 @@
 use crate::config::Config;
+use crate::mev::adaptive::{AdaptivePolicy, AdaptiveQuoteInput, ClusterKey, PreflightInput};
+use crate::mev::opportunity::wei_to_eth_f64;
+use crate::mev::runtime::{decode_relevant_swap, fast_preflight_gate};
 use crate::rpc::RpcFleet;
+use chrono::Timelike;
+use ethers::abi::{encode, Token};
 use ethers::middleware::SignerMiddleware;
 use ethers::prelude::*;
 use ethers::types::transaction::eip2718::TypedTransaction;
-use ethers::types::{BlockNumber, Filter, NameOrAddress, TransactionRequest, H256};
+use ethers::types::{BlockNumber, Bytes, Filter, NameOrAddress, Transaction, TransactionRequest, H256};
 use ethers_flashbots::{BundleRequest, FlashbotsMiddleware};
+use serde::Serialize;
+use std::collections::BTreeMap;
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 use url::Url;
+
+pub async fn maybe_run_runtime_load_test(
+    config: Arc<Config>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if !env_flag("RUN_RUNTIME_LOAD_TEST") {
+        return Ok(false);
+    }
+
+    let cases = env_usize("RUNTIME_LOAD_TEST_CASES", 100_000).max(1);
+    let warmup = env_usize("RUNTIME_LOAD_TEST_WARMUP", 5_000);
+    let concurrency = env_usize(
+        "RUNTIME_LOAD_TEST_CONCURRENCY",
+        std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(1),
+    )
+    .max(1)
+    .min(cases);
+    let budget_p99_us = env_u64("RUNTIME_LOAD_TEST_LATENCY_BUDGET_US", 250);
+    let profile = runtime_load_profile();
+    let output_path = env::var("RUNTIME_LOAD_TEST_OUTPUT_PATH").ok();
+    let min_large_swap_wei = ethers::utils::parse_ether(config.mev.min_large_swap_eth.to_string())?;
+    let gas_price_wei = runtime_load_gas_price_wei(&config.network);
+    let relay_paths = if config.builder_relays.is_empty() {
+        vec!["direct-rpc".to_string()]
+    } else {
+        config.builder_relays.clone()
+    };
+
+    info!(
+        "Running runtime load test: cases={} warmup={} concurrency={} budget_p99={}us",
+        cases, warmup, concurrency, budget_p99_us
+    );
+
+    let started = Instant::now();
+    let mut join_set = JoinSet::new();
+    let base_cases = cases / concurrency;
+    let remainder = cases % concurrency;
+    let base_warmup = warmup / concurrency;
+    let warmup_remainder = warmup % concurrency;
+    for worker_id in 0..concurrency {
+        let config = config.clone();
+        let relays = relay_paths.clone();
+        let worker_cases = base_cases + usize::from(worker_id < remainder);
+        let worker_warmup = base_warmup + usize::from(worker_id < warmup_remainder);
+        join_set.spawn(async move {
+            runtime_load_worker(
+                config,
+                worker_id,
+                worker_cases,
+                worker_warmup,
+                min_large_swap_wei,
+                gas_price_wei,
+                relays,
+                profile,
+            )
+            .await
+        });
+    }
+
+    let mut combined = RuntimeLoadReport::new(
+        config.network.clone(),
+        cases,
+        warmup,
+        concurrency,
+        budget_p99_us,
+        profile,
+    );
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(report)) => combined.merge(report),
+            Ok(Err(err)) => return Err(err.into()),
+            Err(err) => return Err(format!("runtime load test task failed: {}", err).into()),
+        }
+    }
+    combined.wall_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    combined.finalize();
+
+    print_runtime_load_report(&combined);
+    if let Some(path) = output_path {
+        std::fs::write(&path, serde_json::to_string_pretty(&combined)?)?;
+        println!("Runtime load report exported: {}", path);
+    }
+
+    Ok(true)
+}
 
 pub async fn maybe_run_network_benchmark(
     config: Arc<Config>,
@@ -321,6 +414,736 @@ async fn benchmark_bundle_submission(
         }
     })
     .await
+}
+
+async fn runtime_load_worker(
+    config: Arc<Config>,
+    worker_id: usize,
+    cases: usize,
+    warmup: usize,
+    min_large_swap_wei: U256,
+    base_gas_price_wei: U256,
+    relays: Vec<String>,
+    profile: RuntimeLoadProfile,
+) -> Result<RuntimeLoadWorkerReport, String> {
+    let mut policy = AdaptivePolicy::new(&config);
+    let router = config
+        .mev
+        .mev_executor
+        .unwrap_or_else(|| Address::from_low_u64_be(0x7000 + worker_id as u64));
+    let token_in = config
+        .monitored_tokens
+        .first()
+        .map(|token| token.address)
+        .unwrap_or_else(|| Address::from_low_u64_be(0x1000));
+    let recipient = config.executor_address;
+    let hour_utc = chrono::Utc::now().hour() as u8;
+    let mut report = RuntimeLoadWorkerReport::default();
+    let total_iterations = cases.saturating_add(warmup);
+
+    for index in 0..total_iterations {
+        let record = index >= warmup;
+        let scenario = runtime_load_scenario(index, profile);
+        let gas_price_wei = scenario_gas_price(base_gas_price_wei, scenario);
+        let tx = synthetic_runtime_tx(
+            scenario,
+            worker_id,
+            index,
+            router,
+            token_in,
+            Address::from_low_u64_be(0x2000 + ((worker_id * 65_537 + index) % 4096) as u64),
+            recipient,
+            min_large_swap_wei,
+            gas_price_wei,
+            config.chain_id,
+        );
+
+        let total_started = Instant::now();
+        let started = Instant::now();
+        let signal = decode_relevant_swap(&tx, &config.monitored_tokens, min_large_swap_wei);
+        if record {
+            report.samples.decode_us.push(elapsed_us(started));
+            report.processed += 1;
+            report.scenario_mut(scenario).processed += 1;
+        }
+
+        let Some(signal) = signal else {
+            if record {
+                report.decode_reject += 1;
+                report.scenario_mut(scenario).decode_reject += 1;
+                report.samples.total_hot_gate_us.push(elapsed_us(total_started));
+            }
+            continue;
+        };
+        if record {
+            report.decoded += 1;
+            report.scenario_mut(scenario).decoded += 1;
+        }
+
+        let cluster = ClusterKey {
+            router: signal.router,
+            token_in: signal.path.first().copied().unwrap_or_default(),
+            token_out: signal.path.last().copied().unwrap_or_default(),
+            selector: signal.selector,
+        };
+        let context_signal = policy.context_signal(signal.router, hour_utc);
+        policy.observe_candidate_flow(cluster, signal.notional_wei, gas_price_wei);
+
+        let started = Instant::now();
+        let fast = fast_preflight_gate(
+            &signal,
+            gas_price_wei,
+            min_large_swap_wei,
+            &config,
+            context_signal,
+        );
+        if record {
+            report.samples.fast_preflight_us.push(elapsed_us(started));
+        }
+        if !fast.should_continue {
+            if record {
+                report.fast_reject += 1;
+                report.scenario_mut(scenario).fast_reject += 1;
+                report.samples.total_hot_gate_us.push(elapsed_us(total_started));
+            }
+            continue;
+        }
+        if record {
+            report.fast_pass += 1;
+            report.scenario_mut(scenario).fast_pass += 1;
+        }
+
+        let notional_eth = wei_to_eth_f64(signal.notional_wei);
+        let started = Instant::now();
+        let preflight = policy.preflight_score(PreflightInput {
+            cluster,
+            notional_eth,
+            gas_price_wei,
+            path_len: signal.path.len(),
+        });
+        if record {
+            report.samples.adaptive_preflight_us.push(elapsed_us(started));
+        }
+        if !preflight.should_continue {
+            if record {
+                report.adaptive_preflight_reject += 1;
+                report.scenario_mut(scenario).adaptive_preflight_reject += 1;
+                report.samples.total_hot_gate_us.push(elapsed_us(total_started));
+            }
+            continue;
+        }
+        if record {
+            report.adaptive_preflight_pass += 1;
+            report.scenario_mut(scenario).adaptive_preflight_pass += 1;
+        }
+
+        let execution_cost_wei = gas_price_wei.saturating_mul(U256::from(
+            config
+                .estimated_exec_gas
+                .saturating_add(config.estimated_bundle_overhead_gas)
+                .max(180_000),
+        ));
+        let expected_profit_wei = min_large_swap_wei / U256::from(200u64);
+        let started = Instant::now();
+        let quote = policy.quote_for_relays(
+            AdaptiveQuoteInput {
+                cluster,
+                pair: cluster.token_out,
+                hour_utc,
+                context_priority_score: context_signal.priority_score,
+                context_toxicity_score: context_signal.toxicity_score,
+                expected_profit_wei,
+                execution_cost_wei,
+                gas_price_wei,
+                lookup_latency_ms: f64::from(fast.gas_ratio as f32).max(0.0),
+                notional_eth,
+                price_impact_bps: config.mev.max_price_impact_bps.min(80),
+                relay_pressure_override: None,
+            },
+            &relays,
+        );
+        if record {
+            report.samples.adaptive_quote_us.push(elapsed_us(started));
+            report.samples.total_hot_gate_us.push(elapsed_us(total_started));
+        }
+        if quote.should_execute {
+            if record {
+                report.quote_pass += 1;
+                report.scenario_mut(scenario).quote_pass += 1;
+            }
+        } else if record {
+            report.quote_reject += 1;
+            report.scenario_mut(scenario).quote_reject += 1;
+        }
+    }
+
+    Ok(report)
+}
+
+fn synthetic_runtime_tx(
+    scenario: RuntimeLoadScenario,
+    worker_id: usize,
+    index: usize,
+    router: Address,
+    token_in: Address,
+    token_out: Address,
+    recipient: Address,
+    min_large_swap_wei: U256,
+    gas_price_wei: U256,
+    chain_id: u64,
+) -> Transaction {
+    match scenario {
+        RuntimeLoadScenario::MalformedCalldata => synthetic_raw_tx(
+            worker_id,
+            index,
+            router,
+            Bytes::from(vec![0x7f, 0xf3]),
+            min_large_swap_wei,
+            gas_price_wei,
+            chain_id,
+        ),
+        RuntimeLoadScenario::UnknownSelector => synthetic_raw_tx(
+            worker_id,
+            index,
+            router,
+            Bytes::from(vec![0xde, 0xad, 0xbe, 0xef, 0, 1, 2, 3]),
+            min_large_swap_wei,
+            gas_price_wei,
+            chain_id,
+        ),
+        RuntimeLoadScenario::SmallNotional => synthetic_v2_eth_swap_tx(
+            worker_id,
+            index,
+            router,
+            token_in,
+            token_out,
+            recipient,
+            min_large_swap_wei / U256::from(10u64),
+            gas_price_wei,
+            chain_id,
+            1,
+            2,
+        ),
+        RuntimeLoadScenario::LongPath => synthetic_v2_eth_swap_tx(
+            worker_id,
+            index,
+            router,
+            token_in,
+            token_out,
+            recipient,
+            min_large_swap_wei,
+            gas_price_wei,
+            chain_id,
+            1,
+            8,
+        ),
+        RuntimeLoadScenario::ClusterBurst => synthetic_v2_eth_swap_tx(
+            worker_id,
+            index,
+            router,
+            token_in,
+            Address::from_low_u64_be(0x2bad),
+            recipient,
+            min_large_swap_wei,
+            gas_price_wei,
+            chain_id,
+            3,
+            2,
+        ),
+        RuntimeLoadScenario::ToxicGas | RuntimeLoadScenario::Valid => synthetic_v2_eth_swap_tx(
+            worker_id,
+            index,
+            router,
+            token_in,
+            token_out,
+            recipient,
+            min_large_swap_wei,
+            gas_price_wei,
+            chain_id,
+            3,
+            2,
+        ),
+    }
+}
+
+fn synthetic_v2_eth_swap_tx(
+    worker_id: usize,
+    index: usize,
+    router: Address,
+    token_in: Address,
+    token_out: Address,
+    recipient: Address,
+    base_value_wei: U256,
+    gas_price_wei: U256,
+    chain_id: u64,
+    min_size_mult: u64,
+    path_len: usize,
+) -> Transaction {
+    let size_mult = U256::from(min_size_mult + ((worker_id + index) % 5) as u64);
+    let value = base_value_wei.saturating_mul(size_mult);
+    let mut path = Vec::with_capacity(path_len.max(2));
+    path.push(Token::Address(token_in));
+    for hop in 1..path_len.saturating_sub(1) {
+        path.push(Token::Address(Address::from_low_u64_be(
+            0x3000 + ((worker_id + index + hop) % 8192) as u64,
+        )));
+    }
+    path.push(Token::Address(token_out));
+    let mut calldata = Vec::with_capacity(4 + 160);
+    calldata.extend_from_slice(&[0x7f, 0xf3, 0x6a, 0xb5]);
+    calldata.extend(encode(&[
+        Token::Uint(U256::zero()),
+        Token::Array(path),
+        Token::Address(recipient),
+        Token::Uint(U256::from(4_102_444_800u64)),
+    ]));
+
+    synthetic_raw_tx(
+        worker_id,
+        index,
+        router,
+        Bytes::from(calldata),
+        value,
+        gas_price_wei,
+        chain_id,
+    )
+}
+
+fn synthetic_raw_tx(
+    worker_id: usize,
+    index: usize,
+    router: Address,
+    input: Bytes,
+    value: U256,
+    gas_price_wei: U256,
+    chain_id: u64,
+) -> Transaction {
+    Transaction {
+        hash: H256::from_low_u64_be(((worker_id as u64) << 32) | index as u64),
+        nonce: U256::from(index),
+        block_hash: None,
+        block_number: None,
+        transaction_index: None,
+        from: Address::from_low_u64_be(0x9000 + worker_id as u64),
+        to: Some(router),
+        value,
+        gas_price: Some(gas_price_wei),
+        gas: U256::from(240_000u64),
+        input,
+        chain_id: Some(U256::from(chain_id)),
+        ..Default::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeLoadProfile {
+    Baseline,
+    Adversarial,
+}
+
+impl RuntimeLoadProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Adversarial => "adversarial",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RuntimeLoadScenario {
+    Valid,
+    MalformedCalldata,
+    UnknownSelector,
+    SmallNotional,
+    ToxicGas,
+    LongPath,
+    ClusterBurst,
+}
+
+impl RuntimeLoadScenario {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Valid => "valid",
+            Self::MalformedCalldata => "malformed_calldata",
+            Self::UnknownSelector => "unknown_selector",
+            Self::SmallNotional => "small_notional",
+            Self::ToxicGas => "toxic_gas",
+            Self::LongPath => "long_path",
+            Self::ClusterBurst => "cluster_burst",
+        }
+    }
+}
+
+fn runtime_load_profile() -> RuntimeLoadProfile {
+    let explicit = env::var("RUNTIME_LOAD_TEST_PROFILE")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if explicit == "adversarial" || env_flag("RUNTIME_LOAD_TEST_ADVERSARIAL") {
+        RuntimeLoadProfile::Adversarial
+    } else {
+        RuntimeLoadProfile::Baseline
+    }
+}
+
+fn runtime_load_scenario(index: usize, profile: RuntimeLoadProfile) -> RuntimeLoadScenario {
+    if profile == RuntimeLoadProfile::Baseline {
+        return RuntimeLoadScenario::Valid;
+    }
+    match index % 12 {
+        0 => RuntimeLoadScenario::MalformedCalldata,
+        1 => RuntimeLoadScenario::UnknownSelector,
+        2 | 3 => RuntimeLoadScenario::SmallNotional,
+        4 | 5 => RuntimeLoadScenario::ToxicGas,
+        6 | 7 => RuntimeLoadScenario::LongPath,
+        8 | 9 => RuntimeLoadScenario::ClusterBurst,
+        _ => RuntimeLoadScenario::Valid,
+    }
+}
+
+fn scenario_gas_price(base: U256, scenario: RuntimeLoadScenario) -> U256 {
+    if scenario == RuntimeLoadScenario::ToxicGas {
+        base.saturating_mul(U256::from(4u64))
+    } else {
+        base
+    }
+}
+
+fn runtime_load_gas_price_wei(network: &str) -> U256 {
+    let default_gwei = match network {
+        "arbitrum" => 1,
+        "polygon" => 80,
+        "bsc" => 3,
+        _ => 25,
+    };
+    U256::from(env_u64("RUNTIME_LOAD_TEST_GAS_PRICE_GWEI", default_gwei))
+        .saturating_mul(U256::from(1_000_000_000u64))
+}
+
+#[derive(Default)]
+struct RuntimeLoadWorkerReport {
+    processed: usize,
+    decoded: usize,
+    decode_reject: usize,
+    fast_pass: usize,
+    fast_reject: usize,
+    adaptive_preflight_pass: usize,
+    adaptive_preflight_reject: usize,
+    quote_pass: usize,
+    quote_reject: usize,
+    scenarios: BTreeMap<String, RuntimeLoadCaseStats>,
+    samples: RuntimeLoadSamples,
+}
+
+impl RuntimeLoadWorkerReport {
+    fn scenario_mut(&mut self, scenario: RuntimeLoadScenario) -> &mut RuntimeLoadCaseStats {
+        self.scenarios
+            .entry(scenario.as_str().to_string())
+            .or_default()
+    }
+}
+
+#[derive(Clone, Default, Serialize)]
+struct RuntimeLoadCaseStats {
+    processed: usize,
+    decoded: usize,
+    decode_reject: usize,
+    fast_pass: usize,
+    fast_reject: usize,
+    adaptive_preflight_pass: usize,
+    adaptive_preflight_reject: usize,
+    quote_pass: usize,
+    quote_reject: usize,
+}
+
+#[derive(Default)]
+struct RuntimeLoadSamples {
+    decode_us: Vec<u64>,
+    fast_preflight_us: Vec<u64>,
+    adaptive_preflight_us: Vec<u64>,
+    adaptive_quote_us: Vec<u64>,
+    total_hot_gate_us: Vec<u64>,
+}
+
+#[derive(Serialize)]
+struct RuntimeLoadReport {
+    network: String,
+    profile: &'static str,
+    cases: usize,
+    warmup: usize,
+    concurrency: usize,
+    wall_ms: f64,
+    throughput_tps: f64,
+    latency_budget_p99_us: u64,
+    budget_pass: bool,
+    processed: usize,
+    decoded: usize,
+    decode_reject: usize,
+    fast_pass: usize,
+    fast_reject: usize,
+    adaptive_preflight_pass: usize,
+    adaptive_preflight_reject: usize,
+    quote_pass: usize,
+    quote_reject: usize,
+    rejection_rate: f64,
+    malformed_rejection_rate: f64,
+    small_notional_rejection_rate: f64,
+    toxic_gas_rejection_rate: f64,
+    long_path_rejection_rate: f64,
+    cluster_burst_rejection_rate: f64,
+    scenarios: BTreeMap<String, RuntimeLoadCaseStats>,
+    decode: LatencyUsSummary,
+    fast_preflight: LatencyUsSummary,
+    adaptive_preflight: LatencyUsSummary,
+    adaptive_quote: LatencyUsSummary,
+    total_hot_gate: LatencyUsSummary,
+    #[serde(skip)]
+    samples: RuntimeLoadSamples,
+}
+
+impl RuntimeLoadReport {
+    fn new(
+        network: String,
+        cases: usize,
+        warmup: usize,
+        concurrency: usize,
+        latency_budget_p99_us: u64,
+        profile: RuntimeLoadProfile,
+    ) -> Self {
+        Self {
+            network,
+            profile: profile.as_str(),
+            cases,
+            warmup,
+            concurrency,
+            wall_ms: 0.0,
+            throughput_tps: 0.0,
+            latency_budget_p99_us,
+            budget_pass: false,
+            processed: 0,
+            decoded: 0,
+            decode_reject: 0,
+            fast_pass: 0,
+            fast_reject: 0,
+            adaptive_preflight_pass: 0,
+            adaptive_preflight_reject: 0,
+            quote_pass: 0,
+            quote_reject: 0,
+            rejection_rate: 0.0,
+            malformed_rejection_rate: 0.0,
+            small_notional_rejection_rate: 0.0,
+            toxic_gas_rejection_rate: 0.0,
+            long_path_rejection_rate: 0.0,
+            cluster_burst_rejection_rate: 0.0,
+            scenarios: BTreeMap::new(),
+            decode: LatencyUsSummary::default(),
+            fast_preflight: LatencyUsSummary::default(),
+            adaptive_preflight: LatencyUsSummary::default(),
+            adaptive_quote: LatencyUsSummary::default(),
+            total_hot_gate: LatencyUsSummary::default(),
+            samples: RuntimeLoadSamples::default(),
+        }
+    }
+
+    fn merge(&mut self, worker: RuntimeLoadWorkerReport) {
+        self.processed += worker.processed;
+        self.decoded += worker.decoded;
+        self.decode_reject += worker.decode_reject;
+        self.fast_pass += worker.fast_pass;
+        self.fast_reject += worker.fast_reject;
+        self.adaptive_preflight_pass += worker.adaptive_preflight_pass;
+        self.adaptive_preflight_reject += worker.adaptive_preflight_reject;
+        self.quote_pass += worker.quote_pass;
+        self.quote_reject += worker.quote_reject;
+        for (scenario, stats) in worker.scenarios {
+            merge_case_stats(self.scenarios.entry(scenario).or_default(), stats);
+        }
+        self.samples.decode_us.extend(worker.samples.decode_us);
+        self.samples
+            .fast_preflight_us
+            .extend(worker.samples.fast_preflight_us);
+        self.samples
+            .adaptive_preflight_us
+            .extend(worker.samples.adaptive_preflight_us);
+        self.samples
+            .adaptive_quote_us
+            .extend(worker.samples.adaptive_quote_us);
+        self.samples
+            .total_hot_gate_us
+            .extend(worker.samples.total_hot_gate_us);
+    }
+
+    fn finalize(&mut self) {
+        self.throughput_tps = if self.wall_ms <= f64::EPSILON {
+            0.0
+        } else {
+            self.processed as f64 / (self.wall_ms / 1_000.0)
+        };
+        self.decode = summarize_us(&mut self.samples.decode_us);
+        self.fast_preflight = summarize_us(&mut self.samples.fast_preflight_us);
+        self.adaptive_preflight = summarize_us(&mut self.samples.adaptive_preflight_us);
+        self.adaptive_quote = summarize_us(&mut self.samples.adaptive_quote_us);
+        self.total_hot_gate = summarize_us(&mut self.samples.total_hot_gate_us);
+        self.budget_pass = self.total_hot_gate.p99 <= self.latency_budget_p99_us;
+        self.rejection_rate = rate(
+            self.decode_reject + self.fast_reject + self.adaptive_preflight_reject + self.quote_reject,
+            self.processed,
+        );
+        self.malformed_rejection_rate = scenario_rejection_rate(&self.scenarios, "malformed_calldata");
+        self.small_notional_rejection_rate = scenario_rejection_rate(&self.scenarios, "small_notional");
+        self.toxic_gas_rejection_rate = scenario_rejection_rate(&self.scenarios, "toxic_gas");
+        self.long_path_rejection_rate = scenario_rejection_rate(&self.scenarios, "long_path");
+        self.cluster_burst_rejection_rate = scenario_rejection_rate(&self.scenarios, "cluster_burst");
+    }
+}
+
+#[derive(Clone, Copy, Default, Serialize)]
+struct LatencyUsSummary {
+    count: usize,
+    avg: f64,
+    min: u64,
+    p50: u64,
+    p95: u64,
+    p99: u64,
+    max: u64,
+}
+
+fn summarize_us(values: &mut [u64]) -> LatencyUsSummary {
+    if values.is_empty() {
+        return LatencyUsSummary::default();
+    }
+    values.sort_unstable();
+    let avg = values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64;
+    LatencyUsSummary {
+        count: values.len(),
+        avg,
+        min: values[0],
+        p50: percentile_u64(values, 50),
+        p95: percentile_u64(values, 95),
+        p99: percentile_u64(values, 99),
+        max: *values.last().unwrap_or(&0),
+    }
+}
+
+fn percentile_u64(values: &[u64], percentile: usize) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    let rank = ((values.len() - 1) * percentile) / 100;
+    values[rank]
+}
+
+fn merge_case_stats(target: &mut RuntimeLoadCaseStats, source: RuntimeLoadCaseStats) {
+    target.processed += source.processed;
+    target.decoded += source.decoded;
+    target.decode_reject += source.decode_reject;
+    target.fast_pass += source.fast_pass;
+    target.fast_reject += source.fast_reject;
+    target.adaptive_preflight_pass += source.adaptive_preflight_pass;
+    target.adaptive_preflight_reject += source.adaptive_preflight_reject;
+    target.quote_pass += source.quote_pass;
+    target.quote_reject += source.quote_reject;
+}
+
+fn scenario_rejection_rate(
+    scenarios: &BTreeMap<String, RuntimeLoadCaseStats>,
+    scenario: &str,
+) -> f64 {
+    let Some(stats) = scenarios.get(scenario) else {
+        return 0.0;
+    };
+    rate(
+        stats.decode_reject
+            + stats.fast_reject
+            + stats.adaptive_preflight_reject
+            + stats.quote_reject,
+        stats.processed,
+    )
+}
+
+fn print_runtime_load_report(report: &RuntimeLoadReport) {
+    println!("=== Runtime Load Test ===");
+    println!("Network: {}", report.network);
+    println!("Profile: {}", report.profile);
+    println!("Cases: {}", report.cases);
+    println!("Warmup: {}", report.warmup);
+    println!("Concurrency: {}", report.concurrency);
+    println!("Wall time: {:.1}ms", report.wall_ms);
+    println!("Throughput: {:.0} tx/s", report.throughput_tps);
+    println!(
+        "Budget: total_hot_gate p99 <= {}us => {}",
+        report.latency_budget_p99_us,
+        if report.budget_pass { "PASS" } else { "FAIL" }
+    );
+    println!();
+    println!(
+        "Pass rates: decoded={:.1}% fast={:.1}% adaptive_preflight={:.1}% quote={:.1}%",
+        rate(report.decoded, report.processed),
+        rate(report.fast_pass, report.decoded),
+        rate(report.adaptive_preflight_pass, report.fast_pass),
+        rate(report.quote_pass, report.adaptive_preflight_pass),
+    );
+    println!(
+        "Rejects: decode={} fast={} adaptive_preflight={} quote={}",
+        report.decode_reject,
+        report.fast_reject,
+        report.adaptive_preflight_reject,
+        report.quote_reject
+    );
+    println!("Total rejection rate: {:.1}%", report.rejection_rate);
+    if report.profile == RuntimeLoadProfile::Adversarial.as_str() {
+        println!(
+            "Adversarial rejection: malformed={:.1}% small_notional={:.1}% toxic_gas={:.1}% long_path={:.1}% cluster_burst={:.1}%",
+            report.malformed_rejection_rate,
+            report.small_notional_rejection_rate,
+            report.toxic_gas_rejection_rate,
+            report.long_path_rejection_rate,
+            report.cluster_burst_rejection_rate
+        );
+    }
+    if !report.scenarios.is_empty() {
+        println!("Scenario breakdown:");
+        for (name, stats) in &report.scenarios {
+            println!(
+                "  {}: n={} decoded={} final_pass={} rejects={}",
+                name,
+                stats.processed,
+                stats.decoded,
+                stats.quote_pass,
+                stats.decode_reject
+                    + stats.fast_reject
+                    + stats.adaptive_preflight_reject
+                    + stats.quote_reject
+            );
+        }
+    }
+    println!();
+    print_latency_us("decode", report.decode);
+    print_latency_us("fast_preflight", report.fast_preflight);
+    print_latency_us("adaptive_preflight", report.adaptive_preflight);
+    print_latency_us("adaptive_quote", report.adaptive_quote);
+    print_latency_us("total_hot_gate", report.total_hot_gate);
+    println!();
+}
+
+fn print_latency_us(label: &str, summary: LatencyUsSummary) {
+    println!(
+        "  {}: n={} avg={:.2}us p50={}us p95={}us p99={}us min={}us max={}us",
+        label, summary.count, summary.avg, summary.p50, summary.p95, summary.p99, summary.min, summary.max
+    );
+}
+
+fn rate(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 * 100.0 / denominator as f64
+    }
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 #[derive(Clone, Default)]
