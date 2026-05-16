@@ -1,0 +1,150 @@
+{
+  "network": "bsc",
+  "profile": "adversarial",
+  "cases": 200,
+  "warmup": 20,
+  "concurrency": 4,
+  "wall_ms": 44.8272,
+  "throughput_tps": 4461.576899739444,
+  "latency_budget_p99_us": 250,
+  "budget_pass": false,
+  "processed": 200,
+  "decoded": 136,
+  "decode_reject": 64,
+  "fast_pass": 100,
+  "fast_reject": 36,
+  "adaptive_preflight_pass": 100,
+  "adaptive_preflight_reject": 0,
+  "quote_pass": 100,
+  "quote_reject": 0,
+  "rejection_rate": 50.0,
+  "malformed_rejection_rate": 100.0,
+  "small_notional_rejection_rate": 100.0,
+  "toxic_gas_rejection_rate": 100.0,
+  "long_path_rejection_rate": 0.0,
+  "cluster_burst_rejection_rate": 0.0,
+  "scenarios": {
+    "cluster_burst": {
+      "processed": 32,
+      "decoded": 32,
+      "decode_reject": 0,
+      "fast_pass": 32,
+      "fast_reject": 0,
+      "adaptive_preflight_pass": 32,
+      "adaptive_preflight_reject": 0,
+      "quote_pass": 32,
+      "quote_reject": 0
+    },
+    "long_path": {
+      "processed": 36,
+      "decoded": 36,
+      "decode_reject": 0,
+      "fast_pass": 36,
+      "fast_reject": 0,
+      "adaptive_preflight_pass": 36,
+      "adaptive_preflight_reject": 0,
+      "quote_pass": 36,
+      "quote_reject": 0
+    },
+    "malformed_calldata": {
+      "processed": 16,
+      "decoded": 0,
+      "decode_reject": 16,
+      "fast_pass": 0,
+      "fast_reject": 0,
+      "adaptive_preflight_pass": 0,
+      "adaptive_preflight_reject": 0,
+      "quote_pass": 0,
+      "quote_reject": 0
+    },
+    "small_notional": {
+      "processed": 32,
+      "decoded": 0,
+      "decode_reject": 32,
+      "fast_pass": 0,
+      "fast_reject": 0,
+      "adaptive_preflight_pass": 0,
+      "adaptive_preflight_reject": 0,
+      "quote_pass": 0,
+      "quote_reject": 0
+    },
+    "toxic_gas": {
+      "processed": 36,
+      "decoded": 36,
+      "decode_reject": 0,
+      "fast_pass": 0,
+      "fast_reject": 36,
+      "adaptive_preflight_pass": 0,
+      "adaptive_preflight_reject": 0,
+      "quote_pass": 0,
+      "quote_reject": 0
+    },
+    "unknown_selector": {
+      "processed": 16,
+      "decoded": 0,
+      "decode_reject": 16,
+      "fast_pass": 0,
+      "fast_reject": 0,
+      "adaptive_preflight_pass": 0,
+      "adaptive_preflight_reject": 0,
+      "quote_pass": 0,
+      "quote_reject": 0
+    },
+    "valid": {
+      "processed": 32,
+      "decoded": 32,
+      "decode_reject": 0,
+      "fast_pass": 32,
+      "fast_reject": 0,
+      "adaptive_preflight_pass": 32,
+      "adaptive_preflight_reject": 0,
+      "quote_pass": 32,
+      "quote_reject": 0
+    }
+  },
+  "decode": {
+    "count": 200,
+    "avg": 15.08,
+    "min": 0,
+    "p50": 8,
+    "p95": 17,
+    "p99": 199,
+    "max": 718
+  },
+  "fast_preflight": {
+    "count": 136,
+    "avg": 51.10294117647059,
+    "min": 35,
+    "p50": 40,
+    "p95": 49,
+    "p99": 91,
+    "max": 1210
+  },
+  "adaptive_preflight": {
+    "count": 100,
+    "avg": 33.31,
+    "min": 24,
+    "p50": 27,
+    "p95": 35,
+    "p99": 130,
+    "max": 399
+  },
+  "adaptive_quote": {
+    "count": 100,
+    "avg": 55.69,
+    "min": 41,
+    "p50": 46,
+    "p95": 61,
+    "p99": 344,
+    "max": 589
+  },
+  "total_hot_gate": {
+    "count": 200,
+    "avg": 141.165,
+    "min": 1,
+    "p50": 162,
+    "p95": 392,
+    "p99": 912,
+    "max": 1552
+  }
+}
