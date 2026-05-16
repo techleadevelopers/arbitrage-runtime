@@ -300,6 +300,9 @@ pub async fn maybe_run_replay_harness(
 
     print_report(&config, &report);
     maybe_write_decisions(&decision_rows)?;
+    for path in storage.export_evidence_artifacts(512)? {
+        println!("Replay evidence export: {}", path.display());
+    }
     Ok(true)
 }
 
