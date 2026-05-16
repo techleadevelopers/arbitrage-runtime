@@ -17,6 +17,8 @@ static GLOBAL: Jemalloc = Jemalloc;
 use benchmark::{maybe_run_network_benchmark, maybe_run_runtime_load_test};
 use config::Config;
 use dashboard::DashboardHandle;
+#[cfg(target_os = "linux")]
+use mev::execution::pinning::ThreadPinningConfig;
 use replay::maybe_run_replay_harness;
 use rpc::RpcFleet;
 use std::sync::Arc;
@@ -35,6 +37,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Runtime objective: mempool -> AMM impact -> execution -> realized pnl");
 
     let config = Arc::new(Config::load()?);
+    #[cfg(target_os = "linux")]
+    if std::env::var("RUN_RUNTIME_LOAD_TEST")
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("true")
+    {
+        let pinning = ThreadPinningConfig::auto_detect();
+        info!(
+            "Linux runtime load test pinning plan: network_core={} decode_core={} eval_core={} exec_core={} numa_node={}",
+            pinning.network_core,
+            pinning.decode_core,
+            pinning.eval_core,
+            pinning.exec_core,
+            pinning.numa_node
+        );
+    }
     if maybe_run_runtime_load_test(config.clone()).await? {
         return Ok(());
     }
