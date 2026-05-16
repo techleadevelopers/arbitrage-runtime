@@ -4,12 +4,15 @@ use crate::mev::amm::uniswap_v2::V2PoolState;
 use crate::mev::amm::uniswap_v3::V3PoolState;
 use ethers::types::{Address, Bytes, Transaction, H256, U256};
 use revm::{
-    primitives::{AccountInfo, Bytecode, Env, B160, B256, KECCAK_EMPTY, U256 as rU256},
+    primitives::{
+        AccountInfo, Address as RAddress, Bytecode, B256, TransactTo, KECCAK_EMPTY,
+        U256 as rU256,
+    },
     db::{CacheDB, EmptyDB},
-    Database, Evm,
+    EVM,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::str::FromStr;
 use tracing::{debug, warn};
 
 #[derive(Debug, Clone)]
@@ -78,32 +81,32 @@ impl StateSimulator {
         debug!("Running EVM preflight for tx: {:?}", tx.hash);
         
         // Setup REVM environment
-        let mut evm = Evm::builder()
-            .with_db(CacheDB::new(EmptyDB::new()))
-            .modify_tx_env(|tx_env| {
-                tx_env.caller = B160::from(tx.from.unwrap_or_default().as_fixed_bytes());
-                tx_env.transact_to = tx.to.map(|addr| addr.into());
-                tx_env.data = tx.input.0.clone().into();
-                tx_env.value = rU256::from_limbs(tx.value.0);
-                tx_env.gas_price = rU256::from_limbs(tx.gas_price.unwrap_or_default().0);
-                tx_env.gas_limit = tx.gas.as_u64();
-                tx_env.nonce = Some(tx.nonce.as_u64());
-            })
-            .modify_block_env(|block_env| {
-                block_env.number = rU256::from(block_number);
-                block_env.timestamp = rU256::from(chrono::Utc::now().timestamp() as u64);
-                block_env.coinbase = B160::default();
-                block_env.difficulty = rU256::from(0);
-                block_env.prevrandao = Some(rU256::from(0));
-                block_env.gas_limit = rU256::from(30_000_000u64);
-                block_env.basefee = rU256::from(0);
-            })
-            .build();
+        let mut evm = EVM::new();
+        evm.database(CacheDB::new(EmptyDB::new()));
+        evm.env.tx.caller = RAddress::from_slice(tx.from.as_bytes());
+        evm.env.tx.transact_to = tx
+            .to
+            .map(|addr| TransactTo::Call(RAddress::from_slice(addr.as_bytes())))
+            .unwrap_or_else(TransactTo::create);
+        evm.env.tx.data = tx.input.0.clone().into();
+        evm.env.tx.value = rU256::from_limbs(tx.value.0);
+        evm.env.tx.gas_price = rU256::from_limbs(tx.gas_price.unwrap_or_default().0);
+        evm.env.tx.gas_limit = tx.gas.as_u64();
+        evm.env.tx.nonce = Some(tx.nonce.as_u64());
+        evm.env.tx.chain_id = tx.chain_id.map(|chain_id| chain_id.as_u64());
+
+        evm.env.block.number = rU256::from(block_number);
+        evm.env.block.timestamp = rU256::from(chrono::Utc::now().timestamp() as u64);
+        evm.env.block.coinbase = RAddress::ZERO;
+        evm.env.block.difficulty = rU256::from(0);
+        evm.env.block.prevrandao = Some(B256::ZERO);
+        evm.env.block.gas_limit = rU256::from(30_000_000u64);
+        evm.env.block.basefee = rU256::from(0);
 
         // Apply state overrides (pool states, token balances, etc.)
-        let db = evm.db_mut();
+        let db = evm.db().expect("revm database initialized");
         for (address, state) in state_overrides {
-            let addr = B160::from(address.as_fixed_bytes());
+            let addr = RAddress::from_slice(address.as_bytes());
             let account_info = AccountInfo {
                 balance: rU256::from_limbs(state.balance.0),
                 nonce: state.nonce,
@@ -122,17 +125,17 @@ impl StateSimulator {
         match evm.transact() {
             Ok(result) => {
                 let gas_used = result.result.gas_used();
-                let success = !result.result.is_revert();
+                let success = result.result.is_success();
                 let logs = result
                     .result
                     .logs()
                     .iter()
                     .map(|log| EvmLog {
-                        address: Address::from(log.address.0 .0),
-                        topics: log.topics.iter().map(|topic| H256::from(topic.0 .0)).collect(),
-                        data: Bytes::from(log.data.clone()),
+                        address: Address::from_slice(log.address.as_slice()),
+                        topics: log.topics.iter().map(|topic| H256::from_slice(topic.as_slice())).collect(),
+                        data: Bytes::from(log.data.as_ref().to_vec()),
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
 
                 // Extract profit from logs or result
                 let profit_wei = Self::extract_profit_from_logs(&logs, config.profit_address);
@@ -144,8 +147,11 @@ impl StateSimulator {
                     success,
                     gas_used,
                     profit_wei,
-                    revert_reason: if result.result.is_revert() {
-                        Some(String::from_utf8_lossy(&result.result.output()).to_string())
+                    revert_reason: if !result.result.is_success() {
+                        result
+                            .result
+                            .output()
+                            .map(|output| String::from_utf8_lossy(output.as_ref()).to_string())
                     } else {
                         None
                     },
@@ -166,12 +172,11 @@ impl StateSimulator {
         for log in logs {
             if log.topics.len() >= 3 && log.topics[0] == H256::from_str("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef").unwrap() {
                 // Transfer event: from, to, value
-                if let Ok(to) = Address::from_slice(&log.topics[2].as_bytes()[12..]) {
-                    if to == profit_recipient {
-                        if log.data.len() >= 32 {
-                            let value = U256::from_big_endian(&log.data[0..32]);
-                            profit = profit.saturating_add(value);
-                        }
+                let to = Address::from_slice(&log.topics[2].as_bytes()[12..]);
+                if to == profit_recipient {
+                    if log.data.len() >= 32 {
+                        let value = U256::from_big_endian(&log.data[0..32]);
+                        profit = profit.saturating_add(value);
                     }
                 }
             }
