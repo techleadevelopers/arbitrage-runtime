@@ -7,11 +7,13 @@ use crate::mev::adaptive::{ClusterKey, ContextualOutcomeKind, RelayQuote, Shared
 use crate::mev::execution::payload_builder::AmmRouteKind;
 use crate::mev::opportunity::{wei_to_eth_f64, MevOpportunity};
 use crate::mev::pnl::tracker::{ExecutionResult, PnlTracker};
+use crate::mev::simulation::state_simulator::{AccountState, AmmState, EvmPreflightResult, StateSimulator};
 use crate::rpc::{RpcFleet, RpcHandle};
 use ethers::contract::abigen;
 use ethers::prelude::*;
 use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers_flashbots::{BundleRequest, FlashbotsMiddleware};
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -60,6 +62,71 @@ impl ExecutionEngine {
             last_treasury_signal: Arc::new(Mutex::new(None)),
             capital_budget,
         }
+    }
+
+    // NOVA FUNÇÃO: EVM Preflight Validation
+    async fn validate_with_evm_preflight(
+        &self,
+        payload: &crate::mev::execution::payload_builder::ExecutionPayload,
+        tx_bytes: &Bytes,
+        block_number: u64,
+        pool_state: &AmmState,
+        victim_tx: H256,
+    ) -> Result<EvmPreflightResult, String> {
+        let mut state_overrides = HashMap::new();
+
+        // Add pool state override
+        match pool_state {
+            AmmState::UniswapV2(pool) => {
+                let mut pool_account = AccountState::empty();
+                // Slots aproximados para UniswapV2
+                pool_account.storage.insert(U256::from(0), pool.reserve0);
+                pool_account.storage.insert(U256::from(1), pool.reserve1);
+                state_overrides.insert(pool.pair, pool_account);
+            }
+            AmmState::UniswapV3(pool) => {
+                let mut pool_account = AccountState::empty();
+                pool_account.storage.insert(U256::from(0), pool.sqrt_price_x96);
+                pool_account.storage.insert(U256::from(1), pool.liquidity);
+                pool_account.storage.insert(U256::from(2), U256::from(pool.current_tick as i128));
+                state_overrides.insert(pool.pool, pool_account);
+            }
+        }
+
+        // Add executor contract state
+        if let Some(executor) = self.config.mev.mev_executor {
+            state_overrides.insert(executor, AccountState::empty());
+        }
+
+        // Add profit recipient balance tracking
+        state_overrides.insert(self.config.profit_address, AccountState::empty());
+
+        // Criar transação mock para preflight
+        let mock_tx = Transaction {
+            hash: H256::zero(),
+            nonce: U256::zero(),
+            block_hash: None,
+            block_number: None,
+            transaction_index: None,
+            from: Some(self.config.executor_address),
+            to: Some(payload.target_contract),
+            value: payload.value,
+            gas_price: Some(U256::from(0)),
+            gas: U256::from(payload.gas_limit),
+            input: payload.calldata.clone(),
+            chain_id: Some(self.config.chain_id),
+            ..Default::default()
+        };
+
+        self.dashboard.event(
+            "info",
+            format!(
+                "EVM preflight started victim={:?} block={} gas_limit={}",
+                victim_tx, block_number, payload.gas_limit
+            ),
+        );
+
+        StateSimulator::evm_preflight_execution(&self.config, &mock_tx, block_number, state_overrides).await
     }
 
     pub async fn handle(
@@ -160,6 +227,101 @@ impl ExecutionEngine {
             token_out: opportunity.token_out,
             selector: opportunity.selector,
         };
+
+        // WAR LEVEL: EVM preflight validation (opcional, ativado por env)
+        if std::env::var("MEV_EVM_PREFLIGHT_ENABLED")
+            .unwrap_or_default()
+            .eq_ignore_ascii_case("true")
+        {
+            let preflight_started = std::time::Instant::now();
+
+            // Construir pool state a partir do payload
+            // Nota: Idealmente o payload deveria carregar o pool_state, por enquanto criamos um placeholder
+            let pool_state = match &payload.amm_kind {
+                AmmRouteKind::UniswapV2 => {
+                    AmmState::UniswapV2(crate::mev::amm::uniswap_v2::V2PoolState {
+                        pair: payload.pair,
+                        token0: Address::zero(),
+                        token1: Address::zero(),
+                        reserve0: U256::zero(),
+                        reserve1: U256::zero(),
+                        fee_bps: 30,
+                    })
+                }
+                AmmRouteKind::UniswapV3 { fee_tier, .. } => {
+                    AmmState::UniswapV3(crate::mev::amm::uniswap_v3::V3PoolState {
+                        pool: payload.pair,
+                        token0: Address::zero(),
+                        token1: Address::zero(),
+                        sqrt_price_x96: U256::zero(),
+                        liquidity: U256::zero(),
+                        current_tick: 0,
+                        fee_bps: *fee_tier as u64 / 100,
+                        initialized_ticks: Vec::new(),
+                    })
+                }
+            };
+
+            match self
+                .validate_with_evm_preflight(
+                    &payload,
+                    &payload.tx,
+                    target_block,
+                    &pool_state,
+                    opportunity.victim_tx,
+                )
+                .await
+            {
+                Ok(preflight_result) => {
+                    self.dashboard.record_latency(
+                        "evm_preflight",
+                        preflight_started.elapsed().as_millis(),
+                        None,
+                        Some(&format!("success={}", preflight_result.success)),
+                    );
+
+                    if !preflight_result.success {
+                        self.dashboard.event(
+                            "warn",
+                            format!(
+                                "EVM preflight rejected victim={:?}: revert_reason={:?} gas_used={}",
+                                opportunity.victim_tx,
+                                preflight_result.revert_reason,
+                                preflight_result.gas_used
+                            ),
+                        );
+                        return Ok(());
+                    }
+
+                    self.dashboard.event(
+                        "info",
+                        format!(
+                            "EVM preflight passed victim={:?} gas_used={} profit_wei={}",
+                            opportunity.victim_tx,
+                            preflight_result.gas_used,
+                            preflight_result.profit_wei
+                        ),
+                    );
+                }
+                Err(err) => {
+                    self.dashboard.event(
+                        "warn",
+                        format!(
+                            "EVM preflight failed victim={:?}: {}",
+                            opportunity.victim_tx, err
+                        ),
+                    );
+                    // Não bloqueia a execução se o preflight falhar (modo soft)
+                    if std::env::var("MEV_EVM_PREFLIGHT_HARD_FAIL")
+                        .unwrap_or_default()
+                        .eq_ignore_ascii_case("true")
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         let budget_gate = self.check_and_reserve_budget(&opportunity, &payload, cluster);
         if !budget_gate.allowed {
             self.dashboard.event(
