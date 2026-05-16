@@ -8,7 +8,7 @@ mod storage;
 mod wallets;
 
 #[cfg(unix)]
-use jemallocator::Jemalloc;
+use tikv_jemallocator::Jemalloc;
 
 #[cfg(unix)]
 #[global_allocator]
