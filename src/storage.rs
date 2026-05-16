@@ -1,4 +1,6 @@
-use crate::dashboard::{DashboardEvent, ExecutionOutcomeSnapshot, RelaySnapshot, TreasurySnapshot};
+use crate::dashboard::{
+    DashboardEvent, ExecutionOutcomeSnapshot, RelaySnapshot, ToxicitySnapshot, TreasurySnapshot,
+};
 use crate::mev::adaptive::HistoricalOutcomeProfile;
 use chrono::Utc;
 use rusqlite::{params, Connection};
@@ -615,6 +617,78 @@ impl Storage {
         Ok(items)
     }
 
+    pub fn toxicity_profiles(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ToxicitySnapshot>, Box<dyn std::error::Error>> {
+        let conn = self.conn.lock().map_err(|_| "storage lock poisoned")?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT CAST(substr(at, 12, 2) AS INTEGER) AS hour_utc,
+                   pair,
+                   router,
+                   COUNT(*) AS samples,
+                   AVG(CASE WHEN outcome = 'included_success' THEN 1.0 ELSE 0.0 END) AS success_rate,
+                   AVG(CASE WHEN outcome = 'accepted_not_included' THEN 1.0 ELSE 0.0 END) AS miss_rate,
+                   AVG(CASE WHEN outcome = 'included_revert' THEN 1.0 ELSE 0.0 END) AS revert_rate,
+                   AVG(
+                       CASE
+                           WHEN expected_profit_eth > 0 THEN
+                               MIN(MAX(realized_profit_eth / expected_profit_eth, 0.0), 1.25)
+                           ELSE 0.0
+                       END
+                   ) AS realized_capture
+            FROM execution_outcomes
+            WHERE network = ?1
+            GROUP BY hour_utc, pair, router
+            HAVING COUNT(*) >= 1
+            ORDER BY
+                (
+                    (1.0 - AVG(CASE WHEN outcome = 'included_success' THEN 1.0 ELSE 0.0 END)) * 0.30
+                    + AVG(CASE WHEN outcome = 'accepted_not_included' THEN 1.0 ELSE 0.0 END) * 0.30
+                    + AVG(CASE WHEN outcome = 'included_revert' THEN 1.0 ELSE 0.0 END) * 0.25
+                    + (1.0 - AVG(
+                       CASE
+                           WHEN expected_profit_eth > 0 THEN
+                               MIN(MAX(realized_profit_eth / expected_profit_eth, 0.0), 1.25)
+                           ELSE 0.0
+                       END
+                    )) * 0.15
+                ) DESC,
+                samples DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = stmt.query_map(params![self.network, limit as i64], |row| {
+            let success_rate = row.get::<_, f64>(4)?;
+            let miss_rate = row.get::<_, f64>(5)?;
+            let revert_rate = row.get::<_, f64>(6)?;
+            let realized_capture = row.get::<_, f64>(7)?;
+            let toxicity_score = ((1.0 - success_rate).clamp(0.0, 1.0) * 0.30
+                + miss_rate.clamp(0.0, 1.0) * 0.30
+                + revert_rate.clamp(0.0, 1.0) * 0.25
+                + (1.0 - realized_capture).clamp(0.0, 1.0) * 0.15)
+                .clamp(0.0, 1.0);
+            Ok(ToxicitySnapshot {
+                hour_utc: row.get::<_, i64>(0)? as u8,
+                pair: row.get(1)?,
+                router: row.get(2)?,
+                samples: row.get::<_, i64>(3)? as u64,
+                success_rate,
+                miss_rate,
+                revert_rate,
+                realized_capture,
+                toxicity_score,
+            })
+        })?;
+
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
+    }
+
     fn scoped_relay(&self, relay: &str) -> String {
         format!("{}::{}", self.network, relay)
     }
@@ -714,5 +788,40 @@ mod tests {
         assert_eq!(profile.samples, 3);
         assert!(profile.success_rate > 0.60 && profile.success_rate < 0.70);
         assert!(profile.accepted_not_included_rate > 0.30 && profile.accepted_not_included_rate < 0.35);
+    }
+
+    #[test]
+    fn toxicity_profiles_rank_bad_contexts() {
+        let path = temp_path("toxicity");
+        let storage = Storage::new(&path, "polygon").unwrap();
+        let pair = format!("{:?}", Address::from_low_u64_be(101));
+        let router = format!("{:?}", Address::from_low_u64_be(201));
+        let token_in = format!("{:?}", Address::from_low_u64_be(301));
+        let token_out = format!("{:?}", Address::from_low_u64_be(401));
+
+        for outcome in ["included_revert", "accepted_not_included", "included_success"] {
+            storage.record_execution_outcome(
+                "rpc://polygon-a",
+                456,
+                &pair,
+                &router,
+                &token_in,
+                &token_out,
+                "0xvictim",
+                outcome,
+                0.01,
+                if outcome == "included_success" { 0.002 } else { 0.0 },
+                210000,
+                14.0,
+                700.0,
+            );
+        }
+
+        let profiles = storage.toxicity_profiles(10).unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].samples, 3);
+        assert!(profiles[0].toxicity_score > 0.50);
+        assert!(profiles[0].revert_rate > 0.30);
+        assert!(profiles[0].miss_rate > 0.30);
     }
 }
