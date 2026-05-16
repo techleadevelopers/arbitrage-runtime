@@ -22,8 +22,9 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 use tracing::warn;
 use crate::mev::cache::pool_cache::PoolCache;
-use crate::mev::cache::pool_cache::PoolCache;
-use crate::mev::simulation::state_simulator::{StateSimulator, AccountState, EvmPreflightResult};
+use crate::mev::simulation::state_simulator::{
+    AccountState, AmmState, EvmPreflightResult, StateSimulator,
+};
 
 
 const MICROBATCH_WINDOW_MS: u64 = 45;
@@ -551,7 +552,7 @@ async fn process_lookup_decode_task(
 ) -> Option<LookupDecodedCandidate> {
     let mut latency_trace = CandidateLatencyTrace::default();
     let lookup_started = Instant::now();
-    let tx = lookup_pending_tx_parallel(rpc_fleet, task.tx_hash).await?;
+    let tx = lookup_pending_tx_parallel(rpc_fleet.clone(), task.tx_hash).await?;
     latency_trace.lookup_pending_tx_us = Some(elapsed_us(lookup_started));
     let block_number = get_current_block_parallel(rpc_fleet.clone()).await?;
 
@@ -638,8 +639,7 @@ async fn validate_with_evm_preflight(
     dashboard: &DashboardHandle,
 ) -> Result<EvmPreflightResult, String> {
     // Obter um provider para o fork
-    let provider = rpc_fleet.get_best_provider().await
-        .ok_or_else(|| "No available RPC provider for EVM preflight".to_string())?;
+    let _ = (rpc_fleet, dashboard);
     
     // Criar o estado inicial baseado no block_number
     let mut account_states = std::collections::HashMap::new();
@@ -647,20 +647,17 @@ async fn validate_with_evm_preflight(
     // Adicionar o estado do pool antes da execução
     match pool_state {
         AmmState::UniswapV2(pool) => {
-            account_states.insert(pool.pair, AccountState {
-                nonce: None,
-                balance: None,
-                storage: None,  // TODO: Implementar get_storage_layout se necessário
-                code: None,
-            });
+            let mut account = AccountState::empty();
+            account.storage.insert(U256::from(0), pool.reserve0);
+            account.storage.insert(U256::from(1), pool.reserve1);
+            account_states.insert(pool.pair, account);
         }
         AmmState::UniswapV3(pool) => {
-            account_states.insert(pool.pool, AccountState {
-                nonce: None,
-                balance: None,
-                storage: None,  // TODO: Implementar get_storage_layout se necessário
-                code: None,
-            });
+            let mut account = AccountState::empty();
+            account.storage.insert(U256::from(0), pool.sqrt_price_x96);
+            account.storage.insert(U256::from(1), pool.liquidity);
+            account.storage.insert(U256::from(2), U256::from(pool.current_tick.max(0) as u64));
+            account_states.insert(pool.pool, account);
         }
     }
     
@@ -968,128 +965,6 @@ async fn process_evaluation_task(
         .unwrap_or_default()
         .clamp(0.0, 1.0);
     
-    candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
-    candidate
-        .latency_trace
-        .emit(&config, &dashboard, tx_hash, "execution_ready", "adaptive_passed");
-
-    Some(PendingExecutionCandidate {
-        opportunity,
-        ev_real_usd: quote.ev_real_usd,
-        p_positive: quote.p_positive,
-        capital_efficiency,
-        relay_score: quote.builder_pressure,
-        context_priority_score: quote.context_priority_score,
-    })
-}
-
-    let ev_gate_started = Instant::now();
-    if !passes_ev_gate(
-        &config,
-        &payload,
-        &candidate.signal,
-        candidate.lookup_latency,
-        min_profit_wei,
-    ) {
-        candidate.latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
-        candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
-        candidate.latency_trace.emit(&config, &dashboard, tx_hash, "reject", "ev_gate");
-        return None;
-    }
-    candidate.latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
-
-    let execution_cost_wei = candidate
-        .gas_price
-        .saturating_mul(U256::from(payload.gas_limit))
-        .saturating_mul(U256::from(config.mev.gas_safety_margin_bps))
-        / U256::from(10_000u64);
-    let quality_gate_started = Instant::now();
-    if !passes_quality_gate(&config, &payload, execution_cost_wei) {
-        candidate.latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
-        candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
-        candidate.latency_trace.emit(&config, &dashboard, tx_hash, "reject", "quality_gate");
-        return None;
-    }
-    candidate.latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
-
-    let adaptive_quote_started = Instant::now();
-    let quote = if let Ok(mut model) = adaptive.lock() {
-        model.quote_for_relays(
-            AdaptiveQuoteInput {
-                cluster: candidate.cluster,
-                pair: payload.pair,
-                hour_utc: candidate.hour_utc,
-                context_priority_score: candidate.context_signal.priority_score,
-                context_toxicity_score: candidate.context_signal.toxicity_score,
-                expected_profit_wei: payload.expected_profit_wei,
-                execution_cost_wei,
-                gas_price_wei: candidate.gas_price,
-                lookup_latency_ms: candidate.lookup_latency.as_millis() as f64,
-                notional_eth: wei_to_eth_f64(candidate.signal.notional_wei),
-                price_impact_bps: payload.price_impact_bps,
-                relay_pressure_override: None,
-            },
-            &config.builder_relays,
-        )
-    } else {
-        return None;
-    };
-    candidate.latency_trace.adaptive_quote_us = Some(elapsed_us(adaptive_quote_started));
-    dashboard.set_market_regime(quote.regime.as_str());
-    if !quote.should_execute {
-        candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
-        if let Some(reason) = quote.reject_reason {
-            dashboard.record_reject_reason("adaptive", reason);
-        }
-        candidate.latency_trace.emit(
-            &config,
-            &dashboard,
-            tx_hash,
-            "reject",
-            quote.reject_reason.as_deref().unwrap_or("adaptive"),
-        );
-        return None;
-    }
-
-    dashboard.event(
-        "info",
-        format!(
-            "adaptive gate passed victim={:?} regime={} relay={} ev_real={:.2}usd threshold={:.2}usd p={:.2} comp={:.2} risk={:.2} builder={:.2} density={:.2} cluster={:.2} latency={:.2} gas_pressure={:.2} comp_penalty={:.2}usd risk_penalty={:.2}usd path_penalty={:.2}usd context_toxicity={:.2}",
-            tx_hash,
-            quote.regime.as_str(),
-            quote.selected_relay.as_deref().unwrap_or("unknown"),
-            quote.ev_real_usd,
-            quote.threshold_dynamic_usd,
-            quote.p_positive,
-            quote.competition_score,
-            quote.risk_score,
-            quote.builder_pressure,
-            quote.mempool_density,
-            quote.cluster_heat,
-            quote.latency_penalty,
-            quote.gas_pressure,
-            quote.competition_penalty_usd,
-            quote.risk_penalty_usd,
-            quote.path_penalty_usd,
-            quote.context_toxicity_score
-        ),
-    );
-
-    let opportunity = build_opportunity(
-        &candidate.tx,
-        &candidate.signal,
-        payload,
-        quote.selected_relay.clone(),
-    );
-    let capital_efficiency = opportunity
-        .execution_payload
-        .as_ref()
-        .map(|payload| {
-            let capital_eth = wei_to_eth_f64(payload.capital_committed_wei).max(1e-9);
-            (quote.ev_real_usd / capital_eth).max(0.0) / config.mev.eth_usd_price.max(1.0)
-        })
-        .unwrap_or_default()
-        .clamp(0.0, 1.0);
     candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
     candidate
         .latency_trace
