@@ -420,6 +420,13 @@ Examples:
 - execution outcomes
 - latency pipeline
 
+The active runtime also emits operational events directly through the dashboard event stream for cases that matter during low-capital validation:
+
+- opportunity skipped because observed victim gas is above the configured cap
+- executor blocked because live RPC gas is above the configured cap
+- RPC submit failed
+- insufficient funds for gas/value during direct-RPC execution attempts
+
 The dashboard is intended for operational inspection, not public hosting.
 
 The static operational frontend lives under:
@@ -445,10 +452,20 @@ Below is the core environment surface used by the active runtime.
 - `CHAIN_ID`
 - `DASHBOARD_ADDR`
 - `MEMPOOL_WS_URL`
+- `MEMPOOL_WS_URL_BSC`
+- `MEMPOOL_WS_URL_BNB`
+- `MEMPOOL_WS_URL_POLYGON`
 - `STORAGE_PATH`
 
 ### RPC and execution path
 
+- `RPC_URL`
+- `RPC_URL_2`
+- `RPC_URL_3`
+- `RPC_URL_4`
+- `RPC_URL_BSC`
+- `RPC_URL_BNB`
+- `RPC_URL_POLYGON`
 - `ALCHEMY_KEY`
 - `FLASHBOTS_RELAY`
 - `BUILDER_RELAYS`
@@ -472,6 +489,10 @@ Below is the core environment surface used by the active runtime.
 - `MEV_MIN_LARGE_SWAP_ETH`
 - `MEV_MAX_PENDING_AGE_MS`
 - `MEV_MAX_GAS_PER_TX`
+- `MEV_MAX_GAS_PRICE_GWEI`
+- `MEV_MAX_GAS_PRICE_GWEI_BSC`
+- `MEV_MAX_GAS_PRICE_GWEI_BNB`
+- `MEV_MAX_GAS_PRICE_GWEI_POLYGON`
 - `MEV_MAX_PRICE_IMPACT_BPS`
 - `MEV_SLIPPAGE_PROTECTION_BPS`
 - `MEV_ETH_USD_PRICE`
@@ -512,22 +533,63 @@ Below is the core environment surface used by the active runtime.
 ### Normal runtime
 
 ```bash
-cargo run -- --network bsc
+cargo run -- --network polygon
 ```
+
+The runtime still honors `NETWORK` from `.env`. The CLI flag is useful when you want an explicit override.
+
+### Current validated live posture
+
+At the moment, the actively validated path is:
+
+- `polygon`
+- direct-RPC execution
+- mempool websocket via `MEMPOOL_WS_URL` or `MEMPOOL_WS_URL_POLYGON`
+- gas cap through `MEV_MAX_GAS_PRICE_GWEI_POLYGON`
+
+This path has already been validated at startup level with:
+
+- `Network: polygon`
+- `Chain id: 137`
+- visible startup guardrail log for `max_gas_price`
+
+### BNB Chain note
+
+BNB Chain is supported by the runtime decision model, but live operation should use explicit RPC configuration.
+
+Provide at least:
+
+- `RPC_URL_BSC` or `RPC_URL_BNB`
+- `MEMPOOL_WS_URL_BSC` or `MEMPOOL_WS_URL_BNB`
+
+This matters because the generic provider autoconstruction for BNB should not rely on Ethereum/Arbitrum/Polygon-only provider assumptions.
 
 ### Network benchmark
 
 ```bash
-RUN_NETWORK_BENCHMARK=true cargo run -- --network bsc
+RUN_NETWORK_BENCHMARK=true cargo run -- --network polygon
 ```
 
 ### Replay harness
 
 ```bash
 RUN_REPLAY_HARNESS=true \
-REPLAY_INPUT_PATH=./replay/bsc_cases.jsonl \
-cargo run -- --network bsc
+REPLAY_INPUT_PATH=./replay/polygon_cases.jsonl \
+cargo run -- --network polygon
 ```
+
+### Low-capital observation mode
+
+For low-capital validation, the recommended sequence is:
+
+1. Run with `MEV_ENGINE_ENABLED=true` and the chain-specific gas cap set.
+2. Keep the executor wallet at zero or near-zero balance.
+3. Let the runtime observe live mempool flow.
+4. Wait for a visible direct-RPC submit failure such as insufficient funds.
+
+The first `insufficient funds` event is treated as proof that the full path reached:
+
+`mempool read -> decode -> payload build -> EV gate -> execution attempt`
 
 ## Operational Notes
 
@@ -540,6 +602,13 @@ That implies:
 - do not commit `.env`, keys, local SQLite state, or replay datasets with sensitive flow
 - validate chain-specific fork URLs before trusting any replay output
 - calibrate by network separately
+
+Practical gas-cap guidance for the currently intended starting chains:
+
+- BNB Chain: use a tight cap such as `4` or `5` gwei unless you intentionally want to participate in aggressive gas bidding
+- Polygon: use a materially higher cap such as `50` to `100` gwei depending on how much idle time versus gas risk you accept
+
+These are operational guardrails, not profitability guarantees.
 
 ## Current Boundaries
 
@@ -554,6 +623,10 @@ It is strong where it is explicit:
 - historical contextual calibration
 - capital budgeting
 - replay-based decision review
+
+It already includes deterministic post-victim state simulation and slippage-aware sizing gates, but it does not yet include a full local EVM preflight such as `revm` before live direct-RPC submission.
+
+That means the runtime is intentionally safer than a naive mempool bot, but it is not yet equivalent to a full signed-state local execution simulator.
 
 It is not marketed as a universal arbitrage platform or cross-domain MEV framework.
 
