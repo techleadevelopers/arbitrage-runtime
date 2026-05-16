@@ -16,7 +16,8 @@ use ethers_flashbots::{BundleRequest, FlashbotsMiddleware};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::task::JoinSet;
 use tracing::warn;
 use url::Url;
 
@@ -35,6 +36,7 @@ pub struct ExecutionEngine {
     adaptive: SharedAdaptivePolicy,
     last_treasury_signal: Arc<Mutex<Option<TreasurySignal>>>,
     capital_budget: Arc<Mutex<CapitalBudget>>,
+    execution_guard: Arc<Mutex<ExecutionGuard>>,
 }
 
 struct SendContext {
@@ -43,6 +45,17 @@ struct SendContext {
     chain_nonce: U256,
     gas_price: U256,
     block: U64,
+}
+
+#[derive(Default)]
+struct ExecutionGuard {
+    consecutive_losses: u32,
+    frozen_until: Option<Instant>,
+}
+
+struct StopLossSnapshot {
+    consecutive_losses: u32,
+    remaining_freeze_secs: u64,
 }
 
 impl ExecutionEngine {
@@ -61,6 +74,7 @@ impl ExecutionEngine {
             adaptive,
             last_treasury_signal: Arc::new(Mutex::new(None)),
             capital_budget,
+            execution_guard: Arc::new(Mutex::new(ExecutionGuard::default())),
         }
     }
 
@@ -160,6 +174,19 @@ impl ExecutionEngine {
             return Ok(());
         };
 
+        if let Some(snapshot) = self.stop_loss_snapshot() {
+            self.dashboard.event(
+                "warn",
+                format!(
+                    "fee extraction frozen by stop-loss victim={:?}: consecutive_losses={} remaining_freeze_secs={}",
+                    opportunity.victim_tx,
+                    snapshot.consecutive_losses,
+                    snapshot.remaining_freeze_secs
+                ),
+            );
+            return Ok(());
+        }
+
         let wallet = self
             .config
             .executor_private_key
@@ -213,13 +240,6 @@ impl ExecutionEngine {
             );
             return Ok(());
         }
-        payload.tx = sign_executor_transaction(
-            &wallet,
-            &payload,
-            send_context.chain_nonce,
-            send_context.gas_price,
-        )
-        .await?;
         let target_block = (send_context.block + 1).as_u64();
         let cluster = ClusterKey {
             router: opportunity.router,
@@ -342,6 +362,29 @@ impl ExecutionEngine {
             return Ok(());
         }
         let relay_ranking = self.rank_relays(opportunity.preferred_relay.as_deref());
+        let gas_price_to_use = self.dynamic_gas_price(
+            send_context.gas_price,
+            relay_ranking.first(),
+            &payload,
+        );
+        if gas_price_to_use != send_context.gas_price {
+            self.dashboard.event(
+                "info",
+                format!(
+                    "dynamic gas overpay victim={:?}: base={:.2} gwei adjusted={:.2} gwei",
+                    opportunity.victim_tx,
+                    wei_to_gwei_f64(send_context.gas_price),
+                    wei_to_gwei_f64(gas_price_to_use),
+                ),
+            );
+        }
+        payload.tx = sign_executor_transaction(
+            &wallet,
+            &payload,
+            send_context.chain_nonce,
+            gas_price_to_use,
+        )
+        .await?;
         if !relay_ranking.is_empty() {
             self.dashboard.set_relay_rankings(relay_ranking.iter().map(relay_snapshot).collect());
             self.dashboard.event(
@@ -376,21 +419,39 @@ impl ExecutionEngine {
                     submit_endpoints.push(endpoint);
                 }
             }
+            submit_endpoints.truncate(self.config.mev.rpc_fanout_count.max(1));
 
             let mut last_submit_error: Option<String> = None;
+            let mut submit_set = JoinSet::new();
             for endpoint in submit_endpoints {
-                self.rpc_fleet.reserve_send_selection(endpoint.id);
-                let started = std::time::Instant::now();
-                match endpoint.provider.send_raw_transaction(payload.tx.clone()).await {
-                    Ok(pending) => {
-                        let tx_hash = pending.tx_hash();
-                        let submit_latency_ms = started.elapsed().as_millis() as f64;
+                let tx = payload.tx.clone();
+                let endpoint_id = endpoint.id;
+                let endpoint_name = endpoint.name.clone();
+                let provider = endpoint.provider.clone();
+                submit_set.spawn(async move {
+                    let started = Instant::now();
+                    let submit_outcome = match provider.send_raw_transaction(tx).await {
+                        Ok(pending) => Ok((endpoint_id, endpoint_name, started.elapsed(), pending.tx_hash())),
+                        Err(err) => Err((endpoint_id, endpoint_name, started.elapsed(), err.to_string())),
+                    };
+                    submit_outcome
+                });
+            }
+
+            while let Some(result) = submit_set.join_next().await {
+                let Ok(submit_result) = result else {
+                    continue;
+                };
+                match submit_result {
+                    Ok((endpoint_id, endpoint_name, elapsed, tx_hash)) => {
+                        self.rpc_fleet.reserve_send_selection(endpoint_id);
+                        let submit_latency_ms = elapsed.as_millis() as f64;
                         self.rpc_fleet.record_success(
-                            endpoint.id,
-                            started.elapsed(),
+                            endpoint_id,
+                            elapsed,
                             Some(target_block),
                         );
-                        let relay_label = format!("rpc://{}", endpoint.name);
+                        let relay_label = format!("rpc://{}", endpoint_name);
                         if let Ok(mut adaptive) = self.adaptive.lock() {
                             adaptive.record_submit_success_for_relay(&relay_label, submit_latency_ms);
                         }
@@ -398,7 +459,7 @@ impl ExecutionEngine {
                             "fee_rpc_submit",
                             submit_latency_ms as u128,
                             None,
-                            Some(&endpoint.name),
+                            Some(&endpoint_name),
                         );
                         self.dashboard.event(
                             "success",
@@ -410,9 +471,10 @@ impl ExecutionEngine {
                                 wei_to_eth_f64(payload.expected_profit_wei)
                             ),
                         );
+                        submit_set.abort_all();
                         let realized = self
                             .observe_realized_pnl(
-                                endpoint.id,
+                                endpoint_id,
                                 tx_hash,
                                 &opportunity,
                                 &payload,
@@ -424,8 +486,8 @@ impl ExecutionEngine {
                         self.record_result(&realized);
                         return Ok(());
                     }
-                    Err(err) => {
-                        let err_text = err.to_string();
+                    Err((endpoint_id, endpoint_name, _elapsed, err_text)) => {
+                        self.rpc_fleet.reserve_send_selection(endpoint_id);
                         if is_insufficient_funds_error(&err_text) {
                             let estimated_cost_wei = send_context
                                 .gas_price
@@ -436,7 +498,7 @@ impl ExecutionEngine {
                                 format!(
                                     "execution failed victim={:?}: insufficient funds for gas/value via {} required_estimated_cost={:.6} ETH gas_price={:.2} gwei gas_limit={}",
                                     opportunity.victim_tx,
-                                    endpoint.name,
+                                    endpoint_name,
                                     wei_to_eth_f64(estimated_cost_wei),
                                     wei_to_gwei_f64(send_context.gas_price),
                                     payload.gas_limit
@@ -448,13 +510,13 @@ impl ExecutionEngine {
                                 format!(
                                     "fee extraction rpc submit failed victim={:?} via {}: {}",
                                     opportunity.victim_tx,
-                                    endpoint.name,
+                                    endpoint_name,
                                     err_text
                                 ),
                             );
                         }
                         self.rpc_fleet
-                            .record_failure(endpoint.id, RpcFleet::classify_failure(&err_text));
+                            .record_failure(endpoint_id, RpcFleet::classify_failure(&err_text));
                         last_submit_error = Some(err_text);
                     }
                 }
@@ -466,7 +528,10 @@ impl ExecutionEngine {
         }
 
         let mut last_error: Option<String> = None;
-        for relay in &relay_ranking {
+        for relay in relay_ranking
+            .iter()
+            .take(self.config.mev.relay_fanout_count.max(1))
+        {
             let relay_url = match Url::parse(&relay.relay) {
                 Ok(url) => url,
                 Err(err) => {
@@ -858,6 +923,27 @@ impl ExecutionEngine {
     }
 
     fn record_result(&self, result: &ExecutionResult) {
+        let freeze_armed = {
+            let mut guard = match self.execution_guard.lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+            if result.success && result.realized_profit > 0.0 {
+                guard.consecutive_losses = 0;
+                guard.frozen_until = None;
+                false
+            } else {
+                guard.consecutive_losses = guard.consecutive_losses.saturating_add(1);
+                if guard.consecutive_losses >= self.config.mev.stop_loss_consecutive_losses {
+                    guard.frozen_until = Some(
+                        Instant::now() + Duration::from_secs(self.config.mev.stop_loss_freeze_secs),
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
+        };
         if let Ok(mut pnl) = self.pnl.lock() {
             pnl.record(result);
             self.dashboard.event(
@@ -871,6 +957,72 @@ impl ExecutionEngine {
                     pnl.realized_loss_eth
                 ),
             );
+        }
+        if freeze_armed {
+            self.dashboard.event(
+                "warn",
+                format!(
+                    "stop-loss armed: consecutive_losses>={} freeze_secs={}",
+                    self.config.mev.stop_loss_consecutive_losses,
+                    self.config.mev.stop_loss_freeze_secs
+                ),
+            );
+        }
+    }
+
+    fn stop_loss_snapshot(&self) -> Option<StopLossSnapshot> {
+        let Ok(mut guard) = self.execution_guard.lock() else {
+            return None;
+        };
+        let frozen_until = guard.frozen_until?;
+        let now = Instant::now();
+        if now >= frozen_until {
+            guard.frozen_until = None;
+            guard.consecutive_losses = 0;
+            return None;
+        }
+        Some(StopLossSnapshot {
+            consecutive_losses: guard.consecutive_losses,
+            remaining_freeze_secs: frozen_until.saturating_duration_since(now).as_secs(),
+        })
+    }
+
+    fn dynamic_gas_price(
+        &self,
+        base_gas_price: U256,
+        best_relay: Option<&RelayQuote>,
+        payload: &crate::mev::execution::payload_builder::ExecutionPayload,
+    ) -> U256 {
+        let mut extra_bps = self.config.mev.gas_overpay_base_extra_bps;
+
+        if let Some(relay) = best_relay {
+            if relay.accepted_not_included_rate >= 0.10 {
+                extra_bps = extra_bps.saturating_add(self.config.mev.gas_overpay_miss_extra_bps);
+            }
+            if relay.revert_rate >= 0.05 {
+                extra_bps = extra_bps.saturating_add(self.config.mev.gas_overpay_revert_extra_bps);
+            }
+            if relay.accept_rate <= 0.60 {
+                extra_bps =
+                    extra_bps.saturating_add(self.config.mev.gas_overpay_submit_failure_extra_bps);
+            }
+        }
+
+        if payload.context_toxicity_score >= self.config.mev.capital_multiplier_toxicity_threshold {
+            extra_bps = extra_bps.saturating_add(self.config.mev.gas_overpay_miss_extra_bps / 2);
+        } else if payload.context_priority_score
+            >= self.config.mev.capital_multiplier_priority_threshold
+        {
+            extra_bps = extra_bps.saturating_add(self.config.mev.gas_overpay_base_extra_bps / 2);
+        }
+
+        extra_bps = extra_bps.min(self.config.mev.gas_overpay_max_extra_bps);
+        let adjusted = base_gas_price.saturating_mul(U256::from(10_000u64 + extra_bps))
+            / U256::from(10_000u64);
+        if let Some(cap) = self.config.mev.max_gas_price_wei() {
+            adjusted.min(cap)
+        } else {
+            adjusted
         }
     }
 
@@ -1337,6 +1489,20 @@ mod tests {
                 executor_min_buffer_eth: 0.1,
                 executor_target_buffer_eth: 0.3,
                 executor_max_buffer_eth: 1.0,
+                relay_fanout_count: 3,
+                rpc_fanout_count: 2,
+                gas_overpay_base_extra_bps: 500,
+                gas_overpay_miss_extra_bps: 2_500,
+                gas_overpay_revert_extra_bps: 1_200,
+                gas_overpay_submit_failure_extra_bps: 1_500,
+                gas_overpay_max_extra_bps: 5_000,
+                stop_loss_consecutive_losses: 3,
+                stop_loss_freeze_secs: 300,
+                capital_multiplier_aggressive: 2.0,
+                capital_multiplier_neutral: 1.0,
+                capital_multiplier_defensive: 0.3,
+                capital_multiplier_priority_threshold: 0.60,
+                capital_multiplier_toxicity_threshold: 0.65,
                 uniswap_v2_factory: Some(Address::from_low_u64_be(20)),
                 uniswap_v3_factory: Some(Address::from_low_u64_be(22)),
                 mev_executor: Some(Address::from_low_u64_be(21)),

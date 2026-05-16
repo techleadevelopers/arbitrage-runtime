@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 // Arquivo: src/mev/execution/payload_builder.rs
 
 use crate::config::Config;
@@ -33,6 +35,8 @@ pub struct ExecutionPayload {
     pub price_impact_bps: u64,
     pub profit_token: Address,
     pub profit_recipient: Address,
+    pub context_priority_score: f64,
+    pub context_toxicity_score: f64,
     // NOVO: Estado do pool antes da execução para EVM preflight
     pub pool_state_before: AmmState,
 }
@@ -172,6 +176,8 @@ impl PayloadBuilder {
             price_impact_bps,
             profit_token: input.token_in,
             profit_recipient: input.recipient,
+            context_priority_score: input.context_priority_score,
+            context_toxicity_score: input.context_toxicity_score,
             pool_state_before: input.state_before,
         })
     }
@@ -298,6 +304,8 @@ impl PayloadBuilder {
             price_impact_bps,
             profit_token: input.token_in,
             profit_recipient: input.recipient,
+            context_priority_score: input.context_priority_score,
+            context_toxicity_score: input.context_toxicity_score,
             pool_state_before: input.state_before,
         })
     }

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::config::{Config, MonitoredTokenConfig};
 use crate::dashboard::DashboardHandle;
 use crate::mev::adaptive::{
@@ -1249,6 +1251,18 @@ async fn build_payload_with_fallback_parallel(
     None
 }
 
+fn contextual_capital_available_wei(
+    config: &Config,
+    context_signal: ContextSignal,
+) -> Result<U256, String> {
+    let multiplier = config.mev.contextual_capital_multiplier(
+        context_signal.priority_score,
+        context_signal.toxicity_score,
+    );
+    let capital_eth = (config.mev.capital_eth * multiplier).max(0.000_001);
+    ethers::utils::parse_ether(capital_eth.to_string()).map_err(|err| err.to_string())
+}
+
 pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
     provider: Arc<M>,
     config: &Config,
@@ -1287,8 +1301,7 @@ pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
         fee_bps: 30,
     };
     
-    let capital_available_wei =
-        ethers::utils::parse_ether(config.mev.capital_eth.to_string()).map_err(|err| err.to_string())?;
+    let capital_available_wei = contextual_capital_available_wei(config, context_signal)?;
     
     PayloadBuilder::build_fee_extraction_v2(
         config,
@@ -1360,8 +1373,7 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
         initialized_ticks: Vec::new(),
     };
     
-    let capital_available_wei =
-        ethers::utils::parse_ether(config.mev.capital_eth.to_string()).map_err(|err| err.to_string())?;
+    let capital_available_wei = contextual_capital_available_wei(config, context_signal)?;
     
     PayloadBuilder::build_fee_extraction_v3(
         config,

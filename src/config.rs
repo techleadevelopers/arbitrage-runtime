@@ -75,6 +75,20 @@ pub struct MevConfig {
     pub executor_min_buffer_eth: f64,
     pub executor_target_buffer_eth: f64,
     pub executor_max_buffer_eth: f64,
+    pub relay_fanout_count: usize,
+    pub rpc_fanout_count: usize,
+    pub gas_overpay_base_extra_bps: u64,
+    pub gas_overpay_miss_extra_bps: u64,
+    pub gas_overpay_revert_extra_bps: u64,
+    pub gas_overpay_submit_failure_extra_bps: u64,
+    pub gas_overpay_max_extra_bps: u64,
+    pub stop_loss_consecutive_losses: u32,
+    pub stop_loss_freeze_secs: u64,
+    pub capital_multiplier_aggressive: f64,
+    pub capital_multiplier_neutral: f64,
+    pub capital_multiplier_defensive: f64,
+    pub capital_multiplier_priority_threshold: f64,
+    pub capital_multiplier_toxicity_threshold: f64,
     pub uniswap_v2_factory: Option<Address>,
     pub uniswap_v3_factory: Option<Address>,
     pub mev_executor: Option<Address>,
@@ -316,6 +330,51 @@ impl Config {
             executor_max_buffer_eth: env::var("MEV_EXECUTOR_MAX_BUFFER_ETH")
                 .unwrap_or_else(|_| "1.00".to_string())
                 .parse::<f64>()?,
+            relay_fanout_count: env::var("MEV_RELAY_FANOUT_COUNT")
+                .unwrap_or_else(|_| "3".to_string())
+                .parse::<usize>()?
+                .max(1),
+            rpc_fanout_count: env::var("MEV_RPC_FANOUT_COUNT")
+                .unwrap_or_else(|_| "2".to_string())
+                .parse::<usize>()?
+                .max(1),
+            gas_overpay_base_extra_bps: env::var("MEV_GAS_OVERPAY_BASE_EXTRA_BPS")
+                .unwrap_or_else(|_| "500".to_string())
+                .parse::<u64>()?,
+            gas_overpay_miss_extra_bps: env::var("MEV_GAS_OVERPAY_MISS_EXTRA_BPS")
+                .unwrap_or_else(|_| "2500".to_string())
+                .parse::<u64>()?,
+            gas_overpay_revert_extra_bps: env::var("MEV_GAS_OVERPAY_REVERT_EXTRA_BPS")
+                .unwrap_or_else(|_| "1200".to_string())
+                .parse::<u64>()?,
+            gas_overpay_submit_failure_extra_bps: env::var("MEV_GAS_OVERPAY_SUBMIT_FAILURE_EXTRA_BPS")
+                .unwrap_or_else(|_| "1500".to_string())
+                .parse::<u64>()?,
+            gas_overpay_max_extra_bps: env::var("MEV_GAS_OVERPAY_MAX_EXTRA_BPS")
+                .unwrap_or_else(|_| "5000".to_string())
+                .parse::<u64>()?,
+            stop_loss_consecutive_losses: env::var("MEV_STOP_LOSS_CONSECUTIVE_LOSSES")
+                .unwrap_or_else(|_| "3".to_string())
+                .parse::<u32>()?
+                .max(1),
+            stop_loss_freeze_secs: env::var("MEV_STOP_LOSS_FREEZE_SECS")
+                .unwrap_or_else(|_| "300".to_string())
+                .parse::<u64>()?,
+            capital_multiplier_aggressive: env::var("MEV_CAPITAL_MULTIPLIER_AGGRESSIVE")
+                .unwrap_or_else(|_| "2.0".to_string())
+                .parse::<f64>()?,
+            capital_multiplier_neutral: env::var("MEV_CAPITAL_MULTIPLIER_NEUTRAL")
+                .unwrap_or_else(|_| "1.0".to_string())
+                .parse::<f64>()?,
+            capital_multiplier_defensive: env::var("MEV_CAPITAL_MULTIPLIER_DEFENSIVE")
+                .unwrap_or_else(|_| "0.3".to_string())
+                .parse::<f64>()?,
+            capital_multiplier_priority_threshold: env::var("MEV_CAPITAL_MULTIPLIER_PRIORITY_THRESHOLD")
+                .unwrap_or_else(|_| "0.60".to_string())
+                .parse::<f64>()?,
+            capital_multiplier_toxicity_threshold: env::var("MEV_CAPITAL_MULTIPLIER_TOXICITY_THRESHOLD")
+                .unwrap_or_else(|_| "0.65".to_string())
+                .parse::<f64>()?,
             uniswap_v2_factory: parse_optional_address_env(
                 "MEV_UNISWAP_V2_FACTORY",
                 runtime_load_test_mode,
@@ -436,6 +495,22 @@ impl MevConfig {
     pub fn max_gas_price_wei(&self) -> Option<U256> {
         self.max_gas_price_gwei
             .map(|value| U256::from(value).saturating_mul(U256::from(1_000_000_000u64)))
+    }
+
+    pub fn contextual_capital_multiplier(
+        &self,
+        priority_score: f64,
+        toxicity_score: f64,
+    ) -> f64 {
+        if toxicity_score >= self.capital_multiplier_toxicity_threshold {
+            self.capital_multiplier_defensive
+        } else if priority_score >= self.capital_multiplier_priority_threshold
+            && toxicity_score <= self.capital_multiplier_toxicity_threshold * 0.5
+        {
+            self.capital_multiplier_aggressive
+        } else {
+            self.capital_multiplier_neutral
+        }
     }
 }
 

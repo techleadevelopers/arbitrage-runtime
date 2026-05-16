@@ -2446,6 +2446,7 @@ dependencies = [
  "io-uring",
  "libc",
  "ndarray",
+ "num_cpus",
  "rand 0.8.5",
  "rayon",
  "reqwest",

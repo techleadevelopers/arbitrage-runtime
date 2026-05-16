@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 // NOVO ARQUIVO: src/mev/cache/pool_cache.rs
 use ethers::types::{Address, U256};
 use ethers::providers::Middleware;

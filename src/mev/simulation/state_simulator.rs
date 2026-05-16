@@ -1,4 +1,6 @@
 // SUBSTITUIR TODO O CONTEÚDO DE state_simulator.rs
+#![allow(dead_code)]
+
 use crate::config::Config;
 use crate::mev::amm::uniswap_v2::V2PoolState;
 use crate::mev::amm::uniswap_v3::V3PoolState;

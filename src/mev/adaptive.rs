@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::config::Config;
 use crate::mev::opportunity::wei_to_eth_f64;
 use ethers::types::{Address, U256};
@@ -1941,6 +1943,20 @@ mod tests {
                 executor_min_buffer_eth: 0.1,
                 executor_target_buffer_eth: 0.3,
                 executor_max_buffer_eth: 1.0,
+                relay_fanout_count: 3,
+                rpc_fanout_count: 2,
+                gas_overpay_base_extra_bps: 500,
+                gas_overpay_miss_extra_bps: 2_500,
+                gas_overpay_revert_extra_bps: 1_200,
+                gas_overpay_submit_failure_extra_bps: 1_500,
+                gas_overpay_max_extra_bps: 5_000,
+                stop_loss_consecutive_losses: 3,
+                stop_loss_freeze_secs: 300,
+                capital_multiplier_aggressive: 2.0,
+                capital_multiplier_neutral: 1.0,
+                capital_multiplier_defensive: 0.3,
+                capital_multiplier_priority_threshold: 0.60,
+                capital_multiplier_toxicity_threshold: 0.65,
                 uniswap_v2_factory: Some(Address::from_low_u64_be(20)),
                 uniswap_v3_factory: Some(Address::from_low_u64_be(22)),
                 mev_executor: Some(Address::from_low_u64_be(21)),

@@ -17,6 +17,8 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
@@ -184,7 +186,7 @@ pub async fn maybe_run_network_benchmark(
     while let Some(result) = join_set.join_next().await {
         match result {
             Ok(Ok(report)) => reports.push(report),
-            Ok(Err(err)) => return Err(err.into()),
+            Ok(Err(err)) => return Err(Box::<dyn std::error::Error>::from(err)),
             Err(err) => return Err(format!("benchmark task failed: {}", err).into()),
         }
     }
@@ -451,6 +453,7 @@ fn runtime_load_worker(
     {
         let pinning = ThreadPinningConfig::auto_detect();
         let pin = pinning.pin_runtime_load_worker(worker_id);
+        report.pinning_enabled = pin.success;
         if worker_id == 0 {
             let current = pin
                 .current_core
@@ -466,7 +469,6 @@ fn runtime_load_worker(
             );
         }
     }
-
     for index in 0..total_iterations {
         let record = index >= warmup;
         let scenario = runtime_load_scenario(index, profile);
@@ -858,6 +860,7 @@ struct RuntimeLoadWorkerReport {
     adaptive_preflight_reject: usize,
     quote_pass: usize,
     quote_reject: usize,
+    pinning_enabled: bool,
     scenarios: BTreeMap<String, RuntimeLoadCaseStats>,
     samples: RuntimeLoadSamples,
 }
@@ -903,6 +906,7 @@ struct RuntimeLoadReport {
     throughput_tps: f64,
     latency_budget_p99_us: u64,
     budget_pass: bool,
+    hardware_metadata: HardwareMetadata,
     processed: usize,
     decoded: usize,
     decode_reject: usize,
@@ -947,6 +951,7 @@ impl RuntimeLoadReport {
             throughput_tps: 0.0,
             latency_budget_p99_us,
             budget_pass: false,
+            hardware_metadata: HardwareMetadata::detect(false),
             processed: 0,
             decoded: 0,
             decode_reject: 0,
@@ -982,6 +987,7 @@ impl RuntimeLoadReport {
         self.adaptive_preflight_reject += worker.adaptive_preflight_reject;
         self.quote_pass += worker.quote_pass;
         self.quote_reject += worker.quote_reject;
+        self.hardware_metadata.pinning_enabled |= worker.pinning_enabled;
         for (scenario, stats) in worker.scenarios {
             merge_case_stats(self.scenarios.entry(scenario).or_default(), stats);
         }
@@ -1001,6 +1007,7 @@ impl RuntimeLoadReport {
     }
 
     fn finalize(&mut self) {
+        self.hardware_metadata = HardwareMetadata::detect(self.hardware_metadata.pinning_enabled);
         self.throughput_tps = if self.wall_ms <= f64::EPSILON {
             0.0
         } else {
@@ -1033,6 +1040,80 @@ struct LatencyUsSummary {
     p95: u64,
     p99: u64,
     max: u64,
+}
+
+#[derive(Clone, Serialize)]
+struct HardwareMetadata {
+    cpu_model: String,
+    physical_cores: usize,
+    logical_cores: usize,
+    os: &'static str,
+    arch: &'static str,
+    build_profile: &'static str,
+    pinning_enabled: bool,
+}
+
+impl HardwareMetadata {
+    fn detect(pinning_enabled: bool) -> Self {
+        Self {
+            cpu_model: detect_cpu_model(),
+            physical_cores: num_cpus::get_physical(),
+            logical_cores: num_cpus::get(),
+            os: env::consts::OS,
+            arch: env::consts::ARCH,
+            build_profile: if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            pinning_enabled,
+        }
+    }
+}
+
+fn detect_cpu_model() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(model) = env::var("PROCESSOR_IDENTIFIER") {
+            let model = model.trim();
+            if !model.is_empty() {
+                return model.to_string();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo") {
+            for line in cpuinfo.lines() {
+                if line.starts_with("model name") {
+                    if let Some((_, value)) = line.split_once(':') {
+                        let value = value.trim();
+                        if !value.is_empty() {
+                            return value.to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = Command::new("sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+        {
+            if output.status.success() {
+                let model = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !model.is_empty() {
+                    return model;
+                }
+            }
+        }
+    }
+
+    "unknown".to_string()
 }
 
 fn summarize_us(values: &mut [u64]) -> LatencyUsSummary {
@@ -1167,6 +1248,10 @@ fn export_runtime_latency_benchmarks(
     root.insert("updated_at".to_string(), serde_json::Value::String(Utc::now().to_rfc3339()));
     root.insert("network".to_string(), serde_json::Value::String(report.network.clone()));
     root.insert(
+        "hardware_metadata".to_string(),
+        serde_json::to_value(&report.hardware_metadata)?,
+    );
+    root.insert(
         report.profile.to_string(),
         serde_json::to_value(report)?,
     );
@@ -1204,7 +1289,6 @@ fn emit_runtime_budget_warning(report: &RuntimeLoadReport) {
         println!("WARNING: {}", message);
     }
 }
-
 fn print_latency_us(label: &str, summary: LatencyUsSummary) {
     println!(
         "  {}: n={} avg={:.2}us p50={}us p95={}us p99={}us min={}us max={}us",
