@@ -17,11 +17,16 @@ use ethers::types::{Address, H256, Transaction, U256};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinSet;
+use tracing::warn;
 
 const MICROBATCH_WINDOW_MS: u64 = 45;
 const MICROBATCH_MAX_CANDIDATES: usize = 4;
+const LOOKUP_DECODE_QUEUE_CAPACITY: usize = 2048;
+const EVAL_QUEUE_CAPACITY: usize = 512;
+const LOOKUP_DECODE_WORKERS_MAX: usize = 4;
+const EVAL_WORKERS_MAX: usize = 4;
 
 const SWAP_EXACT_TOKENS_FOR_TOKENS: [u8; 4] = [0x38, 0xed, 0x17, 0x39];
 const SWAP_EXACT_ETH_FOR_TOKENS: [u8; 4] = [0x7f, 0xf3, 0x6a, 0xb5];
@@ -206,6 +211,23 @@ impl CandidateLatencyTrace {
     }
 }
 
+struct PendingHashTask {
+    tx_hash: H256,
+    candidate_started: Instant,
+}
+
+struct LookupDecodedCandidate {
+    tx: Transaction,
+    signal: SwapSignal,
+    hour_utc: u8,
+    gas_price: U256,
+    context_signal: ContextSignal,
+    cluster: ClusterKey,
+    lookup_latency: Duration,
+    candidate_started: Instant,
+    latency_trace: CandidateLatencyTrace,
+}
+
 ethers::contract::abigen!(
     UniswapV2Factory,
     r#"[
@@ -264,299 +286,118 @@ pub async fn run(
         dashboard.clone(),
         adaptive.clone(),
     );
+    let lookup_decode_workers = worker_count(LOOKUP_DECODE_WORKERS_MAX);
+    let eval_workers = worker_count(EVAL_WORKERS_MAX);
+    let (lookup_decode_tx, lookup_decode_rx) = mpsc::channel(LOOKUP_DECODE_QUEUE_CAPACITY);
+    let (eval_tx, eval_rx) = mpsc::channel(EVAL_QUEUE_CAPACITY);
+    let (ready_tx, mut ready_rx) = mpsc::channel(EVAL_QUEUE_CAPACITY);
+    let lookup_decode_rx = Arc::new(Mutex::new(lookup_decode_rx));
+    let eval_rx = Arc::new(Mutex::new(eval_rx));
     let mut last_profile_refresh = Instant::now();
     let mut batcher = MicroBatcher::default();
+    let mut flush_tick = tokio::time::interval(Duration::from_millis(MICROBATCH_WINDOW_MS));
 
     dashboard.event(
         "info",
         format!(
-            "fee extraction runtime connected to {} min_large_swap={:.3} ETH min_profit={:.6} ETH",
-            ws_urls.join(" | "), config.mev.min_large_swap_eth, config.mev.min_net_profit_eth
+            "fee extraction runtime connected to {} min_large_swap={:.3} ETH min_profit={:.6} ETH lookup_workers={} eval_workers={}",
+            ws_urls.join(" | "),
+            config.mev.min_large_swap_eth,
+            config.mev.min_net_profit_eth,
+            lookup_decode_workers,
+            eval_workers
         ),
     );
+
+    for worker_idx in 0..lookup_decode_workers {
+        let rx = lookup_decode_rx.clone();
+        let tx = eval_tx.clone();
+        let config = config.clone();
+        let rpc_fleet = rpc_fleet.clone();
+        let adaptive = adaptive.clone();
+        let dashboard = dashboard.clone();
+        tokio::spawn(async move {
+            while let Some(task) = recv_from_shared_channel(&rx).await {
+                if let Some(decoded) = process_lookup_decode_task(
+                    task,
+                    config.clone(),
+                    rpc_fleet.clone(),
+                    adaptive.clone(),
+                    dashboard.clone(),
+                )
+                .await
+                {
+                    if tx.send(decoded).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            dashboard.event("info", format!("lookup/decode worker {} stopped", worker_idx));
+        });
+    }
+    drop(eval_tx);
+
+    for worker_idx in 0..eval_workers {
+        let rx = eval_rx.clone();
+        let tx = ready_tx.clone();
+        let config = config.clone();
+        let rpc_fleet = rpc_fleet.clone();
+        let adaptive = adaptive.clone();
+        let dashboard = dashboard.clone();
+        tokio::spawn(async move {
+            while let Some(candidate) = recv_from_shared_channel(&rx).await {
+                if let Some(ready) = process_evaluation_task(
+                    candidate,
+                    config.clone(),
+                    rpc_fleet.clone(),
+                    adaptive.clone(),
+                    dashboard.clone(),
+                    min_large_swap_wei,
+                    min_profit_wei,
+                )
+                .await
+                {
+                    if tx.send(ready).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            dashboard.event("info", format!("evaluation worker {} stopped", worker_idx));
+        });
+    }
+    drop(ready_tx);
 
     let mut seen_hashes = HashSet::new();
     let mut seen_order = VecDeque::new();
 
-    while let Some(tx_hash) = tx_hash_stream.recv().await {
-        let candidate_started = Instant::now();
-        let mut latency_trace = CandidateLatencyTrace::default();
-        if batcher.should_flush() {
-            flush_candidate_batch(&mut batcher, &executor, &dashboard).await?;
-        }
-        if last_profile_refresh.elapsed() >= Duration::from_secs(60) {
-            refresh_historical_profiles(&adaptive, &storage, &dashboard);
-            last_profile_refresh = Instant::now();
-        }
-        if !mark_seen_tx(&mut seen_hashes, &mut seen_order, tx_hash) {
-            continue;
-        }
-        let lookup_started = Instant::now();
-        let Some(tx) = lookup_pending_tx(&rpc_fleet, tx_hash).await else {
-            continue;
-        };
-        latency_trace.lookup_pending_tx_us = Some(elapsed_us(lookup_started));
-
-        dashboard.record_latency(
-            "fee_pending_lookup",
-            lookup_started.elapsed().as_millis(),
-            None,
-            None,
-        );
-        if let Ok(mut model) = adaptive.lock() {
-            model.observe_lookup_latency(lookup_started.elapsed().as_millis() as f64);
-        }
-
-        let decode_started = Instant::now();
-        let Some(signal) = decode_relevant_swap(&tx, &config.monitored_tokens, min_large_swap_wei) else {
-            continue;
-        };
-        latency_trace.decode_swap_us = Some(elapsed_us(decode_started));
-        let hour_utc = chrono::Utc::now().hour() as u8;
-        let context_started = Instant::now();
-        let context_signal = if let Ok(model) = adaptive.lock() {
-            model.context_signal(signal.router, hour_utc)
-        } else {
-            ContextSignal {
-                priority_score: 0.50,
-                toxicity_score: 0.50,
-                samples: 0,
+    loop {
+        tokio::select! {
+            Some(tx_hash) = tx_hash_stream.recv() => {
+                if last_profile_refresh.elapsed() >= Duration::from_secs(60) {
+                    refresh_historical_profiles(&adaptive, &storage, &dashboard);
+                    last_profile_refresh = Instant::now();
+                }
+                if mark_seen_tx(&mut seen_hashes, &mut seen_order, tx_hash) {
+                    let _ = lookup_decode_tx
+                        .send(PendingHashTask {
+                            tx_hash,
+                            candidate_started: Instant::now(),
+                        })
+                        .await;
+                }
             }
-        };
-        latency_trace.context_signal_us = Some(elapsed_us(context_started));
-
-        let gas_price = tx.max_fee_per_gas.or(tx.gas_price).unwrap_or_default();
-        if gas_price.is_zero() {
-            debug!("fee extraction candidate skipped {:?}: missing gas price", tx.hash);
-            continue;
-        }
-        if let Some(max_gas_price_wei) = config.mev.max_gas_price_wei() {
-            if gas_price > max_gas_price_wei {
-                latency_trace.total_internal_us = Some(elapsed_us(candidate_started));
-                dashboard.record_reject_reason("gas_price_cap", "victim_gas_price_above_cap");
-                dashboard.event(
-                    "warn",
-                    format!(
-                        "opportunity skipped victim={:?}: gas price {:.2} gwei above cap {} gwei",
-                        tx.hash,
-                        wei_to_gwei_f64(gas_price),
-                        config.mev.max_gas_price_gwei.unwrap_or_default()
-                    ),
-                );
-                latency_trace.emit(&config, &dashboard, tx.hash, "reject", "gas_price_cap");
-                debug!(
-                    "fee extraction candidate skipped {:?}: victim gas price {} gwei exceeds cap {} gwei",
-                    tx.hash,
-                    wei_to_gwei_f64(gas_price),
-                    config.mev.max_gas_price_gwei.unwrap_or_default()
-                );
-                continue;
+            Some(candidate) = ready_rx.recv() => {
+                batcher.push(candidate);
+                if batcher.should_flush() {
+                    flush_candidate_batch(&mut batcher, &executor, &dashboard).await?;
+                }
             }
-        }
-        let fast_preflight_started = Instant::now();
-        let fast_gate = fast_preflight_gate(
-            &signal,
-            gas_price,
-            min_large_swap_wei,
-            &config,
-            context_signal,
-        );
-        latency_trace.fast_preflight_us = Some(elapsed_us(fast_preflight_started));
-        if !fast_gate.should_continue {
-            latency_trace.total_internal_us = Some(elapsed_us(candidate_started));
-            if let Some(reason) = fast_gate.reject_reason {
-                dashboard.record_reject_reason("fast_preflight", reason);
+            _ = flush_tick.tick() => {
+                if batcher.should_flush() {
+                    flush_candidate_batch(&mut batcher, &executor, &dashboard).await?;
+                }
             }
-            latency_trace.emit(
-                &config,
-                &dashboard,
-                tx.hash,
-                "reject",
-                fast_gate.reject_reason.unwrap_or("fast_preflight"),
-            );
-            debug!(
-                "fast preflight rejected {:?}: reason={} ev_upper_bound={:.2}usd gas={:.2}usd competition_fast={:.2} gas_ratio={:.2}",
-                tx.hash,
-                fast_gate.reject_reason.unwrap_or("unknown"),
-                fast_gate.ev_upper_bound_usd,
-                fast_gate.estimated_gas_cost_usd,
-                fast_gate.competition_score_fast,
-                fast_gate.gas_ratio
-            );
-            continue;
-        }
-        let cluster = ClusterKey {
-            router: signal.router,
-            token_in: signal.path[0],
-            token_out: *signal.path.last().unwrap_or(&signal.path[0]),
-            selector: signal.selector,
-        };
-        if let Ok(mut model) = adaptive.lock() {
-            model.observe_candidate_flow(cluster, signal.notional_wei, gas_price);
-        }
-        let adaptive_preflight_started = Instant::now();
-        let preflight = if let Ok(mut model) = adaptive.lock() {
-            model.preflight_score(PreflightInput {
-                cluster,
-                notional_eth: wei_to_eth_f64(signal.notional_wei),
-                gas_price_wei: gas_price,
-                path_len: signal.path_len(),
-            })
-        } else {
-            continue;
-        };
-        latency_trace.adaptive_preflight_us = Some(elapsed_us(adaptive_preflight_started));
-        dashboard.set_market_regime(preflight.regime.as_str());
-        if !preflight.should_continue {
-            latency_trace.total_internal_us = Some(elapsed_us(candidate_started));
-            if let Some(reason) = preflight.reject_reason {
-                dashboard.record_reject_reason("preflight", reason);
-            }
-            latency_trace.emit(
-                &config,
-                &dashboard,
-                tx.hash,
-                "reject",
-                preflight.reject_reason.unwrap_or("preflight"),
-            );
-            debug!(
-                "preflight rejected {:?}: regime={} reason={} score={:.2} upper_bound={:.2}usd gas={:.2}usd density={:.2} cluster={:.2} gas_pressure={:.2} impact_hint={:.2} size={:.2}",
-                tx.hash,
-                preflight.regime.as_str(),
-                preflight.reject_reason.unwrap_or("unknown"),
-                preflight.preflight_score,
-                preflight.upper_bound_ev_usd,
-                preflight.estimated_gas_cost_usd,
-                preflight.mempool_density,
-                preflight.cluster_heat,
-                preflight.gas_pressure,
-                preflight.impact_hint,
-                preflight.size_score
-            );
-            continue;
-        }
-
-        let payload_started = Instant::now();
-        let Some(payload) = build_payload_with_fallback(
-            &rpc_fleet,
-            &config,
-            &signal,
-            gas_price,
-            context_signal,
-        )
-        .await else {
-            latency_trace.payload_build_us = Some(elapsed_us(payload_started));
-            latency_trace.total_internal_us = Some(elapsed_us(candidate_started));
-            latency_trace.emit(&config, &dashboard, tx.hash, "reject", "payload_build");
-            continue;
-        };
-        latency_trace.payload_build_us = Some(elapsed_us(payload_started));
-
-        let ev_gate_started = Instant::now();
-        if !passes_ev_gate(&config, &payload, &signal, lookup_started.elapsed(), min_profit_wei) {
-            latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
-            latency_trace.total_internal_us = Some(elapsed_us(candidate_started));
-            latency_trace.emit(&config, &dashboard, tx.hash, "reject", "ev_gate");
-            continue;
-        }
-        latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
-
-        let execution_cost_wei = gas_price
-            .saturating_mul(U256::from(payload.gas_limit))
-            .saturating_mul(U256::from(config.mev.gas_safety_margin_bps))
-            / U256::from(10_000u64);
-        let quality_gate_started = Instant::now();
-        if !passes_quality_gate(&config, &payload, execution_cost_wei) {
-            latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
-            latency_trace.total_internal_us = Some(elapsed_us(candidate_started));
-            latency_trace.emit(&config, &dashboard, tx.hash, "reject", "quality_gate");
-            continue;
-        }
-        latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
-        let adaptive_quote_started = Instant::now();
-        let quote = if let Ok(mut model) = adaptive.lock() {
-            model.quote_for_relays(
-                AdaptiveQuoteInput {
-                    cluster,
-                    pair: payload.pair,
-                    hour_utc,
-                    context_priority_score: context_signal.priority_score,
-                    context_toxicity_score: context_signal.toxicity_score,
-                    expected_profit_wei: payload.expected_profit_wei,
-                    execution_cost_wei,
-                    gas_price_wei: gas_price,
-                    lookup_latency_ms: lookup_started.elapsed().as_millis() as f64,
-                    notional_eth: wei_to_eth_f64(signal.notional_wei),
-                    price_impact_bps: payload.price_impact_bps,
-                    relay_pressure_override: None,
-                },
-                &config.builder_relays,
-            )
-        } else {
-            continue;
-        };
-        latency_trace.adaptive_quote_us = Some(elapsed_us(adaptive_quote_started));
-        dashboard.set_market_regime(quote.regime.as_str());
-        if !quote.should_execute {
-            latency_trace.total_internal_us = Some(elapsed_us(candidate_started));
-            if let Some(reason) = quote.reject_reason {
-                dashboard.record_reject_reason("adaptive", reason);
-            }
-            latency_trace.emit(
-                &config,
-                &dashboard,
-                tx.hash,
-                "reject",
-                quote.reject_reason.as_deref().unwrap_or("adaptive"),
-            );
-            continue;
-        }
-        dashboard.event(
-            "info",
-            format!(
-                "adaptive gate passed victim={:?} regime={} relay={} ev_real={:.2}usd threshold={:.2}usd p={:.2} comp={:.2} risk={:.2} builder={:.2} density={:.2} cluster={:.2} latency={:.2} gas_pressure={:.2} comp_penalty={:.2}usd risk_penalty={:.2}usd path_penalty={:.2}usd context_toxicity={:.2}",
-                tx.hash,
-                quote.regime.as_str(),
-                quote.selected_relay.as_deref().unwrap_or("unknown"),
-                quote.ev_real_usd,
-                quote.threshold_dynamic_usd,
-                quote.p_positive,
-                quote.competition_score,
-                quote.risk_score,
-                quote.builder_pressure,
-                quote.mempool_density,
-                quote.cluster_heat,
-                quote.latency_penalty,
-                quote.gas_pressure,
-                quote.competition_penalty_usd,
-                quote.risk_penalty_usd,
-                quote.path_penalty_usd,
-                quote.context_toxicity_score
-            ),
-        );
-
-        let opportunity = build_opportunity(&tx, &signal, payload, quote.selected_relay.clone());
-        let capital_efficiency = opportunity
-            .execution_payload
-            .as_ref()
-            .map(|payload| {
-                let capital_eth = wei_to_eth_f64(payload.capital_committed_wei).max(1e-9);
-                (quote.ev_real_usd / capital_eth).max(0.0) / config.mev.eth_usd_price.max(1.0)
-            })
-            .unwrap_or_default()
-            .clamp(0.0, 1.0);
-        latency_trace.total_internal_us = Some(elapsed_us(candidate_started));
-        latency_trace.emit(&config, &dashboard, tx.hash, "execution_ready", "adaptive_passed");
-        batcher.push(PendingExecutionCandidate {
-            opportunity,
-            ev_real_usd: quote.ev_real_usd,
-            p_positive: quote.p_positive,
-            capital_efficiency,
-            relay_score: quote.builder_pressure,
-            context_priority_score: quote.context_priority_score,
-        });
-        if batcher.should_flush() {
-            flush_candidate_batch(&mut batcher, &executor, &dashboard).await?;
+            else => break,
         }
     }
 
@@ -644,22 +485,331 @@ fn mark_seen_tx(
     true
 }
 
-async fn lookup_pending_tx(rpc_fleet: &RpcFleet, tx_hash: H256) -> Option<Transaction> {
+async fn lookup_pending_tx_parallel(rpc_fleet: Arc<RpcFleet>, tx_hash: H256) -> Option<Transaction> {
+    let mut join_set = JoinSet::new();
     for handle in rpc_fleet.read_candidates(3) {
-        rpc_fleet.reserve_read_selection(handle.id);
-        let started = Instant::now();
-        match handle.provider.get_transaction(tx_hash).await {
-            Ok(Some(tx)) => {
-                rpc_fleet.record_success(handle.id, started.elapsed(), Some(tx.block_number.unwrap_or_default().as_u64()));
-                return Some(tx);
+        let rpc_fleet = rpc_fleet.clone();
+        join_set.spawn(async move {
+            rpc_fleet.reserve_read_selection(handle.id);
+            let started = Instant::now();
+            let result = handle.provider.get_transaction(tx_hash).await;
+            match result {
+                Ok(Some(tx)) => {
+                    rpc_fleet.record_success(
+                        handle.id,
+                        started.elapsed(),
+                        Some(tx.block_number.unwrap_or_default().as_u64()),
+                    );
+                    Some(tx)
+                }
+                Ok(None) => {
+                    rpc_fleet.record_success(handle.id, started.elapsed(), None);
+                    None
+                }
+                Err(err) => {
+                    rpc_fleet.record_failure(handle.id, RpcFleet::classify_failure(&err.to_string()));
+                    None
+                }
             }
-            Ok(None) => {}
-            Err(err) => {
-                rpc_fleet.record_failure(handle.id, RpcFleet::classify_failure(&err.to_string()));
-            }
+        });
+    }
+
+    while let Some(result) = join_set.join_next().await {
+        if let Ok(Some(tx)) = result {
+            join_set.abort_all();
+            return Some(tx);
         }
     }
     None
+}
+
+async fn recv_from_shared_channel<T>(
+    rx: &Arc<Mutex<mpsc::Receiver<T>>>,
+) -> Option<T> {
+    let mut guard = rx.lock().await;
+    guard.recv().await
+}
+
+async fn process_lookup_decode_task(
+    task: PendingHashTask,
+    config: Arc<Config>,
+    rpc_fleet: Arc<RpcFleet>,
+    adaptive: crate::mev::adaptive::SharedAdaptivePolicy,
+    dashboard: DashboardHandle,
+) -> Option<LookupDecodedCandidate> {
+    let mut latency_trace = CandidateLatencyTrace::default();
+    let lookup_started = Instant::now();
+    let tx = lookup_pending_tx_parallel(rpc_fleet, task.tx_hash).await?;
+    latency_trace.lookup_pending_tx_us = Some(elapsed_us(lookup_started));
+
+    dashboard.record_latency(
+        "fee_pending_lookup",
+        lookup_started.elapsed().as_millis(),
+        None,
+        None,
+    );
+    if let Ok(mut model) = adaptive.lock() {
+        model.observe_lookup_latency(lookup_started.elapsed().as_millis() as f64);
+    }
+
+    let decode_started = Instant::now();
+    let signal = decode_relevant_swap(&tx, &config.monitored_tokens, ethers::utils::parse_ether(config.mev.min_large_swap_eth.to_string()).ok()?)?;
+    latency_trace.decode_swap_us = Some(elapsed_us(decode_started));
+
+    let hour_utc = chrono::Utc::now().hour() as u8;
+    let context_started = Instant::now();
+    let context_signal = if let Ok(model) = adaptive.lock() {
+        model.context_signal(signal.router, hour_utc)
+    } else {
+        ContextSignal {
+            priority_score: 0.50,
+            toxicity_score: 0.50,
+            samples: 0,
+        }
+    };
+    latency_trace.context_signal_us = Some(elapsed_us(context_started));
+
+    let gas_price = tx.max_fee_per_gas.or(tx.gas_price).unwrap_or_default();
+    if gas_price.is_zero() {
+        return None;
+    }
+
+    let cluster = ClusterKey {
+        router: signal.router,
+        token_in: signal.path[0],
+        token_out: *signal.path.last().unwrap_or(&signal.path[0]),
+        selector: signal.selector,
+    };
+
+    Some(LookupDecodedCandidate {
+        tx,
+        signal,
+        hour_utc,
+        gas_price,
+        context_signal,
+        cluster,
+        lookup_latency: lookup_started.elapsed(),
+        candidate_started: task.candidate_started,
+        latency_trace,
+    })
+}
+
+async fn process_evaluation_task(
+    mut candidate: LookupDecodedCandidate,
+    config: Arc<Config>,
+    rpc_fleet: Arc<RpcFleet>,
+    adaptive: crate::mev::adaptive::SharedAdaptivePolicy,
+    dashboard: DashboardHandle,
+    min_large_swap_wei: U256,
+    min_profit_wei: U256,
+) -> Option<PendingExecutionCandidate> {
+    let tx_hash = candidate.tx.hash;
+    if let Some(max_gas_price_wei) = config.mev.max_gas_price_wei() {
+        if candidate.gas_price > max_gas_price_wei {
+            candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+            dashboard.record_reject_reason("gas_price_cap", "victim_gas_price_above_cap");
+            dashboard.event(
+                "warn",
+                format!(
+                    "opportunity skipped victim={:?}: gas price {:.2} gwei above cap {} gwei",
+                    tx_hash,
+                    wei_to_gwei_f64(candidate.gas_price),
+                    config.mev.max_gas_price_gwei.unwrap_or_default()
+                ),
+            );
+            candidate
+                .latency_trace
+                .emit(&config, &dashboard, tx_hash, "reject", "gas_price_cap");
+            return None;
+        }
+    }
+
+    let fast_preflight_started = Instant::now();
+    let fast_gate = fast_preflight_gate(
+        &candidate.signal,
+        candidate.gas_price,
+        min_large_swap_wei,
+        &config,
+        candidate.context_signal,
+    );
+    candidate.latency_trace.fast_preflight_us = Some(elapsed_us(fast_preflight_started));
+    if !fast_gate.should_continue {
+        candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        if let Some(reason) = fast_gate.reject_reason {
+            dashboard.record_reject_reason("fast_preflight", reason);
+        }
+        candidate.latency_trace.emit(
+            &config,
+            &dashboard,
+            tx_hash,
+            "reject",
+            fast_gate.reject_reason.unwrap_or("fast_preflight"),
+        );
+        return None;
+    }
+
+    if let Ok(mut model) = adaptive.lock() {
+        model.observe_candidate_flow(candidate.cluster, candidate.signal.notional_wei, candidate.gas_price);
+    }
+    let adaptive_preflight_started = Instant::now();
+    let preflight = if let Ok(mut model) = adaptive.lock() {
+        model.preflight_score(PreflightInput {
+            cluster: candidate.cluster,
+            notional_eth: wei_to_eth_f64(candidate.signal.notional_wei),
+            gas_price_wei: candidate.gas_price,
+            path_len: candidate.signal.path_len(),
+        })
+    } else {
+        return None;
+    };
+    candidate.latency_trace.adaptive_preflight_us = Some(elapsed_us(adaptive_preflight_started));
+    dashboard.set_market_regime(preflight.regime.as_str());
+    if !preflight.should_continue {
+        candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        if let Some(reason) = preflight.reject_reason {
+            dashboard.record_reject_reason("preflight", reason);
+        }
+        candidate.latency_trace.emit(
+            &config,
+            &dashboard,
+            tx_hash,
+            "reject",
+            preflight.reject_reason.unwrap_or("preflight"),
+        );
+        return None;
+    }
+
+    let payload_started = Instant::now();
+    let payload = build_payload_with_fallback_parallel(
+        rpc_fleet,
+        config.clone(),
+        candidate.signal.clone(),
+        candidate.gas_price,
+        candidate.context_signal,
+    )
+    .await?;
+    candidate.latency_trace.payload_build_us = Some(elapsed_us(payload_started));
+
+    let ev_gate_started = Instant::now();
+    if !passes_ev_gate(
+        &config,
+        &payload,
+        &candidate.signal,
+        candidate.lookup_latency,
+        min_profit_wei,
+    ) {
+        candidate.latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
+        candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        candidate.latency_trace.emit(&config, &dashboard, tx_hash, "reject", "ev_gate");
+        return None;
+    }
+    candidate.latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
+
+    let execution_cost_wei = candidate
+        .gas_price
+        .saturating_mul(U256::from(payload.gas_limit))
+        .saturating_mul(U256::from(config.mev.gas_safety_margin_bps))
+        / U256::from(10_000u64);
+    let quality_gate_started = Instant::now();
+    if !passes_quality_gate(&config, &payload, execution_cost_wei) {
+        candidate.latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
+        candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        candidate.latency_trace.emit(&config, &dashboard, tx_hash, "reject", "quality_gate");
+        return None;
+    }
+    candidate.latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
+
+    let adaptive_quote_started = Instant::now();
+    let quote = if let Ok(mut model) = adaptive.lock() {
+        model.quote_for_relays(
+            AdaptiveQuoteInput {
+                cluster: candidate.cluster,
+                pair: payload.pair,
+                hour_utc: candidate.hour_utc,
+                context_priority_score: candidate.context_signal.priority_score,
+                context_toxicity_score: candidate.context_signal.toxicity_score,
+                expected_profit_wei: payload.expected_profit_wei,
+                execution_cost_wei,
+                gas_price_wei: candidate.gas_price,
+                lookup_latency_ms: candidate.lookup_latency.as_millis() as f64,
+                notional_eth: wei_to_eth_f64(candidate.signal.notional_wei),
+                price_impact_bps: payload.price_impact_bps,
+                relay_pressure_override: None,
+            },
+            &config.builder_relays,
+        )
+    } else {
+        return None;
+    };
+    candidate.latency_trace.adaptive_quote_us = Some(elapsed_us(adaptive_quote_started));
+    dashboard.set_market_regime(quote.regime.as_str());
+    if !quote.should_execute {
+        candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        if let Some(reason) = quote.reject_reason {
+            dashboard.record_reject_reason("adaptive", reason);
+        }
+        candidate.latency_trace.emit(
+            &config,
+            &dashboard,
+            tx_hash,
+            "reject",
+            quote.reject_reason.as_deref().unwrap_or("adaptive"),
+        );
+        return None;
+    }
+
+    dashboard.event(
+        "info",
+        format!(
+            "adaptive gate passed victim={:?} regime={} relay={} ev_real={:.2}usd threshold={:.2}usd p={:.2} comp={:.2} risk={:.2} builder={:.2} density={:.2} cluster={:.2} latency={:.2} gas_pressure={:.2} comp_penalty={:.2}usd risk_penalty={:.2}usd path_penalty={:.2}usd context_toxicity={:.2}",
+            tx_hash,
+            quote.regime.as_str(),
+            quote.selected_relay.as_deref().unwrap_or("unknown"),
+            quote.ev_real_usd,
+            quote.threshold_dynamic_usd,
+            quote.p_positive,
+            quote.competition_score,
+            quote.risk_score,
+            quote.builder_pressure,
+            quote.mempool_density,
+            quote.cluster_heat,
+            quote.latency_penalty,
+            quote.gas_pressure,
+            quote.competition_penalty_usd,
+            quote.risk_penalty_usd,
+            quote.path_penalty_usd,
+            quote.context_toxicity_score
+        ),
+    );
+
+    let opportunity = build_opportunity(
+        &candidate.tx,
+        &candidate.signal,
+        payload,
+        quote.selected_relay.clone(),
+    );
+    let capital_efficiency = opportunity
+        .execution_payload
+        .as_ref()
+        .map(|payload| {
+            let capital_eth = wei_to_eth_f64(payload.capital_committed_wei).max(1e-9);
+            (quote.ev_real_usd / capital_eth).max(0.0) / config.mev.eth_usd_price.max(1.0)
+        })
+        .unwrap_or_default()
+        .clamp(0.0, 1.0);
+    candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+    candidate
+        .latency_trace
+        .emit(&config, &dashboard, tx_hash, "execution_ready", "adaptive_passed");
+
+    Some(PendingExecutionCandidate {
+        opportunity,
+        ev_real_usd: quote.ev_real_usd,
+        p_positive: quote.p_positive,
+        capital_efficiency,
+        relay_score: quote.builder_pressure,
+        context_priority_score: quote.context_priority_score,
+    })
 }
 
 pub(crate) fn passes_quality_gate(
@@ -881,32 +1031,40 @@ pub(crate) async fn build_payload<M: Middleware + 'static>(
     }
 }
 
-async fn build_payload_with_fallback(
-    rpc_fleet: &RpcFleet,
-    config: &Config,
-    signal: &SwapSignal,
+async fn build_payload_with_fallback_parallel(
+    rpc_fleet: Arc<RpcFleet>,
+    config: Arc<Config>,
+    signal: SwapSignal,
     gas_price: U256,
     context_signal: ContextSignal,
 ) -> Option<crate::mev::execution::payload_builder::ExecutionPayload> {
+    let mut join_set = JoinSet::new();
     for handle in rpc_fleet.read_candidates(3) {
-        rpc_fleet.reserve_read_selection(handle.id);
-        let started = Instant::now();
-        match build_payload(
-            handle.provider.clone(),
-            config,
-            signal,
-            gas_price,
-            context_signal,
-        )
-        .await
-        {
-            Ok(payload) => {
-                rpc_fleet.record_success(handle.id, started.elapsed(), None);
-                return Some(payload);
+        let rpc_fleet = rpc_fleet.clone();
+        let provider = handle.provider.clone();
+        let signal = signal.clone();
+        let config = config.clone();
+        let context_signal = context_signal;
+        join_set.spawn(async move {
+            rpc_fleet.reserve_read_selection(handle.id);
+            let started = Instant::now();
+            match build_payload(provider, &config, &signal, gas_price, context_signal).await {
+                Ok(payload) => {
+                    rpc_fleet.record_success(handle.id, started.elapsed(), None);
+                    Some(payload)
+                }
+                Err(err) => {
+                    rpc_fleet.record_failure(handle.id, RpcFleet::classify_failure(&err));
+                    None
+                }
             }
-            Err(err) => {
-                rpc_fleet.record_failure(handle.id, RpcFleet::classify_failure(&err));
-            }
+        });
+    }
+
+    while let Some(result) = join_set.join_next().await {
+        if let Ok(Some(payload)) = result {
+            join_set.abort_all();
+            return Some(payload);
         }
     }
     None
@@ -1331,6 +1489,12 @@ fn push_stage_pair(
     if let Some(duration_us) = duration_us {
         pairs.push((stage, duration_us));
     }
+}
+
+fn worker_count(max_workers: usize) -> usize {
+    std::thread::available_parallelism()
+        .map(|value| value.get().min(max_workers).max(1))
+        .unwrap_or(2)
 }
 
 fn token_as_uint(token: &Token) -> Option<U256> {
