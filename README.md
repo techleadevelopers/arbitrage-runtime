@@ -423,191 +423,150 @@ The runtime is built for adversarial environments and assumes hostile execution 
 
 The system operates as a zero-copy, linear, multi-threaded pipeline using bounded asynchronous communication primitives.
 
-```
+
+```txt
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│                              ARBITRAGE RUNTIME ARCHITECTURE                                   │
-│                                    (Zero-Copy Pipeline)                                      │
+│ ARBITRAGE RUNTIME ARCHITECTURE                                                             │
+│ (Zero-Copy Deterministic Adversarial Execution Pipeline)                                   │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 
-                                    ┌─────────────────────┐
-                                    │  Paid RPC Provider  │
-                                    │    WS Stream(s)     │
-                                    │  (Alchemy/Infura)   │
-                                    └──────────┬──────────┘
-                                               │
-                                               ▼
-                              ┌────────────────────────────────┐
-                              │   Ingestion Thread / Fan-in    │
-                              │   (Minimal Structural Parse)   │
-                              │   • Deduplication (8k LRU)     │
-                              │   • Timestamp tracking         │
-                              └───────────────┬────────────────┘
-                                              │
-                                    [ tokio::sync::mpsc ]
-                                    (LOOKUP_DECODE_QUEUE_CAPACITY=2048)
-                                              │
-                                              ▼
+┌─────────────────────────┐
+│ Paid RPC Provider       │
+│ WS Stream(s)            │
+│ (Alchemy / Infura)      │
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────────────┐
+│ Ingestion Thread / Fan-In       │
+│ Minimal Structural Parse        │
+│ • Deduplication (8k LRU)        │
+│ • Timestamp Tracking            │
+└───────────────┬─────────────────┘
+                │
+                ▼
+      [ tokio::sync::mpsc ]
+      LOOKUP_DECODE_QUEUE=2048
+                │
+                ▼
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│                         LOOKUP/DECODE WORKERS (Multi-threaded)                              │
-│                                         (4 workers max)                                      │
+│ LOOKUP / DECODE WORKERS                                                                    │
+│ Multi-threaded                                                                             │
 ├─────────────────────────────────────────────────────────────────────────────────────────────┤
-│  ┌─────────────────────┐    ┌─────────────────────┐    ┌─────────────────────┐             │
-│  │  Parallel RPC Fetch │    │   Transaction       │    │   Context Signal    │             │
-│  │  (3 endpoints)      │───▶│   Decoding          │───▶│   (Historical       │             │
-│  │  • get_transaction  │    │   • V2/V3 selectors │    │    Profiles)        │             │
-│  │  • get_block_number │    │   • Path extraction │    │  • Priority Score   │             │
-│  └─────────────────────┘    └─────────────────────┘    │  • Toxicity Score   │             │
-│                                                         └─────────────────────┘             │
+│ • Parallel RPC Fetch (3 endpoints)                                                         │
+│ • Raw transaction decoding                                                                 │
+│ • V2 / V3 selector parsing                                                                 │
+│ • Path extraction                                                                          │
+│ • Historical contextual profile fetch                                                      │
+│ • Toxicity / priority scoring                                                              │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
-                                              │
-                                    [ tokio::sync::mpsc ]
-                                    (EVAL_QUEUE_CAPACITY=512)
-                                              │
-                                              ▼
+                │
+                ▼
+      [ tokio::sync::mpsc ]
+      EVAL_QUEUE=512
+                │
+                ▼
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│                           EVALUATION WORKERS (Multi-threaded)                               │
-│                                         (4 workers max)                                      │
+│ EVALUATION ENGINE                                                                          │
 ├─────────────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                              │
-│  ┌────────────────────────────────────────────────────────────────────────────────────┐    │
-│  │                         STAGE 1: FAST PREFLIGHT GATE                               │    │
-│  │  • Path validation (>=2 hops)           • Notional vs min_large_swap              │    │
-│  │  • Gas ratio check (baseline gwei)      • Competition score (mempool density)     │    │
-│  │  • EV upper bound (USD)                 • Gas pressure calculation                │    │
-│  └────────────────────────────────────────────────────────────────────────────────────┘    │
-│                                              │                                               │
-│                                              ▼                                               │
-│  ┌────────────────────────────────────────────────────────────────────────────────────┐    │
-│  │                         STAGE 2: ADAPTIVE PREFLIGHT                                │    │
-│  │  • Cluster heat analysis (recent flows)    • Memorypool density (EWMA)            │    │
-│  │  • Gas pressure (EWMA)                     • Impact hint (size/path)              │    │
-│  │  • Latency penalty (lookup/submit/finalize) • Market regime (Calm/Normal/Hot/Toxic)│    │
-│  └────────────────────────────────────────────────────────────────────────────────────┘    │
-│                                              │                                               │
-│                                              ▼                                               │
-│  ┌────────────────────────────────────────────────────────────────────────────────────┐    │
-│  │                    STAGE 3: PAYLOAD BUILD (with CACHE)                             │    │
-│  │  ┌──────────────────────────────────────────────────────────────────────────────┐ │    │
-│  │  │                         POOL CACHE (TTL: 120ms)                              │ │    │
-│  │  │  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────────────┐  │ │    │
-│  │  │  │  V2 Pool Cache  │    │  V3 Pool Cache  │    │  Cache Stats (Hit/Miss) │  │ │    │
-│  │  │  │ • reserve0/1    │    │ • sqrtPriceX96  │    │  • v2_hits/v2_misses    │  │ │    │
-│  │  │  │ • token0/1      │    │ • liquidity     │    │  • v3_hits/v3_misses    │  │ │    │
-│  │  │  │ • block_number  │    │ • current_tick  │    │  • stale_reads          │  │ │    │
-│  │  │  └─────────────────┘    └─────────────────┘    └─────────────────────────┘  │ │    │
-│  │  └──────────────────────────────────────────────────────────────────────────────┘ │    │
-│  │                                                                                    │    │
-│  │  • Parallel RPC for missing cache (3 endpoints)    • V2/V3 pool state simulation  │    │
-│  │  • Victim post-swap state simulation               • Optimal size selection       │    │
-│  │  • ROI calculation & slippage protection           • Flashswap call encoding      │    │
-│  └────────────────────────────────────────────────────────────────────────────────────┘    │
-│                                              │                                               │
-│                                              ▼                                               │
-│  ┌────────────────────────────────────────────────────────────────────────────────────┐    │
-│  │                         STAGE 4: EV GATE                                           │    │
-│  │  • Lookup freshness (<=1500ms)        • Notional >= min_large_swap               │    │
-│  │  • Price impact (V2>=8bps / V3>=6bps) • Expected profit >= min_profit            │    │
-│  │  • Net EV >= min_profit_usd           • Gas budget <= max_gas_per_tx             │    │
-│  └────────────────────────────────────────────────────────────────────────────────────┘    │
-│                                              │                                               │
-│                                              ▼                                               │
-│  ┌────────────────────────────────────────────────────────────────────────────────────┐    │
-│  │                         STAGE 5: QUALITY GATE                                      │    │
-│  │  • ROI >= min_roi_bps (800)           • Price impact <= max_price_impact (250bps)│    │
-│  └────────────────────────────────────────────────────────────────────────────────────┘    │
-│                                              │                                               │
-│                                              ▼                                               │
-│  ┌────────────────────────────────────────────────────────────────────────────────────┐    │
-│  │                    STAGE 6: ADAPTIVE QUOTE (Per Relay)                             │    │
-│  │  • Competition score (cluster heat + mempool density)  • Risk score (failures)    │    │
-│  │  • Dynamic threshold (regime-aware)                    • Probability positive     │    │
-│  │  • Relay ranking (score/pressure/accept/inclusion)     • Real EV calculation      │    │
-│  └────────────────────────────────────────────────────────────────────────────────────┘    │
-│                                                                                              │
+│ Stage 1: FAST PREFLIGHT                                                                    │
+│ • Path validity                                                                            │
+│ • Minimum notional                                                                         │
+│ • Baseline gas sanity                                                                      │
+│ • EV upper bound                                                                           │
+│ • Competition score                                                                        │
+│                                                                                           │
+│ Stage 2: ADAPTIVE PREFLIGHT                                                                │
+│ • Cluster heat                                                                             │
+│ • EWMA gas pressure                                                                        │
+│ • Regime detection                                                                         │
+│ • Latency penalties                                                                        │
+│                                                                                           │
+│ Stage 3: PAYLOAD BUILD                                                                     │
+│ • V2/V3 pool cache                                                                         │
+│ • Deterministic post-victim simulation                                                     │
+│ • Flashswap path construction                                                              │
+│ • ROI sizing                                                                               │
+│                                                                                           │
+│ Stage 4: EV GATE                                                                           │
+│ • Net profitability                                                                        │
+│ • Gas constraints                                                                          │
+│ • Slippage constraints                                                                     │
+│                                                                                           │
+│ Stage 5: QUALITY GATE                                                                      │
+│ • ROI thresholds                                                                           │
+│ • Price impact thresholds                                                                  │
+│                                                                                           │
+│ Stage 6: ADAPTIVE FINAL QUOTE                                                              │
+│ • Relay ranking                                                                            │
+│ • Dynamic thresholds                                                                       │
+│ • Historical inclusion bias                                                                │
+│ • Real EV                                                                                  │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
-                                              │
-                                    [ tokio::sync::mpsc ]
-                                    (EVAL_QUEUE_CAPACITY=512)
-                                              │
-                                              ▼
+                │
+                ▼
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│                              MICROBATCHER (45ms window)                                      │
-│  • Batches up to 4 candidates                • Ranking score (EV + p_positive + efficiency) │
-│  • Selects best candidate                    • Drops lower-ranked candidates              │
+│ MICROBATCHER                                                                               │
+│ • 45ms batching window                                                                     │
+│ • Candidate ranking                                                                        │
+│ • Best-path selection                                                                      │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
-                                              │
-                                              ▼
+                │
+                ▼
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│                              EXECUTION ENGINE (executor.rs)                                 │
+│ EXECUTION ENGINE                                                                           │
 ├─────────────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                              │
-│  ┌────────────────────────────────────────────────────────────────────────────────────┐    │
-│  │                    PRE-EXECUTION VALIDATION                                         │    │
-│  │  • Opportunity age check (<=1500ms)         • Executor balance (min/target/max)   │    │
-│  │  • RPC gas price vs cap                     • Treasury signal (fund/sweep/hold)   │    │
-│  │  • Capital budget (window/cluster/pair)     • Transaction signing                  │    │
-│  └────────────────────────────────────────────────────────────────────────────────────┘    │
-│                                              │                                               │
-│                                              ▼                                               │
-│  ┌────────────────────────────────────────────────────────────────────────────────────┐    │
-│  │                         EVM PREFLIGHT (WAR LEVEL - Optional)                       │    │
-│  │  ┌──────────────────────────────────────────────────────────────────────────────┐ │    │
-│  │  │                    State Overrides Builder                                   │ │    │
-│  │  │  • Pool state (V2 reserves / V3 sqrtPriceX96 + liquidity + tick)            │ │    │
-│  │  │  • Executor contract state                                                 │ │    │
-│  │  │  • Profit recipient balance tracking                                        │ │    │
-│  │  └──────────────────────────────────────────────────────────────────────────────┘ │    │
-│  │                                                                                    │    │
-│  │  ┌──────────────────────────────────────────────────────────────────────────────┐ │    │
-│  │  │                         REVM Execution                                       │ │    │
-│  │  │  • Local EVM simulation                      • Gas usage estimation         │ │    │
-│  │  │  • Revert reason detection                    • Profit extraction from logs │ │    │
-│  │  │  • Log event parsing (Transfer events)        • Success/failure prediction  │ │    │
-│  │  └──────────────────────────────────────────────────────────────────────────────┘ │    │
-│  │                                                                                    │    │
-│  │  • Config: MEV_EVM_PREFLIGHT_ENABLED=true      • Hard fail: MEV_EVM_PREFLIGHT_HARD_FAIL│
-│  └────────────────────────────────────────────────────────────────────────────────────┘    │
-│                                              │                                               │
-│                                              ▼                                               │
-│  ┌────────────────────────────────────────────────────────────────────────────────────┐    │
-│  │                    EXECUTION PATH DISPATCH                                         │    │
-│  │                                                                                    │    │
-│  │  ┌─────────────────────────────┐       ┌─────────────────────────────────────┐   │    │
-│  │  │     DIRECT-RPC MODE         │       │          BUNDLE-RELAY MODE           │   │    │
-│  │  │     (BNB/Polygon)           │       │          (Ethereum)                  │   │    │
-│  │  │  • send_raw_transaction     │       │  • Flashbots Middleware              │   │    │
-│  │  │  • Parallel endpoint retry  │       │  • Bundle construction               │   │    │
-│  │  │  • 3 endpoint candidates    │       │  • Victim + flashswap bundle         │   │    │
-│  │  └─────────────────────────────┘       └─────────────────────────────────────┘   │    │
-│  └────────────────────────────────────────────────────────────────────────────────────┘    │
-│                                              │                                               │
-│                                              ▼                                               │
-│  ┌────────────────────────────────────────────────────────────────────────────────────┐    │
-│  │                    POST-EXECUTION OBSERVATION                                      │    │
-│  │  • Receipt polling (10 attempts, 250ms interval)  • Realized PnL calculation     │    │
-│  │  • Balance delta tracking (pre/post block)        • Outcome classification       │    │
-│  │    - included_success / included_revert / accepted_not_included                  │    │
-│  └────────────────────────────────────────────────────────────────────────────────────┘    │
-│                                                                                              │
+│ PRE-EXECUTION VALIDATION                                                                   │
+│ • Opportunity freshness                                                                    │
+│ • Treasury controls                                                                        │
+│ • Capital window enforcement                                                               │
+│ • Gas caps                                                                                 │
+│ • Wallet health                                                                            │
+│                                                                                           │
+│ OPTIONAL WAR-LEVEL EVM PREFLIGHT                                                           │
+│ • Local EVM simulation                                                                     │
+│ • State overrides                                                                          │
+│ • Revert prediction                                                                        │
+│ • Gas estimate                                                                             │
+│ • Profit simulation                                                                        │
+│                                                                                           │
+│ EXECUTION DISPATCH                                                                         │
+│ ┌───────────────────────────────┐   ┌────────────────────────────────┐                    │
+│ │ Direct RPC                    │   │ Bundle Relay                   │                    │
+│ │ BNB / Polygon                 │   │ Ethereum                       │                    │
+│ │ • Multi-endpoint send         │   │ • Flashbots bundles            │                    │
+│ │ • Retry logic                 │   │ • Relay ranking                │                    │
+│ └───────────────────────────────┘   └────────────────────────────────┘                    │
+│                                                                                           │
+│ POST-EXECUTION OBSERVATION                                                                 │
+│ • Receipt polling                                                                          │
+│ • Realized PnL                                                                             │
+│ • Outcome classification                                                                   │
+│ • Historical persistence                                                                   │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
-                                              │
-                                              ▼
+                │
+                ▼
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│                              PERSISTENCE LAYER (SQLite)                                      │
+│ SQLITE PERSISTENCE LAYER                                                                   │
 ├─────────────────────────────────────────────────────────────────────────────────────────────┤
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │
-│  │   events     │  │  telemetry   │  │ relay_metrics│  │treasury_     │  │execution_    │   │
-│  │              │  │              │  │              │  │  rebalance   │  │  outcomes    │   │
-│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘   │
-│                                                                                              │
-│  • Historical outcome profiles (hour_utc + pair + router)  • Adaptive policy refresh (60s) │
+│ • Relay metrics                                                                            │
+│ • Treasury signals                                                                         │
+│ • Execution outcomes                                                                       │
+│ • Telemetry                                                                                │
+│ • Historical contextual profiles                                                           │
+│ • Adaptive policy state                                                                    │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
-                                              │
-                                              ▼
+                │
+                ▼
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│                              DASHBOARD SERVER (Port 8787)                                    │
-│  • Real-time status API (/api/status)  • HTML/JS frontend  • SSE event stream               │
-│  • Metrics: regime, relay rankings, reject reasons, treasury state, EV preflight results   │
+│ DASHBOARD SERVER                                                                           │
+│ Port 8787                                                                                  │
+│ • Runtime state                                                                            │
+│ • Relay quality                                                                            │
+│ • Treasury state                                                                           │
+│ • Reject reasons                                                                           │
+│ • Latency metrics                                                                          │
+│ • Live operational event stream                                                            │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
