@@ -5,6 +5,7 @@ use serde::Deserialize;
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use tracing::warn;
 
 #[derive(Parser, Debug)]
 #[command(name = "fee-extraction-engine")]
@@ -113,6 +114,7 @@ impl Config {
             .map(|value| value.trim().to_lowercase())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| cli.network.to_lowercase());
+        let runtime_load_test_mode = env_flag("RUN_RUNTIME_LOAD_TEST");
         let tenderly_rpc_only = env::var("USE_TENDERLY_RPC_ONLY")
             .unwrap_or_else(|_| "false".to_string())
             .trim()
@@ -125,7 +127,7 @@ impl Config {
             parse_alchemy_keys()
         } else {
             let keys = parse_alchemy_keys();
-            if keys.is_empty() {
+            if keys.is_empty() && !runtime_load_test_mode {
                 return Err("environment variable ALCHEMY_KEY is not configured".into());
             }
             keys
@@ -143,7 +145,7 @@ impl Config {
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
             .unwrap_or_else(|| default_chain_id(&network));
-        let executor_private_key = env::var("EXECUTOR_PRIVATE_KEY")
+        let executor_private_key_candidate = env::var("EXECUTOR_PRIVATE_KEY")
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !is_placeholder(value))
@@ -159,30 +161,49 @@ impl Config {
                     .map(|value| value.trim().to_string())
                     .filter(|value| !is_placeholder(value))
             })
+            .or_else(|| {
+                runtime_load_test_mode.then(|| {
+                    "0000000000000000000000000000000000000000000000000000000000000001"
+                        .to_string()
+                })
+            })
             .ok_or(
                 "environment variable EXECUTOR_PRIVATE_KEY, SENDER_PRIVATE_KEY or CONTROL_PRIVATE_KEY is not configured",
             )?;
+        let executor_private_key =
+            if runtime_load_test_mode && executor_private_key_candidate.parse::<LocalWallet>().is_err()
+            {
+                "0000000000000000000000000000000000000000000000000000000000000001"
+                    .to_string()
+            } else {
+                executor_private_key_candidate
+            };
         let executor_address = executor_private_key
             .parse::<LocalWallet>()?
             .address();
-        let control_address = required_env("CONTROL_ADDRESS")?.parse::<Address>()?;
-        let vault_address = env::var("VAULT_ADDRESS")
-            .ok()
-            .map(|value| value.trim().parse::<Address>())
-            .transpose()?
-            .unwrap_or(control_address);
-        let profit_address = env::var("PROFIT_ADDRESS")
-            .ok()
-            .map(|value| value.trim().parse::<Address>())
-            .transpose()?
-            .or_else(|| {
-                env::var("MEV_SEARCHER_RECIPIENT")
-                    .ok()
-                    .map(|value| value.trim().parse::<Address>())
-                    .transpose()
-                    .ok()
-                    .flatten()
-            })
+        let control_address = match env::var("CONTROL_ADDRESS") {
+            Ok(value) => match value.trim().parse::<Address>() {
+                Ok(address) => address,
+                Err(err) if runtime_load_test_mode => {
+                    warn!("ignoring invalid CONTROL_ADDRESS for runtime load test: {}", err);
+                    executor_address
+                }
+                Err(err) => return Err(err.into()),
+            },
+            Err(_) if runtime_load_test_mode => executor_address,
+            Err(_) => Address::zero(),
+        };
+        if control_address == Address::zero() && !runtime_load_test_mode {
+            return Err("environment variable CONTROL_ADDRESS is not configured".into());
+        }
+        let vault_address =
+            parse_optional_address_env("VAULT_ADDRESS", runtime_load_test_mode)?
+                .unwrap_or(control_address);
+        let profit_address = parse_optional_address_env("PROFIT_ADDRESS", runtime_load_test_mode)?
+            .or(parse_optional_address_env(
+                "MEV_SEARCHER_RECIPIENT",
+                runtime_load_test_mode,
+            )?)
             .unwrap_or(control_address);
         let monitored_tokens = parse_monitored_tokens(&network)?;
         let estimated_exec_gas = env::var("ESTIMATED_EXEC_GAS")
@@ -295,18 +316,15 @@ impl Config {
             executor_max_buffer_eth: env::var("MEV_EXECUTOR_MAX_BUFFER_ETH")
                 .unwrap_or_else(|_| "1.00".to_string())
                 .parse::<f64>()?,
-            uniswap_v2_factory: env::var("MEV_UNISWAP_V2_FACTORY")
-                .ok()
-                .map(|value| value.trim().parse::<Address>())
-                .transpose()?,
-            uniswap_v3_factory: env::var("MEV_UNISWAP_V3_FACTORY")
-                .ok()
-                .map(|value| value.trim().parse::<Address>())
-                .transpose()?,
-            mev_executor: env::var("MEV_EXECUTOR_ADDRESS")
-                .ok()
-                .map(|value| value.trim().parse::<Address>())
-                .transpose()?,
+            uniswap_v2_factory: parse_optional_address_env(
+                "MEV_UNISWAP_V2_FACTORY",
+                runtime_load_test_mode,
+            )?,
+            uniswap_v3_factory: parse_optional_address_env(
+                "MEV_UNISWAP_V3_FACTORY",
+                runtime_load_test_mode,
+            )?,
+            mev_executor: parse_optional_address_env("MEV_EXECUTOR_ADDRESS", runtime_load_test_mode)?,
         };
 
         let mut infura_ids = Vec::new();
@@ -529,10 +547,38 @@ fn parse_rpc_urls(network: &str) -> Vec<String> {
     urls
 }
 
+fn parse_optional_address_env(
+    name: &str,
+    tolerate_invalid: bool,
+) -> Result<Option<Address>, Box<dyn std::error::Error>> {
+    let Ok(value) = env::var(name) else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if is_placeholder(trimmed) {
+        return Ok(None);
+    }
+    match trimmed.parse::<Address>() {
+        Ok(address) => Ok(Some(address)),
+        Err(err) if tolerate_invalid => {
+            warn!("ignoring invalid {name} for runtime load test: {}", err);
+            Ok(None)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn is_placeholder(value: &str) -> bool {
     value.trim().is_empty()
         || value.trim() == "SUA_CHAVE_HEX_AQUI"
         || value.trim() == "0xSeuContratoAlvo"
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .unwrap_or_else(|_| "false".to_string())
+        .trim()
+        .eq_ignore_ascii_case("true")
 }
 
 fn default_chain_id(network: &str) -> u64 {
