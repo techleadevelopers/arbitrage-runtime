@@ -4,8 +4,10 @@ use crate::dashboard::{
 use crate::mev::adaptive::HistoricalOutcomeProfile;
 use chrono::Utc;
 use rusqlite::{params, Connection};
+use serde::Serialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -689,6 +691,75 @@ impl Storage {
         Ok(items)
     }
 
+    pub fn export_evidence_artifacts(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+        let exports_dir = ensure_exports_dir()?;
+        let toxicity = self.write_toxicity_profiles_csv_to(&exports_dir, limit)?;
+        let realized = self.write_realized_vs_expected_json_to(&exports_dir, limit)?;
+        Ok(vec![toxicity, realized])
+    }
+
+    #[allow(dead_code)]
+    pub fn export_toxicity_profiles_csv(
+        &self,
+        limit: usize,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let exports_dir = ensure_exports_dir()?;
+        self.write_toxicity_profiles_csv_to(&exports_dir, limit)
+    }
+
+    #[allow(dead_code)]
+    pub fn export_realized_vs_expected_json(
+        &self,
+        limit: usize,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let exports_dir = ensure_exports_dir()?;
+        self.write_realized_vs_expected_json_to(&exports_dir, limit)
+    }
+
+    fn write_toxicity_profiles_csv_to(
+        &self,
+        exports_dir: &Path,
+        limit: usize,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let path = exports_dir.join("toxicity_profiles.csv");
+        let profiles = self.toxicity_profiles(limit)?;
+        let mut out = String::from("router,pair,hour,revert_rate,samples,success_rate,miss_rate,realized_capture,toxicity_score\n");
+        for profile in profiles {
+            out.push_str(&format!(
+                "{},{},{},{:.6},{},{:.6},{:.6},{:.6},{:.6}\n",
+                csv_field(&profile.router),
+                csv_field(&profile.pair),
+                profile.hour_utc,
+                profile.revert_rate,
+                profile.samples,
+                profile.success_rate,
+                profile.miss_rate,
+                profile.realized_capture,
+                profile.toxicity_score,
+            ));
+        }
+        fs::write(&path, out)?;
+        Ok(path)
+    }
+
+    fn write_realized_vs_expected_json_to(
+        &self,
+        exports_dir: &Path,
+        limit: usize,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let path = exports_dir.join("realized_vs_expected.json");
+        let rows: Vec<RealizedVsExpectedRow> = self
+            .execution_outcomes(limit)?
+            .into_iter()
+            .map(RealizedVsExpectedRow::from_snapshot)
+            .collect();
+        fs::write(&path, serde_json::to_string_pretty(&rows)?)?;
+        Ok(path)
+    }
+
     fn scoped_relay(&self, relay: &str) -> String {
         format!("{}::{}", self.network, relay)
     }
@@ -698,6 +769,64 @@ impl Storage {
             .map(|(_, value)| value.to_string())
             .unwrap_or_else(|| relay.to_string())
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RealizedVsExpectedRow {
+    at: String,
+    relay: String,
+    target_block: u64,
+    pair: String,
+    router: String,
+    token_in: String,
+    token_out: String,
+    victim_tx: String,
+    outcome: String,
+    expected_profit_eth: f64,
+    realized_profit_eth: f64,
+    delta_profit_eth: f64,
+    capture_ratio: f64,
+    gas_used: u64,
+    submit_latency_ms: f64,
+    finalization_latency_ms: f64,
+}
+
+impl RealizedVsExpectedRow {
+    fn from_snapshot(snapshot: ExecutionOutcomeSnapshot) -> Self {
+        let capture_ratio = if snapshot.expected_profit_eth.abs() <= f64::EPSILON {
+            0.0
+        } else {
+            snapshot.realized_profit_eth / snapshot.expected_profit_eth
+        };
+        Self {
+            delta_profit_eth: snapshot.realized_profit_eth - snapshot.expected_profit_eth,
+            capture_ratio,
+            at: snapshot.at,
+            relay: snapshot.relay,
+            target_block: snapshot.target_block,
+            pair: snapshot.pair,
+            router: snapshot.router,
+            token_in: snapshot.token_in,
+            token_out: snapshot.token_out,
+            victim_tx: snapshot.victim_tx,
+            outcome: snapshot.outcome,
+            expected_profit_eth: snapshot.expected_profit_eth,
+            realized_profit_eth: snapshot.realized_profit_eth,
+            gas_used: snapshot.gas_used,
+            submit_latency_ms: snapshot.submit_latency_ms,
+            finalization_latency_ms: snapshot.finalization_latency_ms,
+        }
+    }
+}
+
+pub fn ensure_exports_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let dir = PathBuf::from("exports");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn csv_field(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 #[cfg(test)]
@@ -823,5 +952,53 @@ mod tests {
         assert!(profiles[0].toxicity_score > 0.50);
         assert!(profiles[0].revert_rate > 0.30);
         assert!(profiles[0].miss_rate > 0.30);
+    }
+
+    #[test]
+    fn evidence_exports_write_expected_files() {
+        let path = temp_path("exports");
+        let storage = Storage::new(&path, "polygon").unwrap();
+        let pair = format!("{:?}", Address::from_low_u64_be(111));
+        let router = format!("{:?}", Address::from_low_u64_be(211));
+        let token_in = format!("{:?}", Address::from_low_u64_be(311));
+        let token_out = format!("{:?}", Address::from_low_u64_be(411));
+
+        storage.record_execution_outcome(
+            "relay-a",
+            777,
+            &pair,
+            &router,
+            &token_in,
+            &token_out,
+            "0xvictim",
+            "included_success",
+            0.015,
+            0.012,
+            245000,
+            11.0,
+            510.0,
+        );
+
+        let export_dir = std::env::temp_dir().join(format!(
+            "flash_bot_exports_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&export_dir).unwrap();
+
+        let toxicity = storage
+            .write_toxicity_profiles_csv_to(&export_dir, 16)
+            .unwrap();
+        let realized = storage
+            .write_realized_vs_expected_json_to(&export_dir, 16)
+            .unwrap();
+
+        let toxicity_raw = fs::read_to_string(toxicity).unwrap();
+        let realized_raw = fs::read_to_string(realized).unwrap();
+        assert!(toxicity_raw.contains("router,pair,hour,revert_rate"));
+        assert!(realized_raw.contains("\"delta_profit_eth\""));
+        assert!(realized_raw.contains("\"capture_ratio\""));
     }
 }

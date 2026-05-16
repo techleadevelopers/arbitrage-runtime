@@ -1,8 +1,11 @@
 use crate::config::Config;
 use crate::mev::adaptive::{AdaptivePolicy, AdaptiveQuoteInput, ClusterKey, PreflightInput};
+#[cfg(target_os = "linux")]
+use crate::mev::execution::pinning::ThreadPinningConfig;
 use crate::mev::opportunity::wei_to_eth_f64;
 use crate::mev::runtime::{decode_relevant_swap, fast_preflight_gate};
 use crate::rpc::RpcFleet;
+use chrono::Utc;
 use chrono::Timelike;
 use ethers::abi::{encode, Token};
 use ethers::middleware::SignerMiddleware;
@@ -13,6 +16,7 @@ use ethers_flashbots::{BundleRequest, FlashbotsMiddleware};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::env;
+use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
@@ -53,7 +57,7 @@ pub async fn maybe_run_runtime_load_test(
     );
 
     let started = Instant::now();
-    let mut join_set = JoinSet::new();
+    let mut worker_handles = Vec::with_capacity(concurrency);
     let base_cases = cases / concurrency;
     let remainder = cases % concurrency;
     let base_warmup = warmup / concurrency;
@@ -63,7 +67,7 @@ pub async fn maybe_run_runtime_load_test(
         let relays = relay_paths.clone();
         let worker_cases = base_cases + usize::from(worker_id < remainder);
         let worker_warmup = base_warmup + usize::from(worker_id < warmup_remainder);
-        join_set.spawn(async move {
+        worker_handles.push(tokio::task::spawn_blocking(move || {
             runtime_load_worker(
                 config,
                 worker_id,
@@ -74,8 +78,7 @@ pub async fn maybe_run_runtime_load_test(
                 relays,
                 profile,
             )
-            .await
-        });
+        }));
     }
 
     let mut combined = RuntimeLoadReport::new(
@@ -86,7 +89,8 @@ pub async fn maybe_run_runtime_load_test(
         budget_p99_us,
         profile,
     );
-    while let Some(result) = join_set.join_next().await {
+    for handle in worker_handles {
+        let result = handle.await;
         match result {
             Ok(Ok(report)) => combined.merge(report),
             Ok(Err(err)) => return Err(err.into()),
@@ -98,9 +102,11 @@ pub async fn maybe_run_runtime_load_test(
 
     print_runtime_load_report(&combined);
     if let Some(path) = output_path {
-        std::fs::write(&path, serde_json::to_string_pretty(&combined)?)?;
+        fs::write(&path, serde_json::to_string_pretty(&combined)?)?;
         println!("Runtime load report exported: {}", path);
     }
+    export_runtime_latency_benchmarks(&combined)?;
+    emit_runtime_budget_warning(&combined);
 
     Ok(true)
 }
@@ -416,7 +422,7 @@ async fn benchmark_bundle_submission(
     .await
 }
 
-async fn runtime_load_worker(
+fn runtime_load_worker(
     config: Arc<Config>,
     worker_id: usize,
     cases: usize,
@@ -440,6 +446,26 @@ async fn runtime_load_worker(
     let hour_utc = chrono::Utc::now().hour() as u8;
     let mut report = RuntimeLoadWorkerReport::default();
     let total_iterations = cases.saturating_add(warmup);
+
+    #[cfg(target_os = "linux")]
+    {
+        let pinning = ThreadPinningConfig::auto_detect();
+        let pin = pinning.pin_runtime_load_worker(worker_id);
+        if worker_id == 0 {
+            let current = pin
+                .current_core
+                .map(|core| core.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            println!(
+                "Runtime load test pinning: total_hot_gate worker pinned requested_core={} current_core={} numa_node={} success={}",
+                pin.requested_core, current, pin.numa_node, pin.success
+            );
+            info!(
+                "Linux runtime load test pinning: requested_core={} current_core={} numa_node={} success={}",
+                pin.requested_core, current, pin.numa_node, pin.success
+            );
+        }
+    }
 
     for index in 0..total_iterations {
         let record = index >= warmup;
@@ -1125,6 +1151,58 @@ fn print_runtime_load_report(report: &RuntimeLoadReport) {
     print_latency_us("adaptive_quote", report.adaptive_quote);
     print_latency_us("total_hot_gate", report.total_hot_gate);
     println!();
+}
+
+fn export_runtime_latency_benchmarks(
+    report: &RuntimeLoadReport,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let exports_dir = crate::storage::ensure_exports_dir()?;
+    let path = exports_dir.join("runtime_latency_benchmarks.json");
+    let mut root = if path.exists() {
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&fs::read_to_string(&path)?)
+            .unwrap_or_default()
+    } else {
+        serde_json::Map::new()
+    };
+    root.insert("updated_at".to_string(), serde_json::Value::String(Utc::now().to_rfc3339()));
+    root.insert("network".to_string(), serde_json::Value::String(report.network.clone()));
+    root.insert(
+        report.profile.to_string(),
+        serde_json::to_value(report)?,
+    );
+    fs::write(&path, serde_json::to_string_pretty(&root)?)?;
+    println!("Runtime benchmark export: {}", path.display());
+    Ok(())
+}
+
+fn emit_runtime_budget_warning(report: &RuntimeLoadReport) {
+    if report.budget_pass {
+        return;
+    }
+
+    let environment_hint = if env::var("WSL_DISTRO_NAME").is_ok() {
+        "WSL scheduler jitter accumulated into the hot-path tail"
+    } else if cfg!(target_os = "windows") {
+        "Windows scheduler jitter accumulated into the hot-path tail"
+    } else if cfg!(target_os = "linux") {
+        "Linux run is likely missing isolated cores, NUMA locality, or clean pinning"
+    } else {
+        "the current environment is adding scheduler noise to the hot-path tail"
+    };
+
+    let message = format!(
+        "runtime load test exceeded the 250us release budget: total_hot_gate p99={}us max={}us; {}",
+        report.total_hot_gate.p99,
+        report.total_hot_gate.max,
+        environment_hint
+    );
+
+    if cfg!(debug_assertions) {
+        warn!("debug build budget miss: {}", message);
+    } else {
+        warn!("{}", message);
+        println!("WARNING: {}", message);
+    }
 }
 
 fn print_latency_us(label: &str, summary: LatencyUsSummary) {
