@@ -114,6 +114,45 @@ $$R = \Delta_{\text{realized\_pnl}} \cdot \mathbb{I}(\text{Success}) - \left( c 
 
 The engine utilizes this continuous feedback loop to apply gradient adjustments to the pre-flight filters in `adaptive.rs`, optimizing for long-term expected value ($\sum \gamma^k R_{t+k}$) instead of localized execution density.
 
+## Advanced Ultra-Low Latency & Quantitative Core (Tier-1 Architecture)
+
+### 1. High-Frequency Market Microstructure & Stochastic Optimal Control
+The execution kernel transitions from reactive filters to an optimal stopping time problem, treating the liquidity state as a continuous-time jump-diffusion process.
+
+*   **Hidden Markov Model (HMM) Regime Switching:** The runtime implements a 3-state localized HMM (Low-Vol, High-Vol/Competitive, Toxic/Reorg-Heavy) directly within `adaptive.rs`. State transitions ($\mathcal{A}_{ij}$) are computed online using a fixed-window Baum-Welch approximation, dynamically updating the EV gate baseline before a single payload is built.
+*   **Stochastic Optimal Control (Hamilton-Jacobi-Bellman formulation):** To maximize capital utility over the finite horizon of a block assembly period ($T$), execution routing solves the HJB equation for the value function $V(x, t)$:
+
+$$-\frac{\partial V}{\partial t} = \max_{u \in \mathcal{U}} \left\{ \mathcal{L}^u V(x, t) + R(x, u) \right\}$$
+
+Where $u$ represents the continuous boundary push for priority gas fee adjustments, balancing the risk of adverse selection (getting frontrun or trapped in an unprofitable multi-hop leg) against the probability of priority inclusion.
+*   **Queue-Reactive Order Book Models:** On chains with predictable block intervals (e.g., BNB Chain and Polygon), the engine treats the local transaction memory layout as an implicit queue network. It models the probability of transaction displacement at a specific block space index via a discrete-time Markov chain configured by the intensity of competitive direct-RPC incoming bursts.
+
+### 2. Hardcore Systems Optimization & Low-Level Hardware Alignment
+The Rust implementation is fundamentally designed to minimize hardware-induced microsecond degradation, targeting bare-metal structural efficiency.
+
+```text
+[Network Frame] ──> [io_uring / XDP Direct Ingest] ──> [SIMD Fast Decode] ──> [NUMA-Local Thread Pool]
+                                                                                     │
+[Hardware Bus Client] <── [Lock-Free Ring Buffer] <── [Cache-Aligned Layout] <───────┘
+```
+
+*   **Lock-Free Concurrency & Cache-Aware Layouts:** Critical state primitives in `rpc.rs` and `mev/runtime.rs` avoid OS-level mutex contention by leveraging lock-free atomic rings (`crossbeam-channel` derivatives) and explicit cache-line padding (`#[link_section]` or 64-byte alignment hints) to entirely mitigate false sharing across high-throughput CPU cores.
+*   **Custom Allocator Tuning (`jemalloc` / `mimalloc` Integration):** High-frequency execution paths isolate memory allocation entirely. The runtime disables the default OS allocator in favor of a statically-tuned `jemalloc` profile, configuring dedicated arena pools to completely bypass runtime thread-cache contention during burst mempool events.
+*   **Zero-Copy Byte Parsing via SIMD:** Transaction payload decoding replaces iterative structural matching with SIMD vectorization routines. Target AMM method selectors (`0x38ed1739`, `0x7ff36ab5`) are evaluated across raw network bytes using vector instructions in a single clock cycle.
+*   **NUMA Awareness & Thread Pinning:** For multi-socket deployments, execution workers are pinned via explicit affinity masks (`core_affinity`) to distinct physical CPU cores sharing localized L3 caches with the PCIe network interface card (NIC), bypassing Cross-Socket Interconnect (QPI/UPI) latency bottlenecks.
+
+### 3. Empirical Economic Validation & Private Statistical Bounds
+While production trading results are strictly restricted from public tracking repositories, the framework evaluates execution health against formal high-frequency financial metrics.
+
+*   **Adverse Selection Metrics:** The engine calculates the Conditional Value-at-Risk ($\text{CVaR}_\alpha$) of all transaction submissions. If the realized post-execution price drift inside the targeted AMM pool systematically opposes our entry vectors within a 3-block horizon, the system automatically marks the router/pair cluster as *toxic* and scales down the allocation profile.
+*   **Inclusion Win-Rate Decay Curves:** The system tracks the statistical divergence between our simulated local pre-flight expectation and the live blockchain block reality (Live-Replay Divergence). Winning trajectories are plotted continuously against an empirical decay curve:
+
+$$W(\Delta t) = W_0 \cdot e^{-\kappa \cdot \Delta t_{\text{network}}}$$
+
+Where $\kappa$ measures the instantaneous competitive density of the ecosystem. This decay profile allows the engine to adaptively drop payloads if the RPC socket confirmation latency slips by more than $1.8 \text{ ms}$ off the historical baseline.
+
+*   **Sharpe-Like Operational Stability:** Capital efficiency is bounded via a custom High-Frequency Sortino Ratio, tracking net extraction yield strictly against the downside variance of uncompensated gas burn (reverts and missed blocks). The engine's structural goal is to ensure this ratio trends strictly positive even during extreme network congestion regimes.
+
 ## Architecture Diagram
 
 The system operates as a zero-copy, linear, multi-threaded pipeline using bounded asynchronous communication primitives.
