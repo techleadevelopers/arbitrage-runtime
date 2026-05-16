@@ -90,6 +90,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|| "disabled".to_string())
     );
     info!(
+        "Latency trace: enabled={} warn_threshold_us={}",
+        config.mev.latency_trace,
+        config.mev.latency_trace_warn_us
+    );
+    info!(
         "Executor buffer: min={:.4} ETH target={:.4} ETH max={:.4} ETH",
         config.mev.executor_min_buffer_eth,
         config.mev.executor_target_buffer_eth,
