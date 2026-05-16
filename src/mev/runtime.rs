@@ -13,6 +13,7 @@ use crate::storage::Storage;
 use chrono::Timelike;
 use ethers::abi::{self, ParamType, Token};
 use ethers::providers::{Middleware, Provider, StreamExt, Ws};
+use crate::mev::execution::payload_builder::ExecutionPayload;
 use ethers::types::{Address, H256, Transaction, U256};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -20,6 +21,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 use tracing::warn;
+use crate::mev::cache::pool_cache::PoolCache;
+use crate::mev::cache::pool_cache::PoolCache;
+use crate::mev::simulation::state_simulator::{StateSimulator, AccountState, EvmPreflightResult};
+
 
 const MICROBATCH_WINDOW_MS: u64 = 45;
 const MICROBATCH_MAX_CANDIDATES: usize = 4;
@@ -36,6 +41,8 @@ const SWAP_EXACT_ETH_FOR_TOKENS_SUPPORTING_FEE: [u8; 4] = [0xb6, 0xf9, 0xde, 0x9
 const SWAP_EXACT_TOKENS_FOR_ETH_SUPPORTING_FEE: [u8; 4] = [0x79, 0x1a, 0xc9, 0x47];
 const V3_EXACT_INPUT_SINGLE: [u8; 4] = [0x41, 0x4b, 0xf3, 0x89];
 const V3_EXACT_INPUT: [u8; 4] = [0xc0, 0x4b, 0x8d, 0x59];
+
+
 
 #[derive(Debug, Clone)]
 pub(crate) enum SwapKind {
@@ -226,6 +233,7 @@ struct LookupDecodedCandidate {
     lookup_latency: Duration,
     candidate_started: Instant,
     latency_trace: CandidateLatencyTrace,
+    block_number: u64,
 }
 
 ethers::contract::abigen!(
@@ -275,6 +283,7 @@ pub async fn run(
         return Err("fee extraction runtime requires ALLOW_SEND=true".into());
     }
 
+    let pool_cache = Arc::new(PoolCache::new(config.mev.pool_state_cache_ttl_ms));
     let mut tx_hash_stream = connect_mempool_fan_in(&ws_urls, &dashboard);
     let min_large_swap_wei = ethers::utils::parse_ether(config.mev.min_large_swap_eth.to_string())?;
     let min_profit_wei = ethers::utils::parse_ether(config.mev.min_net_profit_eth.to_string())?;
@@ -344,6 +353,8 @@ pub async fn run(
         let rpc_fleet = rpc_fleet.clone();
         let adaptive = adaptive.clone();
         let dashboard = dashboard.clone();
+        let pool_cache = pool_cache.clone();
+
         tokio::spawn(async move {
             while let Some(candidate) = recv_from_shared_channel(&rx).await {
                 if let Some(ready) = process_evaluation_task(
@@ -354,6 +365,7 @@ pub async fn run(
                     dashboard.clone(),
                     min_large_swap_wei,
                     min_profit_wei,
+                    pool_cache.clone(), 
                 )
                 .await
                 {
@@ -541,6 +553,7 @@ async fn process_lookup_decode_task(
     let lookup_started = Instant::now();
     let tx = lookup_pending_tx_parallel(rpc_fleet, task.tx_hash).await?;
     latency_trace.lookup_pending_tx_us = Some(elapsed_us(lookup_started));
+    let block_number = get_current_block_parallel(rpc_fleet.clone()).await?;
 
     dashboard.record_latency(
         "fee_pending_lookup",
@@ -591,7 +604,88 @@ async fn process_lookup_decode_task(
         lookup_latency: lookup_started.elapsed(),
         candidate_started: task.candidate_started,
         latency_trace,
+        block_number, 
     })
+}
+
+// NOVA FUNÇÃO auxiliar
+async fn get_current_block_parallel(rpc_fleet: Arc<RpcFleet>) -> Option<u64> {
+    let mut join_set = JoinSet::new();
+    for handle in rpc_fleet.read_candidates(3) {
+        let provider = handle.provider.clone();
+        join_set.spawn(async move {
+            provider.get_block_number().await.ok().map(|b| b.as_u64())
+        });
+    }
+    
+    while let Some(result) = join_set.join_next().await {
+        if let Ok(Some(block)) = result {
+            join_set.abort_all();
+            return Some(block);
+        }
+    }
+    None
+}
+
+/// Valida uma oportunidade MEV usando um fork do estado atual da blockchain
+async fn validate_with_evm_preflight(
+    payload: &ExecutionPayload,
+    victim_tx: &Transaction,
+    block_number: u64,
+    pool_state: &AmmState,
+    config: &Config,
+    rpc_fleet: &Arc<RpcFleet>,
+    dashboard: &DashboardHandle,
+) -> Result<EvmPreflightResult, String> {
+    // Obter um provider para o fork
+    let provider = rpc_fleet.get_best_provider().await
+        .ok_or_else(|| "No available RPC provider for EVM preflight".to_string())?;
+    
+    // Criar o estado inicial baseado no block_number
+    let mut account_states = std::collections::HashMap::new();
+    
+    // Adicionar o estado do pool antes da execução
+    match pool_state {
+        AmmState::UniswapV2(pool) => {
+            account_states.insert(pool.pair, AccountState {
+                nonce: None,
+                balance: None,
+                storage: None,  // TODO: Implementar get_storage_layout se necessário
+                code: None,
+            });
+        }
+        AmmState::UniswapV3(pool) => {
+            account_states.insert(pool.pool, AccountState {
+                nonce: None,
+                balance: None,
+                storage: None,  // TODO: Implementar get_storage_layout se necessário
+                code: None,
+            });
+        }
+    }
+    
+    // Configurar a simulação - CORRIGIR a conversão do min_profit_wei
+    let min_profit_wei_value = (config.mev.min_net_profit_eth * 1e18) as u64;
+    
+    let simulation_config = crate::mev::simulation::evm_simulator::EvmSimulationConfig {
+        fork_block_number: block_number,
+        gas_limit: payload.gas_limit,
+        tx_value: payload.value,
+        profit_recipient: payload.profit_recipient,
+        min_profit_wei: U256::from(min_profit_wei_value),
+        ..Default::default()
+    };
+    
+    // Executar a simulação
+    let simulator = StateSimulator::new(provider);
+    let result = simulator.simulate_mev_opportunity(
+        &payload.calldata,
+        payload.target_contract,
+        simulation_config,
+        account_states,
+    ).await?;
+    
+    Ok(result)
 }
 
 async fn process_evaluation_task(
@@ -602,8 +696,10 @@ async fn process_evaluation_task(
     dashboard: DashboardHandle,
     min_large_swap_wei: U256,
     min_profit_wei: U256,
+    pool_cache: Arc<PoolCache>,  // NOVO PARÂMETRO
 ) -> Option<PendingExecutionCandidate> {
     let tx_hash = candidate.tx.hash;
+    
     if let Some(max_gas_price_wei) = config.mev.max_gas_price_wei() {
         if candidate.gas_price > max_gas_price_wei {
             candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
@@ -633,6 +729,7 @@ async fn process_evaluation_task(
         candidate.context_signal,
     );
     candidate.latency_trace.fast_preflight_us = Some(elapsed_us(fast_preflight_started));
+    
     if !fast_gate.should_continue {
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
         if let Some(reason) = fast_gate.reject_reason {
@@ -651,6 +748,7 @@ async fn process_evaluation_task(
     if let Ok(mut model) = adaptive.lock() {
         model.observe_candidate_flow(candidate.cluster, candidate.signal.notional_wei, candidate.gas_price);
     }
+    
     let adaptive_preflight_started = Instant::now();
     let preflight = if let Ok(mut model) = adaptive.lock() {
         model.preflight_score(PreflightInput {
@@ -664,6 +762,7 @@ async fn process_evaluation_task(
     };
     candidate.latency_trace.adaptive_preflight_us = Some(elapsed_us(adaptive_preflight_started));
     dashboard.set_market_regime(preflight.regime.as_str());
+    
     if !preflight.should_continue {
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
         if let Some(reason) = preflight.reject_reason {
@@ -681,14 +780,208 @@ async fn process_evaluation_task(
 
     let payload_started = Instant::now();
     let payload = build_payload_with_fallback_parallel(
-        rpc_fleet,
+        rpc_fleet.clone(),
         config.clone(),
         candidate.signal.clone(),
         candidate.gas_price,
         candidate.context_signal,
+        &pool_cache,
+        candidate.block_number,
     )
     .await?;
     candidate.latency_trace.payload_build_us = Some(elapsed_us(payload_started));
+    
+    // WAR LEVEL: EVM preflight validation (opcional, ativado por env)
+    if std::env::var("MEV_EVM_PREFLIGHT_ENABLED")
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("true")
+    {
+        let preflight_started = std::time::Instant::now();
+        
+        // Usar o estado real do pool que está no payload
+        let pool_state = &payload.pool_state_before;
+        
+        // Obter a transação da vítima
+        let victim_tx = &candidate.tx;
+        
+        // Chamar a validação EVM
+        match validate_with_evm_preflight(
+            &payload,
+            victim_tx,
+            candidate.block_number,
+            pool_state,
+            &config,
+            &rpc_fleet,
+            &dashboard,
+        ).await {
+            Ok(preflight_result) => {
+                let preflight_elapsed = preflight_started.elapsed();
+                candidate.latency_trace.adaptive_preflight_us = Some(elapsed_us(preflight_started));
+                
+                if !preflight_result.should_proceed {
+                    candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+                    dashboard.record_reject_reason("evm_preflight", preflight_result.reject_reason.as_deref().unwrap_or("preflight_failed"));
+                    candidate.latency_trace.emit(
+                        &config,
+                        &dashboard,
+                        tx_hash,
+                        "reject",
+                        preflight_result.reject_reason.as_deref().unwrap_or("evm_preflight"),
+                    );
+                    return None;
+                }
+                
+                dashboard.event(
+                    "info",
+                    format!(
+                        "evm preflight passed victim={:?} execution_cost_gas={} simulated_profit_wei={} preflight_ms={}",
+                        tx_hash,
+                        preflight_result.execution_gas_used,
+                        preflight_result.simulated_profit_wei,
+                        preflight_elapsed.as_millis()
+                    ),
+                );
+            }
+            Err(err) => {
+                candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+                dashboard.record_reject_reason("evm_preflight_error", &err);
+                candidate.latency_trace.emit(
+                    &config,
+                    &dashboard,
+                    tx_hash,
+                    "reject",
+                    "evm_preflight_error",
+                );
+                return None;
+            }
+        }
+    }
+
+    let ev_gate_started = Instant::now();
+    if !passes_ev_gate(
+        &config,
+        &payload,
+        &candidate.signal,
+        candidate.lookup_latency,
+        min_profit_wei,
+    ) {
+        candidate.latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
+        candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        candidate.latency_trace.emit(&config, &dashboard, tx_hash, "reject", "ev_gate");
+        return None;
+    }
+    candidate.latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
+
+    let execution_cost_wei = candidate
+        .gas_price
+        .saturating_mul(U256::from(payload.gas_limit))
+        .saturating_mul(U256::from(config.mev.gas_safety_margin_bps))
+        / U256::from(10_000u64);
+    
+    let quality_gate_started = Instant::now();
+    if !passes_quality_gate(&config, &payload, execution_cost_wei) {
+        candidate.latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
+        candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        candidate.latency_trace.emit(&config, &dashboard, tx_hash, "reject", "quality_gate");
+        return None;
+    }
+    candidate.latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
+
+    let adaptive_quote_started = Instant::now();
+    let quote = if let Ok(mut model) = adaptive.lock() {
+        model.quote_for_relays(
+            AdaptiveQuoteInput {
+                cluster: candidate.cluster,
+                pair: payload.pair,
+                hour_utc: candidate.hour_utc,
+                context_priority_score: candidate.context_signal.priority_score,
+                context_toxicity_score: candidate.context_signal.toxicity_score,
+                expected_profit_wei: payload.expected_profit_wei,
+                execution_cost_wei,
+                gas_price_wei: candidate.gas_price,
+                lookup_latency_ms: candidate.lookup_latency.as_millis() as f64,
+                notional_eth: wei_to_eth_f64(candidate.signal.notional_wei),
+                price_impact_bps: payload.price_impact_bps,
+                relay_pressure_override: None,
+            },
+            &config.builder_relays,
+        )
+    } else {
+        return None;
+    };
+    candidate.latency_trace.adaptive_quote_us = Some(elapsed_us(adaptive_quote_started));
+    dashboard.set_market_regime(quote.regime.as_str());
+    
+    if !quote.should_execute {
+        candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        if let Some(reason) = quote.reject_reason {
+            dashboard.record_reject_reason("adaptive", reason);
+        }
+        candidate.latency_trace.emit(
+            &config,
+            &dashboard,
+            tx_hash,
+            "reject",
+            quote.reject_reason.as_deref().unwrap_or("adaptive"),
+        );
+        return None;
+    }
+
+    dashboard.event(
+        "info",
+        format!(
+            "adaptive gate passed victim={:?} regime={} relay={} ev_real={:.2}usd threshold={:.2}usd p={:.2} comp={:.2} risk={:.2} builder={:.2} density={:.2} cluster={:.2} latency={:.2} gas_pressure={:.2} comp_penalty={:.2}usd risk_penalty={:.2}usd path_penalty={:.2}usd context_toxicity={:.2}",
+            tx_hash,
+            quote.regime.as_str(),
+            quote.selected_relay.as_deref().unwrap_or("unknown"),
+            quote.ev_real_usd,
+            quote.threshold_dynamic_usd,
+            quote.p_positive,
+            quote.competition_score,
+            quote.risk_score,
+            quote.builder_pressure,
+            quote.mempool_density,
+            quote.cluster_heat,
+            quote.latency_penalty,
+            quote.gas_pressure,
+            quote.competition_penalty_usd,
+            quote.risk_penalty_usd,
+            quote.path_penalty_usd,
+            quote.context_toxicity_score
+        ),
+    );
+
+    let opportunity = build_opportunity(
+        &candidate.tx,
+        &candidate.signal,
+        payload,
+        quote.selected_relay.clone(),
+    );
+    
+    let capital_efficiency = opportunity
+        .execution_payload
+        .as_ref()
+        .map(|payload| {
+            let capital_eth = wei_to_eth_f64(payload.capital_committed_wei).max(1e-9);
+            (quote.ev_real_usd / capital_eth).max(0.0) / config.mev.eth_usd_price.max(1.0)
+        })
+        .unwrap_or_default()
+        .clamp(0.0, 1.0);
+    
+    candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+    candidate
+        .latency_trace
+        .emit(&config, &dashboard, tx_hash, "execution_ready", "adaptive_passed");
+
+    Some(PendingExecutionCandidate {
+        opportunity,
+        ev_real_usd: quote.ev_real_usd,
+        p_positive: quote.p_positive,
+        capital_efficiency,
+        relay_score: quote.builder_pressure,
+        context_priority_score: quote.context_priority_score,
+    })
+}
 
     let ev_gate_started = Instant::now();
     if !passes_ev_gate(
@@ -1037,7 +1330,9 @@ async fn build_payload_with_fallback_parallel(
     signal: SwapSignal,
     gas_price: U256,
     context_signal: ContextSignal,
-) -> Option<crate::mev::execution::payload_builder::ExecutionPayload> {
+    pool_cache: &PoolCache,  // NOVO
+    block_number: u64,       // NOVO
+) -> Option<ExecutionPayload> {
     let mut join_set = JoinSet::new();
     for handle in rpc_fleet.read_candidates(3) {
         let rpc_fleet = rpc_fleet.clone();
@@ -1045,12 +1340,13 @@ async fn build_payload_with_fallback_parallel(
         let signal = signal.clone();
         let config = config.clone();
         let context_signal = context_signal;
+        let pool_cache = pool_cache.clone();
         join_set.spawn(async move {
             rpc_fleet.reserve_read_selection(handle.id);
             let started = Instant::now();
-            match build_payload(provider, &config, &signal, gas_price, context_signal).await {
+            match build_payload(provider, &config, &signal, gas_price, context_signal, &pool_cache, block_number).await {
                 Ok(payload) => {
-                    rpc_fleet.record_success(handle.id, started.elapsed(), None);
+                    rpc_fleet.record_success(handle.id, started.elapsed(), Some(block_number));
                     Some(payload)
                 }
                 Err(err) => {
@@ -1076,49 +1372,41 @@ pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
     signal: &SwapSignal,
     gas_price: U256,
     context_signal: ContextSignal,
-) -> Result<crate::mev::execution::payload_builder::ExecutionPayload, String> {
-    let factory = config
-        .mev
-        .uniswap_v2_factory
-        .ok_or_else(|| "missing uniswap v2 factory".to_string())?;
+    pool_cache: &PoolCache,  // NOVO PARÂMETRO
+    block_number: u64,       // NOVO PARÂMETRO
+) -> Result<ExecutionPayload, String> {
+    let factory = config.mev.uniswap_v2_factory.ok_or_else(|| "missing uniswap v2 factory".to_string())?;
     let recipient = config.profit_address;
-    let token_in = *signal
-        .path
-        .first()
-        .ok_or_else(|| "missing token_in".to_string())?;
-    let token_out = *signal
-        .path
-        .get(1)
-        .ok_or_else(|| "missing token_out".to_string())?;
-    let factory = UniswapV2Factory::new(factory, provider.clone());
-    let pair = factory
+    let token_in = *signal.path.first().ok_or_else(|| "missing token_in".to_string())?;
+    let token_out = *signal.path.get(1).ok_or_else(|| "missing token_out".to_string())?;
+    
+    let factory_contract = UniswapV2Factory::new(factory, provider.clone());
+    let pair = factory_contract
         .get_pair(token_in, token_out)
         .call()
         .await
         .map_err(|err| err.to_string())?;
+    
     if pair == Address::zero() {
         return Err("v2 pair not found".to_string());
     }
 
-    let pair_contract = UniswapV2Pair::new(pair, provider.clone());
-    let token0_method = pair_contract.token_0();
-    let token1_method = pair_contract.token_1();
-    let reserves_method = pair_contract.get_reserves();
-    let token0_call = token0_method.call();
-    let token1_call = token1_method.call();
-    let reserves_call = reserves_method.call();
-    let (token0, token1, reserves) = tokio::try_join!(token0_call, token1_call, reserves_call)
-    .map_err(|err| err.to_string())?;
+    // Usar cache em vez de chamadas RPC diretas
+    let cached_pool = pool_cache.get_or_fetch_v2(pair, provider.clone(), block_number).await
+        .ok_or_else(|| "failed to fetch pool state".to_string())?;
+    
     let pool = V2PoolState {
         pair,
-        token0,
-        token1,
-        reserve0: U256::from(reserves.0),
-        reserve1: U256::from(reserves.1),
+        token0: cached_pool.token0,
+        token1: cached_pool.token1,
+        reserve0: cached_pool.reserve0,
+        reserve1: cached_pool.reserve1,
         fee_bps: 30,
     };
+    
     let capital_available_wei =
         ethers::utils::parse_ether(config.mev.capital_eth.to_string()).map_err(|err| err.to_string())?;
+    
     PayloadBuilder::build_fee_extraction_v2(
         config,
         FeeExtractionBuildInput {
@@ -1146,7 +1434,9 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
     context_signal: ContextSignal,
     fee_tier: u32,
     encoded_path: ethers::types::Bytes,
-) -> Result<crate::mev::execution::payload_builder::ExecutionPayload, String> {
+    pool_cache: &PoolCache,  // NOVO PARÂMETRO
+    block_number: u64,       // NOVO PARÂMETRO
+) -> Result<ExecutionPayload, String> {
     let factory = config
         .mev
         .uniswap_v3_factory
@@ -1160,40 +1450,36 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
         .path
         .get(1)
         .ok_or_else(|| "missing edge token_out".to_string())?;
+    
     let factory = UniswapV3Factory::new(factory, provider.clone());
     let pool = factory
         .get_pool(token_in, token_out, fee_tier)
         .call()
         .await
         .map_err(|err| err.to_string())?;
+    
     if pool == Address::zero() {
         return Err("v3 pool not found".to_string());
     }
 
-    let pool_contract = UniswapV3Pool::new(pool, provider.clone());
-    let token0_method = pool_contract.token_0();
-    let token1_method = pool_contract.token_1();
-    let liquidity_method = pool_contract.liquidity();
-    let slot0_method = pool_contract.slot_0();
-    let token0_call = token0_method.call();
-    let token1_call = token1_method.call();
-    let liquidity_call = liquidity_method.call();
-    let slot0_call = slot0_method.call();
-    let (token0, token1, liquidity, slot0) =
-        tokio::try_join!(token0_call, token1_call, liquidity_call, slot0_call)
-    .map_err(|err| err.to_string())?;
+    // Usar cache em vez de chamadas RPC diretas
+    let cached_pool = pool_cache.get_or_fetch_v3(pool, provider.clone(), block_number).await
+        .ok_or_else(|| "failed to fetch v3 pool state".to_string())?;
+    
     let state = V3PoolState {
         pool,
-        token0,
-        token1,
-        sqrt_price_x96: slot0.0,
-        liquidity: U256::from(liquidity),
-        current_tick: slot0.1,
+        token0: cached_pool.token0,
+        token1: cached_pool.token1,
+        sqrt_price_x96: cached_pool.sqrt_price_x96,
+        liquidity: cached_pool.liquidity,
+        current_tick: cached_pool.current_tick,
         fee_bps: fee_tier as u64 / 100,
         initialized_ticks: Vec::new(),
     };
+    
     let capital_available_wei =
         ethers::utils::parse_ether(config.mev.capital_eth.to_string()).map_err(|err| err.to_string())?;
+    
     PayloadBuilder::build_fee_extraction_v3(
         config,
         FeeExtractionBuildInput {
