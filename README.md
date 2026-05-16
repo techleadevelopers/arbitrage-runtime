@@ -70,6 +70,50 @@ Measured locally via `std::time::Instant` precision hooks under simulated full-l
 
 ---
 
+## Quantitative Framework & Stochastic Execution Mechanics
+
+The runtime's adaptive layer rejects naive static heuristics in favor of formal microstructural modeling, capturing the probabilistic nature of block inclusion and competitive dominance.
+
+### 1. Latency Arbitrage & Post-Victim AMM Topology
+The expected gross edge ($\mathbb{E}[\Delta_{\text{profit}}]$) is modeled as a deterministic function of the displacement of the invariant curve post-victim swap, adjusted for localized transaction queuing decay. For a Uniswap V2 constant-product topology ($x \cdot y = k$):
+
+$$\mathbb{E}[\Delta_{\text{profit}}] = \max_{A_{\text{in}}} \left( \frac{A_{\text{in}} \cdot \gamma \cdot y_{\text{post}}}{x_{\text{post}} + A_{\text{in}} \cdot \gamma} - G_{\text{cost}} \right)$$
+
+Where $\gamma = 1 - \text{fee}$ and $G_{\text{cost}}$ represents the structural network weight. The engine computes the first-order derivative $\frac{\partial \text{PnL}}{\partial A_{\text{in}}} = 0$ locally to determine exact execution size in under $0.82 \text{ ms}$.
+
+### 2. Bayesian Regime Adaptation
+Instead of relying on rolling averages, the threshold multiplier ($\Lambda_t$) dynamically scales via a continuous conjugate Bayesian update framework. The system models the transaction inclusion success rate as a Bernoulli process ($X \sim \text{Bernoulli}(p)$) with a Beta distribution prior:
+
+$$p \sim \text{Beta}(\alpha_t, \beta_t)$$
+
+Upon observing execution outcomes in the persistence layer (SQLite), updates to the hyperparameters occur online:
+
+$$\alpha_{t+1} = \alpha_t + \mathbb{I}(\text{Inclusion}), \quad \beta_{t+1} = \beta_t + \mathbb{I}(\text{Revert} \lor \text{Missed})$$
+
+The operational threshold for the EV Gate adapts based on the posterior expected probability of success $\hat{p} = \frac{\alpha}{\alpha + \beta}$:
+
+$$\text{EV}_{\text{threshold}} = \frac{\text{Base\_Threshold}}{\hat{p}} \cdot \left(1 + \sigma_{\text{latency}}^2\right)$$
+
+This mathematical scaling penalizes volatile nodes or toxic hours ($hour + pair + router$) by structurally expanding the required margin before dispatch.
+
+### 3. Queue Position Modeling & Inclusion Probability
+On direct-RPC environments (Polygon/BNB Chain), inclusion is not a pure function of network speed but a stochastic race for block space priority. The engine models block insertion queues using a non-homogeneous Poisson process. 
+
+The probability $P(I)$ that our transaction is included at block height $H$ before a competitive state mutation occurs is governed by an exponential decay kernel based on the delta between victim observation time ($t_0$) and execution submit timestamp ($t_s$):
+
+$$P(I \mid \Delta t) = e^{-\lambda \cdot (t_s - t_0)} \cdot \left( 1 - \Phi\left( \frac{G_{\text{observed}} - G_{\text{cap}}}{\sigma_{\text{gas}}} \right) \right)$$
+
+Where:
+*   $\lambda$ is the empirical intensity parameter of adversarial mempool density.
+*   $\Phi(z)$ is the standard normal cumulative distribution function representing the probability that a competitor outbids our targeted network boundary ($G_{\text{cap}}$).
+
+### 4. Continuous Reward Mapping (Stochastic Policy)
+The runtime uses a lightweight, model-free policy tracking system to calibrate structural risk parameters across execution pathways. The reward space metric ($R$) formalizes the joint distribution of net returns and pipeline latency:
+
+$$R = \Delta_{\text{realized\_pnl}} \cdot \mathbb{I}(\text{Success}) - \left( c \cdot \Delta t_{\text{finalization}} \cdot G_{\text{price}} \right) \cdot \mathbb{I}(\text{Revert})$$
+
+The engine utilizes this continuous feedback loop to apply gradient adjustments to the pre-flight filters in `adaptive.rs`, optimizing for long-term expected value ($\sum \gamma^k R_{t+k}$) instead of localized execution density.
+
 ## Architecture Diagram
 
 The system operates as a zero-copy, linear, multi-threaded pipeline using bounded asynchronous communication primitives.
