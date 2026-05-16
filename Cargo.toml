@@ -3,6 +3,9 @@ name = "mev-sweeper"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+xdp-ingest = []
+
 [dependencies]
 # Ethers + Flashbots
 ethers = { version = "2.0.14", features = ["rustls", "ws", "abigen", "legacy"] }
@@ -37,12 +40,12 @@ rand = "0.8"
 dotenvy = "0.15"
 axum = "0.7"
 rusqlite = { version = "0.32", features = ["bundled"] }
-revm = "3.5.0"
+revm = { version = "3.5.0", default-features = false, features = ["std"] }
 ndarray = "0.15"
 core_affinity = "0.8"
 
 [target.'cfg(unix)'.dependencies]
-jemallocator = "0.5"
+tikv-jemallocator = "0.5"
 tikv-jemalloc-sys = { version = "0.5", features = ["stats"] }
 io-uring = "0.7"
 
