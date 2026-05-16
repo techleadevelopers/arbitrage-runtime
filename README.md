@@ -96,6 +96,7 @@ The system operates as a zero-copy, linear, multi-threaded pipeline using bounde
           ( Async Executor / Direct-RPC Submission )
             ├── Build Network Payload Array
             └── Dispatch via Dedicated RPC Client Fleet
+``` 
 
 ## Runtime Pipeline
 
