@@ -14,7 +14,7 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-use benchmark::maybe_run_network_benchmark;
+use benchmark::{maybe_run_network_benchmark, maybe_run_runtime_load_test};
 use config::Config;
 use dashboard::DashboardHandle;
 use replay::maybe_run_replay_harness;
@@ -35,6 +35,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Runtime objective: mempool -> AMM impact -> execution -> realized pnl");
 
     let config = Arc::new(Config::load()?);
+    if maybe_run_runtime_load_test(config.clone()).await? {
+        return Ok(());
+    }
+
     let rpc_fleet = Arc::new(RpcFleet::from_config(&config)?);
     let storage = Storage::new(&config.storage_path, &config.network)?;
     let loaded_wallets = load_wallets(&config.wallets, config.chain_id)?;
