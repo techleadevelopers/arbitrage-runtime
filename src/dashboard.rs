@@ -164,6 +164,19 @@ pub struct ExecutionOutcomeSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ToxicitySnapshot {
+    pub hour_utc: u8,
+    pub pair: String,
+    pub router: String,
+    pub samples: u64,
+    pub success_rate: f64,
+    pub miss_rate: f64,
+    pub revert_rate: f64,
+    pub realized_capture: f64,
+    pub toxicity_score: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct DashboardState {
     pub runtime_mode: String,
     pub market_regime: String,
@@ -202,6 +215,7 @@ pub struct DashboardState {
     pub latency_metrics: Vec<LatencyMetric>,
     pub reject_reasons: Vec<RejectReasonSnapshot>,
     pub relay_rankings: Vec<RelaySnapshot>,
+    pub toxicity_profiles: Vec<ToxicitySnapshot>,
     pub treasury_rebalance_trail: Vec<TreasurySnapshot>,
     pub execution_outcomes: Vec<ExecutionOutcomeSnapshot>,
 }
@@ -266,6 +280,7 @@ impl DashboardHandle {
             )
             .collect();
         let relay_rankings = storage.relay_rankings(12).unwrap_or_default();
+        let toxicity_profiles = storage.toxicity_profiles(12).unwrap_or_default();
         let treasury_rebalance_trail = storage.treasury_rebalance_trail(12).unwrap_or_default();
         let execution_outcomes = storage.execution_outcomes(12).unwrap_or_default();
         let (treasury_action, treasury_recommended_amount_eth, treasury_status, treasury_note) =
@@ -326,6 +341,7 @@ impl DashboardHandle {
                 latency_metrics,
                 reject_reasons: Vec::new(),
                 relay_rankings,
+                toxicity_profiles,
                 treasury_rebalance_trail,
                 execution_outcomes,
             })),
@@ -335,7 +351,14 @@ impl DashboardHandle {
     }
 
     pub fn snapshot(&self) -> DashboardState {
-        self.inner.read().expect("dashboard state lock").clone()
+        let mut state = self.inner.read().expect("dashboard state lock").clone();
+        if let Ok(toxicity_profiles) = self.storage.toxicity_profiles(12) {
+            state.toxicity_profiles = toxicity_profiles;
+        }
+        if let Ok(relay_rankings) = self.storage.relay_rankings(12) {
+            state.relay_rankings = relay_rankings;
+        }
+        state
     }
 
     pub fn event(&self, level: &str, message: impl Into<String>) {
@@ -635,6 +658,7 @@ pub async fn run_server(
     let app = Router::new()
         .route("/", get(index))
         .route("/api/status", get(status))
+        .route("/api/export", get(status))
         .with_state(dashboard);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
@@ -1034,6 +1058,18 @@ const INDEX_HTML: &str = r#"<!doctype html>
         </table>
       </div>
     </div>
+
+    <div class="layout">
+      <div class="panel">
+        <strong>Context Toxicity</strong>
+        <table style="margin-top:12px">
+          <thead>
+            <tr><th>Hour</th><th>Router</th><th>Pair</th><th>Samples</th><th>Success</th><th>Miss</th><th>Revert</th><th>Capture</th><th>Toxicity</th></tr>
+          </thead>
+          <tbody id="toxicity-body"></tbody>
+        </table>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -1196,6 +1232,22 @@ const INDEX_HTML: &str = r#"<!doctype html>
           </tr>
         `).join('')
         : '<tr><td colspan="5">No treasury signals yet</td></tr>';
+
+      document.getElementById('toxicity-body').innerHTML = data.toxicity_profiles.length
+        ? data.toxicity_profiles.map(item => `
+          <tr>
+            <td>${item.hour_utc}</td>
+            <td class="mono">${item.router}</td>
+            <td class="mono">${item.pair}</td>
+            <td>${item.samples}</td>
+            <td>${item.success_rate.toFixed(2)}</td>
+            <td>${item.miss_rate.toFixed(2)}</td>
+            <td>${item.revert_rate.toFixed(2)}</td>
+            <td>${item.realized_capture.toFixed(2)}</td>
+            <td>${item.toxicity_score.toFixed(2)}</td>
+          </tr>
+        `).join('')
+        : '<tr><td colspan="9">No contextual toxicity data yet</td></tr>';
     }
 
     refresh().catch(console.error);
