@@ -1347,9 +1347,9 @@ impl AdaptivePolicy {
                 * confidence;
         let stress = (instability * 0.28 + miss * 0.34 + revert * 0.22 + poor_realization * 0.16)
             .clamp(0.0, 1.0);
-        let regime_shift = if profile.samples >= 12 && stress >= 0.82 {
+        let regime_shift = if profile.samples >= 12 && stress >= 0.54 {
             2
-        } else if profile.samples >= 6 && stress >= 0.62 {
+        } else if profile.samples >= 6 && stress >= 0.42 {
             1
         } else if profile.samples >= 12
             && stress <= 0.18
@@ -1573,6 +1573,302 @@ impl Default for RelayContextStats {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct HiddenMarkovModel {
+    transition_matrix: ndarray::Array2<f64>,
+    emission_matrix: ndarray::Array2<f64>,
+    initial_distribution: ndarray::Array1<f64>,
+    current_belief: ndarray::Array1<f64>,
+}
+
+impl HiddenMarkovModel {
+    pub fn new(num_states: usize, num_observations: usize) -> Self {
+        let states = num_states.max(1);
+        let observations = num_observations.max(1);
+        Self {
+            transition_matrix: ndarray::Array2::from_elem((states, states), 1.0 / states as f64),
+            emission_matrix: ndarray::Array2::from_elem(
+                (states, observations),
+                1.0 / observations as f64,
+            ),
+            initial_distribution: ndarray::Array1::from_elem(states, 1.0 / states as f64),
+            current_belief: ndarray::Array1::from_elem(states, 1.0 / states as f64),
+        }
+    }
+
+    pub fn forward_algorithm(&self, observations: &[usize]) -> f64 {
+        if observations.is_empty() {
+            return 1.0;
+        }
+        let t_len = observations.len();
+        let states = self.transition_matrix.shape()[0];
+        let obs_count = self.emission_matrix.shape()[1];
+        let mut alpha = ndarray::Array2::zeros((t_len, states));
+
+        for i in 0..states {
+            let obs = observations[0].min(obs_count - 1);
+            alpha[[0, i]] = self.initial_distribution[i] * self.emission_matrix[[i, obs]];
+        }
+        normalize_row(&mut alpha, 0);
+
+        for t in 1..t_len {
+            let obs = observations[t].min(obs_count - 1);
+            for j in 0..states {
+                let sum = (0..states)
+                    .map(|i| alpha[[t - 1, i]] * self.transition_matrix[[i, j]])
+                    .sum::<f64>();
+                alpha[[t, j]] = sum * self.emission_matrix[[j, obs]];
+            }
+            normalize_row(&mut alpha, t);
+        }
+
+        (0..states).map(|i| alpha[[t_len - 1, i]]).sum::<f64>().clamp(0.0, 1.0)
+    }
+
+    pub fn baum_welch(&mut self, observations: &[usize], max_iter: usize, tol: f64) {
+        if observations.len() < 2 {
+            return;
+        }
+        let states = self.transition_matrix.shape()[0];
+        let obs_count = self.emission_matrix.shape()[1];
+        let t_len = observations.len();
+        let mut previous_likelihood = f64::NEG_INFINITY;
+
+        for _ in 0..max_iter {
+            let mut alpha = ndarray::Array2::zeros((t_len, states));
+            let mut beta = ndarray::Array2::ones((t_len, states));
+
+            for i in 0..states {
+                let obs = observations[0].min(obs_count - 1);
+                alpha[[0, i]] = self.initial_distribution[i] * self.emission_matrix[[i, obs]];
+            }
+            normalize_row(&mut alpha, 0);
+            for t in 1..t_len {
+                let obs = observations[t].min(obs_count - 1);
+                for j in 0..states {
+                    let sum = (0..states)
+                        .map(|i| alpha[[t - 1, i]] * self.transition_matrix[[i, j]])
+                        .sum::<f64>();
+                    alpha[[t, j]] = sum * self.emission_matrix[[j, obs]];
+                }
+                normalize_row(&mut alpha, t);
+            }
+
+            for t in (0..t_len - 1).rev() {
+                let next_obs = observations[t + 1].min(obs_count - 1);
+                for i in 0..states {
+                    beta[[t, i]] = (0..states)
+                        .map(|j| {
+                            self.transition_matrix[[i, j]]
+                                * self.emission_matrix[[j, next_obs]]
+                                * beta[[t + 1, j]]
+                        })
+                        .sum::<f64>();
+                }
+                normalize_row(&mut beta, t);
+            }
+
+            let mut new_transition = ndarray::Array2::zeros((states, states));
+            let mut new_emission = ndarray::Array2::zeros((states, obs_count));
+            let mut new_initial = ndarray::Array1::zeros(states);
+
+            for t in 0..t_len {
+                let gamma_den = (0..states)
+                    .map(|i| alpha[[t, i]] * beta[[t, i]])
+                    .sum::<f64>()
+                    .max(1e-12);
+                let obs = observations[t].min(obs_count - 1);
+                for i in 0..states {
+                    let gamma = alpha[[t, i]] * beta[[t, i]] / gamma_den;
+                    if t == 0 {
+                        new_initial[i] = gamma;
+                    }
+                    new_emission[[i, obs]] += gamma;
+                    if t + 1 < t_len {
+                        let next_obs = observations[t + 1].min(obs_count - 1);
+                        for j in 0..states {
+                            new_transition[[i, j]] += gamma
+                                * self.transition_matrix[[i, j]]
+                                * self.emission_matrix[[j, next_obs]];
+                        }
+                    }
+                }
+            }
+
+            normalize_matrix_rows(&mut new_transition);
+            normalize_matrix_rows(&mut new_emission);
+            normalize_vector(&mut new_initial);
+
+            self.transition_matrix = new_transition;
+            self.emission_matrix = new_emission;
+            self.initial_distribution = new_initial;
+
+            let likelihood = self.forward_algorithm(observations);
+            if (likelihood - previous_likelihood).abs() < tol {
+                break;
+            }
+            previous_likelihood = likelihood;
+        }
+    }
+
+    pub fn filter(&mut self, observation: usize) -> ndarray::Array1<f64> {
+        let states = self.transition_matrix.shape()[0];
+        let obs = observation.min(self.emission_matrix.shape()[1] - 1);
+        let mut next = ndarray::Array1::zeros(states);
+        for j in 0..states {
+            next[j] = (0..states)
+                .map(|i| self.current_belief[i] * self.transition_matrix[[i, j]])
+                .sum::<f64>()
+                * self.emission_matrix[[j, obs]];
+        }
+        normalize_vector(&mut next);
+        self.current_belief = next.clone();
+        next
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BetaDistribution {
+    alpha: f64,
+    beta: f64,
+}
+
+impl BetaDistribution {
+    pub fn new(alpha: f64, beta: f64) -> Self {
+        Self {
+            alpha: alpha.max(1e-6),
+            beta: beta.max(1e-6),
+        }
+    }
+
+    pub fn update(&mut self, success: bool) {
+        if success {
+            self.alpha += 1.0;
+        } else {
+            self.beta += 1.0;
+        }
+    }
+
+    pub fn mean(&self) -> f64 {
+        self.alpha / (self.alpha + self.beta)
+    }
+
+    pub fn variance(&self) -> f64 {
+        (self.alpha * self.beta)
+            / ((self.alpha + self.beta).powi(2) * (self.alpha + self.beta + 1.0))
+    }
+
+    pub fn lower_confidence_bound(&self, z: f64) -> f64 {
+        (self.mean() - z.abs() * self.variance().sqrt()).clamp(0.0, 1.0)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct HjbSolver {
+    value_function: ndarray::Array1<f64>,
+    optimal_policy: ndarray::Array1<f64>,
+    dt: f64,
+}
+
+impl HjbSolver {
+    pub fn new(state_dim: usize, dt: f64) -> Self {
+        let dim = state_dim.max(1);
+        Self {
+            value_function: ndarray::Array1::zeros(dim),
+            optimal_policy: ndarray::Array1::zeros(dim),
+            dt: dt.max(1e-6),
+        }
+    }
+
+    pub fn solve(&mut self, reward_fn: impl Fn(usize, f64) -> f64, max_iter: usize) {
+        for _ in 0..max_iter {
+            let mut next_value = ndarray::Array1::zeros(self.value_function.len());
+            for state in 0..self.value_function.len() {
+                let mut best_value = f64::NEG_INFINITY;
+                let mut best_action = 0.0;
+                for action_step in 0..=100 {
+                    let action = action_step as f64 / 100.0;
+                    let next_state = ((state as f64 + action * self.dt).round() as usize)
+                        .min(self.value_function.len() - 1);
+                    let value = reward_fn(state, action) + self.dt * self.value_function[next_state];
+                    if value > best_value {
+                        best_value = value;
+                        best_action = action;
+                    }
+                }
+                next_value[state] = best_value;
+                self.optimal_policy[state] = best_action;
+            }
+            let diff = (&next_value - &self.value_function).mapv(f64::abs).sum();
+            self.value_function = next_value;
+            if diff < 1e-6 {
+                break;
+            }
+        }
+    }
+
+    pub fn get_optimal_action(&self, state: usize) -> f64 {
+        self.optimal_policy[state.min(self.optimal_policy.len() - 1)]
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct InclusionPoissonProcess {
+    lambda: f64,
+    last_observation: Instant,
+}
+
+impl InclusionPoissonProcess {
+    pub fn new(initial_lambda: f64) -> Self {
+        Self {
+            lambda: initial_lambda.clamp(0.01, 100.0),
+            last_observation: Instant::now(),
+        }
+    }
+
+    pub fn inclusion_probability(&self, delta_ms: f64) -> f64 {
+        (1.0 - (-self.lambda * delta_ms.max(0.0) / 1000.0).exp()).clamp(0.0, 1.0)
+    }
+
+    pub fn update_lambda(&mut self, inclusion_observed: bool, delta_ms: f64) {
+        let observed_lambda = if inclusion_observed && delta_ms > 0.0 {
+            1000.0 / delta_ms
+        } else {
+            0.0
+        };
+        self.lambda = (self.lambda * 0.9 + observed_lambda * 0.1).clamp(0.01, 100.0);
+        self.last_observation = Instant::now();
+    }
+
+    pub fn lambda(&self) -> f64 {
+        self.lambda
+    }
+}
+
+fn normalize_row(matrix: &mut ndarray::Array2<f64>, row: usize) {
+    let sum = matrix.row(row).sum();
+    if sum > 0.0 {
+        for value in matrix.row_mut(row) {
+            *value /= sum;
+        }
+    }
+}
+
+fn normalize_matrix_rows(matrix: &mut ndarray::Array2<f64>) {
+    for row in 0..matrix.shape()[0] {
+        normalize_row(matrix, row);
+    }
+}
+
+fn normalize_vector(vector: &mut ndarray::Array1<f64>) {
+    let sum = vector.sum();
+    if sum > 0.0 {
+        for value in vector.iter_mut() {
+            *value /= sum;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1591,6 +1887,7 @@ mod tests {
                 _ => 1,
             },
             allow_send: true,
+            tenderly_rpc_only: false,
             alchemy_keys: vec!["test".to_string()],
             infura_ids: Vec::new(),
             flashbots_relay: "https://relay.flashbots.net".to_string(),
