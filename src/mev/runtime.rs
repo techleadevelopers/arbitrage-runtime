@@ -661,28 +661,30 @@ async fn validate_with_evm_preflight(
         }
     }
     
-    // Configurar a simulação - CORRIGIR a conversão do min_profit_wei
-    let min_profit_wei_value = (config.mev.min_net_profit_eth * 1e18) as u64;
-    
-    let simulation_config = crate::mev::simulation::evm_simulator::EvmSimulationConfig {
-        fork_block_number: block_number,
-        gas_limit: payload.gas_limit,
-        tx_value: payload.value,
-        profit_recipient: payload.profit_recipient,
-        min_profit_wei: U256::from(min_profit_wei_value),
+    if let Some(executor) = config.mev.mev_executor {
+        account_states.entry(executor).or_insert_with(AccountState::empty);
+    }
+    account_states
+        .entry(config.profit_address)
+        .or_insert_with(AccountState::empty);
+
+    let mock_tx = Transaction {
+        hash: victim_tx.hash,
+        nonce: victim_tx.nonce,
+        block_hash: None,
+        block_number: None,
+        transaction_index: None,
+        from: config.executor_address,
+        to: Some(payload.target_contract),
+        value: payload.value,
+        gas_price: Some(victim_tx.max_fee_per_gas.or(victim_tx.gas_price).unwrap_or_default()),
+        gas: U256::from(payload.gas_limit),
+        input: payload.calldata.clone(),
+        chain_id: Some(U256::from(config.chain_id)),
         ..Default::default()
     };
-    
-    // Executar a simulação
-    let simulator = StateSimulator::new(provider);
-    let result = simulator.simulate_mev_opportunity(
-        &payload.calldata,
-        payload.target_contract,
-        simulation_config,
-        account_states,
-    ).await?;
-    
-    Ok(result)
+
+    StateSimulator::evm_preflight_execution(config, &mock_tx, block_number, account_states).await
 }
 
 async fn process_evaluation_task(
@@ -782,7 +784,7 @@ async fn process_evaluation_task(
         candidate.signal.clone(),
         candidate.gas_price,
         candidate.context_signal,
-        &pool_cache,
+        pool_cache.clone(),
         candidate.block_number,
     )
     .await?;
@@ -815,15 +817,15 @@ async fn process_evaluation_task(
                 let preflight_elapsed = preflight_started.elapsed();
                 candidate.latency_trace.adaptive_preflight_us = Some(elapsed_us(preflight_started));
                 
-                if !preflight_result.should_proceed {
+                if !preflight_result.success {
                     candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
-                    dashboard.record_reject_reason("evm_preflight", preflight_result.reject_reason.as_deref().unwrap_or("preflight_failed"));
+                    dashboard.record_reject_reason("evm_preflight", preflight_result.revert_reason.as_deref().unwrap_or("preflight_failed"));
                     candidate.latency_trace.emit(
                         &config,
                         &dashboard,
                         tx_hash,
                         "reject",
-                        preflight_result.reject_reason.as_deref().unwrap_or("evm_preflight"),
+                        preflight_result.revert_reason.as_deref().unwrap_or("evm_preflight"),
                     );
                     return None;
                 }
@@ -833,8 +835,8 @@ async fn process_evaluation_task(
                     format!(
                         "evm preflight passed victim={:?} execution_cost_gas={} simulated_profit_wei={} preflight_ms={}",
                         tx_hash,
-                        preflight_result.execution_gas_used,
-                        preflight_result.simulated_profit_wei,
+                        preflight_result.gas_used,
+                        preflight_result.profit_wei,
                         preflight_elapsed.as_millis()
                     ),
                 );
@@ -1177,9 +1179,13 @@ pub(crate) async fn build_payload<M: Middleware + 'static>(
     signal: &SwapSignal,
     gas_price: U256,
     context_signal: ContextSignal,
+    pool_cache: &PoolCache,
+    block_number: u64,
 ) -> Result<crate::mev::execution::payload_builder::ExecutionPayload, String> {
     match &signal.kind {
-        SwapKind::V2 => build_v2_payload(provider, config, signal, gas_price, context_signal).await,
+        SwapKind::V2 => {
+            build_v2_payload(provider, config, signal, gas_price, context_signal, pool_cache, block_number).await
+        }
         SwapKind::V3 {
             fee_tier,
             encoded_path,
@@ -1193,6 +1199,8 @@ pub(crate) async fn build_payload<M: Middleware + 'static>(
                 context_signal,
                 *fee_tier,
                 encoded_path.clone(),
+                pool_cache,
+                block_number,
             )
             .await
         }
@@ -1205,7 +1213,7 @@ async fn build_payload_with_fallback_parallel(
     signal: SwapSignal,
     gas_price: U256,
     context_signal: ContextSignal,
-    pool_cache: &PoolCache,  // NOVO
+    pool_cache: Arc<PoolCache>,  // NOVO
     block_number: u64,       // NOVO
 ) -> Option<ExecutionPayload> {
     let mut join_set = JoinSet::new();
@@ -1538,6 +1546,9 @@ fn estimate_notional_wei(
 
 fn selector(tx: &Transaction) -> Option<[u8; 4]> {
     let input = tx.input.as_ref();
+    if let Some(index) = crate::mev::decoder::simd::find_selector(input) {
+        return Some(crate::mev::decoder::simd::SELECTORS[index]);
+    }
     (input.len() >= 4).then(|| [input[0], input[1], input[2], input[3]])
 }
 
