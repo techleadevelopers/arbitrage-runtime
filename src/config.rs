@@ -43,6 +43,7 @@ pub struct Config {
     pub rpc_send_preference: RpcPreference,
     pub storage_path: PathBuf,
     pub dashboard_addr: SocketAddr,
+    pub explicit_rpc_urls: Vec<String>,
     pub mempool_ws_urls: Vec<String>,
     pub mev: MevConfig,
 }
@@ -208,6 +209,7 @@ impl Config {
         let dashboard_addr = env::var("DASHBOARD_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:8787".to_string())
             .parse::<SocketAddr>()?;
+        let explicit_rpc_urls = parse_rpc_urls(&network);
         let mempool_ws_urls = parse_mempool_ws_urls(&network, tenderly_rpc_only, &alchemy_keys);
         let mev = MevConfig {
             enabled: env::var("MEV_ENGINE_ENABLED")
@@ -327,6 +329,7 @@ impl Config {
             rpc_send_preference,
             storage_path,
             dashboard_addr,
+            explicit_rpc_urls,
             mempool_ws_urls,
             mev,
         })
@@ -340,7 +343,12 @@ impl Config {
                 .unwrap_or_default();
         }
 
-        let mut urls = Vec::with_capacity(self.infura_ids.len() + self.alchemy_keys.len());
+        let mut urls = Vec::with_capacity(
+            self.explicit_rpc_urls.len() + self.infura_ids.len() + self.alchemy_keys.len(),
+        );
+        for (idx, rpc_url) in self.explicit_rpc_urls.iter().enumerate() {
+            urls.push((format!("rpc-{}", idx + 1), rpc_url.clone()));
+        }
         for (idx, alchemy_key) in self.alchemy_keys.iter().enumerate() {
             if let Some(alchemy_url) = alchemy_url_for_network(&self.network, alchemy_key) {
                 urls.push((format!("alchemy-{}", idx + 1), alchemy_url));
@@ -443,26 +451,28 @@ fn parse_alchemy_keys() -> Vec<String> {
 fn parse_mempool_ws_urls(network: &str, tenderly_rpc_only: bool, alchemy_keys: &[String]) -> Vec<String> {
     let mut urls: Vec<String> = Vec::new();
 
-    if let Ok(value) = env::var("MEMPOOL_WS_URL") {
-        for item in value.split(',').map(str::trim).filter(|value| !value.is_empty()) {
-            if !urls
-                .iter()
-                .any(|existing: &String| existing.eq_ignore_ascii_case(item))
-            {
-                urls.push(item.to_string());
-            }
-        }
-    }
-
-    for idx in 2..=6 {
-        if let Ok(value) = env::var(format!("MEMPOOL_WS_URL_{idx}")) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty()
-                && !urls
+    for key in prioritized_network_keys(
+        network,
+        &[
+            "MEMPOOL_WS_URL",
+            "MEMPOOL_WS_URL_2",
+            "MEMPOOL_WS_URL_3",
+            "MEMPOOL_WS_URL_4",
+            "MEMPOOL_WS_URL_5",
+            "MEMPOOL_WS_URL_6",
+            "MEMPOOL_WS_URL_BSC",
+            "MEMPOOL_WS_URL_BNB",
+            "MEMPOOL_WS_URL_POLYGON",
+        ],
+    ) {
+        if let Ok(value) = env::var(key) {
+            for item in value.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+                if !urls
                     .iter()
-                    .any(|existing: &String| existing.eq_ignore_ascii_case(trimmed))
-            {
-                urls.push(trimmed.to_string());
+                    .any(|existing: &String| existing.eq_ignore_ascii_case(item))
+                {
+                    urls.push(item.to_string());
+                }
             }
         }
     }
@@ -475,6 +485,34 @@ fn parse_mempool_ws_urls(network: &str, tenderly_rpc_only: bool, alchemy_keys: &
         }
     }
 
+    urls
+}
+
+fn parse_rpc_urls(network: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    for key in prioritized_network_keys(
+        network,
+        &[
+            "RPC_URL",
+            "RPC_URL_2",
+            "RPC_URL_3",
+            "RPC_URL_4",
+            "RPC_URL_BSC",
+            "RPC_URL_BNB",
+            "RPC_URL_POLYGON",
+        ],
+    ) {
+        if let Ok(value) = env::var(key) {
+            for item in value.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+                if !urls
+                    .iter()
+                    .any(|existing: &String| existing.eq_ignore_ascii_case(item))
+                {
+                    urls.push(item.to_string());
+                }
+            }
+        }
+    }
     urls
 }
 
