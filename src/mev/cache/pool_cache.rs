@@ -2,9 +2,9 @@
 use ethers::types::{Address, U256};
 use ethers::providers::Middleware;
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime};
-use tracing::warn;
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct CachedV2Pool {
@@ -36,11 +36,44 @@ struct PoolCacheEntry<T> {
     block_number: u64,
 }
 
+#[repr(align(64))]
+pub struct CacheAligned<T> {
+    data: T,
+}
+
+impl<T> CacheAligned<T> {
+    pub fn new(data: T) -> Self {
+        Self { data }
+    }
+
+    pub fn get(&self) -> &T {
+        &self.data
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.data
+    }
+}
+
+impl<T> Deref for CacheAligned<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl<T> DerefMut for CacheAligned<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.data
+    }
+}
+
 pub struct PoolCache {
-    v2_pools: Arc<RwLock<HashMap<Address, PoolCacheEntry<CachedV2Pool>>>>,
-    v3_pools: Arc<RwLock<HashMap<Address, PoolCacheEntry<CachedV3Pool>>>>,
+    v2_pools: Arc<CacheAligned<RwLock<HashMap<Address, PoolCacheEntry<CachedV2Pool>>>>>,
+    v3_pools: Arc<CacheAligned<RwLock<HashMap<Address, PoolCacheEntry<CachedV3Pool>>>>>,
     ttl_ms: u64,
-    stats: Arc<RwLock<CacheStats>>,
+    stats: Arc<CacheAligned<RwLock<CacheStats>>>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -56,10 +89,10 @@ pub struct CacheStats {
 impl PoolCache {
     pub fn new(ttl_ms: u64) -> Self {
         Self {
-            v2_pools: Arc::new(RwLock::new(HashMap::new())),
-            v3_pools: Arc::new(RwLock::new(HashMap::new())),
+            v2_pools: Arc::new(CacheAligned::new(RwLock::new(HashMap::new()))),
+            v3_pools: Arc::new(CacheAligned::new(RwLock::new(HashMap::new()))),
             ttl_ms,
-            stats: Arc::new(RwLock::new(CacheStats::default())),
+            stats: Arc::new(CacheAligned::new(RwLock::new(CacheStats::default()))),
         }
     }
 
@@ -86,13 +119,12 @@ impl PoolCache {
         }
 
         // Cache miss or stale - fetch fresh
-        let mut stats = self.stats.write().unwrap();
-        stats.v2_misses += 1;
-        drop(stats);
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.v2_misses += 1;
+        }
 
-        use crate::mev::runtime::{UniswapV2Factory, UniswapV2Pair};
-        let factory_addr = todo!("get from config");
-        let factory = UniswapV2Factory::new(factory_addr, provider.clone());
+        use crate::mev::runtime::UniswapV2Pair;
         
         // Fetch pair info
         let token0_fut = UniswapV2Pair::new(pair, provider.clone()).token_0();
@@ -144,9 +176,10 @@ impl PoolCache {
             }
         }
 
-        let mut stats = self.stats.write().unwrap();
-        stats.v3_misses += 1;
-        drop(stats);
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.v3_misses += 1;
+        }
 
         // Fetch fresh V3 pool data
         use crate::mev::runtime::UniswapV3Pool;
