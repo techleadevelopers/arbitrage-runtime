@@ -21,6 +21,8 @@ The load-test harness is intentionally narrower than a live runtime profile. It 
 
 ## Regeneration
 
+For a copyable environment template, see `runtime-load-test.env.example`.
+
 Baseline:
 
 ```bash
