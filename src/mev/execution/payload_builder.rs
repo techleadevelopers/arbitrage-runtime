@@ -1,3 +1,5 @@
+// Arquivo: src/mev/execution/payload_builder.rs
+
 use crate::config::Config;
 use crate::mev::amm::uniswap_v2::{
     amount_out_exact_in, select_best_size_candidate, size_candidates, SizeCandidate,
@@ -31,6 +33,8 @@ pub struct ExecutionPayload {
     pub price_impact_bps: u64,
     pub profit_token: Address,
     pub profit_recipient: Address,
+    // NOVO: Estado do pool antes da execução para EVM preflight
+    pub pool_state_before: AmmState,
 }
 
 #[derive(Debug, Clone)]
@@ -51,13 +55,19 @@ pub struct FeeExtractionBuildInput {
 
 pub struct PayloadBuilder;
 
+impl ExecutionPayload {
+    pub fn pool_state_clone(&self) -> AmmState {
+        self.pool_state_before.clone()
+    }
+}
+
 impl PayloadBuilder {
     pub fn build_fee_extraction_v2(
         config: &Config,
         input: FeeExtractionBuildInput,
     ) -> Result<ExecutionPayload, String> {
         let post_victim = StateSimulator::simulate_victim_exact_in(
-            input.state_before,
+            input.state_before.clone(),
             input.token_in,
             input.token_out,
             input.victim_amount_in,
@@ -162,6 +172,7 @@ impl PayloadBuilder {
             price_impact_bps,
             profit_token: input.token_in,
             profit_recipient: input.recipient,
+            pool_state_before: input.state_before,
         })
     }
 
@@ -178,7 +189,7 @@ impl PayloadBuilder {
             _ => Bytes::new(),
         };
         let post_victim = StateSimulator::simulate_victim_exact_in(
-            input.state_before,
+            input.state_before.clone(),
             input.token_in,
             input.token_out,
             input.victim_amount_in,
@@ -287,6 +298,7 @@ impl PayloadBuilder {
             price_impact_bps,
             profit_token: input.token_in,
             profit_recipient: input.recipient,
+            pool_state_before: input.state_before,
         })
     }
 }
