@@ -135,6 +135,20 @@ Instead of relying only on static thresholds, the runtime persists execution out
 
 The practical effect is simple: volatile nodes, toxic hours, weak relays, and bad router/pair contexts require more margin before dispatch.
 
+The operational EV threshold can be represented in GitHub-safe math as:
+
+$$
+\mathrm{EV}_{\mathrm{threshold}}
+= \frac{\mathrm{BaseThreshold}}{\hat{p}}
+\cdot \left(1 + \sigma_{\mathrm{latency}}^{2}\right)
+$$
+
+Where:
+
+- $\hat{p}$ is the observed probability of successful execution for the relevant context.
+- $\sigma_{\mathrm{latency}}^{2}$ is the variance penalty from observed lookup, submit, or finalization latency.
+- $\mathrm{BaseThreshold}$ is the configured minimum margin before contextual scaling.
+
 ### 3. Inclusion and Gas Discipline
 On direct-RPC environments such as Polygon and BNB Chain, inclusion is not a pure function of local speed. Gas caps, endpoint quality, current pressure, and competing state mutations matter.
 
@@ -154,6 +168,25 @@ The runtime uses persisted outcomes to calibrate structural risk parameters acro
 `dispatch decision -> submit result -> inclusion/revert/miss -> realized PnL -> persistence -> future threshold calibration`
 
 This feedback loop is what makes the system stateful. It is more important than any single formula because it lets the runtime learn which contexts are structurally toxic.
+
+A compact reward mapping for post-execution calibration is:
+
+$$
+R =
+\Delta_{\mathrm{realizedPnL}} \cdot \mathbf{1}_{\mathrm{success}}
+-
+\left(
+  c \cdot \Delta t_{\mathrm{finalization}} \cdot G_{\mathrm{price}}
+\right)
+\cdot \mathbf{1}_{\mathrm{revert}}
+$$
+
+Where:
+
+- $\Delta_{\mathrm{realizedPnL}}$ is realized PnL delta after gas and execution costs.
+- $\Delta t_{\mathrm{finalization}}$ is the observed finalization delay.
+- $G_{\mathrm{price}}$ is observed gas price.
+- $c$ is a calibration coefficient for latency and gas drag.
 
 ## Experimental Research and Systems Modules
 
@@ -1020,9 +1053,75 @@ This mode is useful for:
 
 ## Benchmarking
 
-The project also includes a network benchmark mode for infrastructure validation.
+The project includes two benchmark modes: one for hot-path runtime latency and one for network infrastructure validation.
 
-It measures:
+### Runtime load test
+
+This is the production-style latency test for the synchronous decision path. It is offline and synthetic by design: no RPC, no payload lookup, no relay submission. It measures the path that must stay extremely fast:
+
+- selector decode
+- cheap preflight gate
+- adaptive preflight
+- adaptive relay quote
+- total hot-gate latency
+
+Run:
+
+```bash
+RUN_RUNTIME_LOAD_TEST=true RUNTIME_LOAD_TEST_CASES=100000 cargo run --release -- --network polygon
+```
+
+Adversarial robustness profile:
+
+```bash
+RUN_RUNTIME_LOAD_TEST=true RUNTIME_LOAD_TEST_PROFILE=adversarial RUNTIME_LOAD_TEST_CASES=100000 cargo run --release -- --network polygon
+```
+
+Useful knobs:
+
+- `RUNTIME_LOAD_TEST_CASES`: measured synthetic transactions, default `100000`
+- `RUNTIME_LOAD_TEST_WARMUP`: warmup transactions excluded from the report, default `5000`
+- `RUNTIME_LOAD_TEST_CONCURRENCY`: worker count, default CPU parallelism
+- `RUNTIME_LOAD_TEST_PROFILE`: `baseline` or `adversarial`
+- `RUNTIME_LOAD_TEST_ADVERSARIAL`: legacy boolean switch for adversarial mode
+- `RUNTIME_LOAD_TEST_GAS_PRICE_GWEI`: synthetic victim gas price, default chain baseline
+- `RUNTIME_LOAD_TEST_LATENCY_BUDGET_US`: p99 budget for total hot-gate latency, default `250`
+- `RUNTIME_LOAD_TEST_OUTPUT_PATH`: optional JSON export path
+
+Baseline output reports throughput, pass/reject rates, and p50/p95/p99/max latency per stage. Treat this as the latency baseline for the core runtime. Full replay and network benchmarks remain separate because RPC, state lookup, relay behavior, and fork simulation measure different risks.
+
+The adversarial profile mixes:
+
+- malformed calldata
+- unknown function selectors
+- small-notional spam
+- toxic gas pressure
+- long paths
+- repeated cluster bursts
+- valid opportunities
+
+Runtime load test metrics:
+
+- `throughput_tps`: measured synthetic transaction throughput
+- `budget_pass`: whether `total_hot_gate.p99` stayed under `RUNTIME_LOAD_TEST_LATENCY_BUDGET_US`
+- `rejection_rate`: total rejected cases across decode, fast preflight, adaptive preflight, and quote
+- `malformed_rejection_rate`: malformed calldata rejection coverage
+- `small_notional_rejection_rate`: spam/small-size rejection coverage
+- `toxic_gas_rejection_rate`: high-gas rejection coverage
+- `long_path_rejection_rate`: path-complexity rejection coverage
+- `cluster_burst_rejection_rate`: burst/cluster pressure rejection coverage
+- `scenarios`: per-scenario counts for processed, decoded, stage rejects, and final passes
+- `decode`: latency summary for selector and calldata decode
+- `fast_preflight`: latency summary for cheap deterministic rejection
+- `adaptive_preflight`: latency summary for stateful adaptive rejection
+- `adaptive_quote`: latency summary for relay-aware adaptive quote
+- `total_hot_gate`: end-to-end synchronous hot-gate latency
+
+When this mode is enabled, placeholder credentials and placeholder addresses are ignored and replaced by synthetic local-only values before the benchmark starts. Normal runtime, replay, network benchmark, and execution paths keep the regular configuration validation.
+
+### Network benchmark
+
+Network benchmark mode is for infrastructure validation. It measures:
 
 - RPC latency and stability
 - endpoint-specific probe performance
