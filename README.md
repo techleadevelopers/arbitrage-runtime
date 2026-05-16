@@ -34,6 +34,40 @@ Operationally, it behaves as:
 
 `always scanning -> mostly rejecting -> occasionally executing`
 
+## Product Positioning
+
+The practical edge of this project is operational intelligence, not academic quant modeling.
+
+The core product claim is:
+
+`stateful adaptive rejection + deterministic AMM modeling + execution discipline + capital preservation`
+
+The runtime is intentionally built to reject most flow. That is a feature, not a limitation. In fee extraction, avoiding bad dispatches, reverts, stale opportunities, gas bleed, and toxic router/pair/hour contexts is often more valuable than maximizing raw execution count.
+
+The live path should stay fast and simple:
+
+- decode the pending swap
+- reject cheap failures early
+- reconstruct the relevant AMM state
+- estimate deterministic impact
+- apply gas, EV, quality, and exposure gates
+- use cached historical toxicity and relay/direct-RPC health
+- dispatch only when the path still has enough margin
+
+The slower research path exists for calibration:
+
+- replay harness
+- historical profiles
+- relay metrics
+- reject reason analysis
+- latency histograms
+- realized PnL versus expected PnL
+- estimated gas waste avoided by rejection gates
+- router/pair/hour toxicity tables
+- optional model experiments
+
+Experimental HMM, HJB, Poisson, and Bayesian utilities may exist in the codebase, but they are not the center of the production edge unless profiling proves they improve realized net PnL without hurting dispatch latency.
+
 ## Design Principles
 
 The codebase is organized around a narrow production objective:
@@ -52,10 +86,12 @@ The runtime is adversarial by design. It assumes:
 - accepted bundles can still miss inclusion
 - historical behavior by router/pair/hour contains useful signal
 
-## Performance & Operational Benchmarks
+## Performance & Operational Evidence
+
+Performance numbers should be treated as operational evidence only when backed by local benchmark output, replay output, or live dashboard screenshots. The most useful evidence for this system is not theoretical complexity; it is measured rejection quality, latency, inclusion quality, gas avoided, and realized outcome tracking.
 
 ### 1. Internal Execution Stats (Local Latency Profile)
-Measured locally via `std::time::Instant` precision hooks under simulated full-load profiles:
+Measured locally via `std::time::Instant` precision hooks under simulated or replayed load profiles:
 *   **Mempool Ingestion to Decoding (`runtime.rs`):** $< 1.15 \text{ ms}$
 *   **Post-Victim Impact Modeling & Sizing (`payload_builder.rs`):** $< 0.82 \text{ ms}$
 *   **EV/Gas Gate & Payload Serialization (`executor.rs`):** $< 0.48 \text{ ms}$
@@ -65,70 +101,90 @@ Measured locally via `std::time::Instant` precision hooks under simulated full-l
 *   **Peak Message Processing:** $15,000+ \text{ transactions/second}$ (simulated via high-density historical Polygon mempool dumps).
 *   **Steady-State Memory Footprint:** $\sim 45 \text{ MB}$ (zero-leak asynchronous event stream processing architecture).
 
-### 3. Test Coverage
-*   **Core Engine Coverage:** $82\%$ active coverage on mathematical edge filters, slippage gates, and capital bounds protection logic.
+### 3. Verification Surface
+*   **Core Tests:** `cargo test` validates AMM math, adaptive gates, capital controls, and storage aggregation.
+*   **Replay Evidence:** replay output reports decode rate, gate pass rates, false positives/negatives, realized versus expected profit, estimated gas avoided, and contextual toxicity.
+*   **Runtime Evidence:** dashboard JSON export and screenshots should be preferred over unsupported percentage coverage claims.
 
 ---
 
-## Quantitative Framework & Stochastic Execution Mechanics
+## Operational Decision Framework
 
-The runtime's adaptive layer rejects naive static heuristics in favor of formal microstructural modeling, capturing the probabilistic nature of block inclusion and competitive dominance.
+The runtime's adaptive layer is a practical rejection engine. Its job is to keep bad flow out of the execution path while allowing high-quality opportunities to reach payload construction and dispatch.
 
-### 1. Latency Arbitrage & Post-Victim AMM Topology
-The expected gross edge ($\mathbb{E}[\Delta_{\text{profit}}]$) is modeled as a deterministic function of the displacement of the invariant curve post-victim swap, adjusted for localized transaction queuing decay. For a Uniswap V2 constant-product topology ($x \cdot y = k$):
+The production decision model is intentionally based on signals that can be measured and replayed:
 
-$$\mathbb{E}[\Delta_{\text{profit}}] = \max_{A_{\text{in}}} \left( \frac{A_{\text{in}} \cdot \gamma \cdot y_{\text{post}}}{x_{\text{post}} + A_{\text{in}} \cdot \gamma} - G_{\text{cost}} \right)$$
+- current gas pressure
+- mempool density
+- cluster heat
+- lookup and submit latency
+- historical success, miss, and revert rates
+- realized capture
+- relay pressure
+- chain-specific threshold bias
 
-Where $\gamma = 1 - \text{fee}$ and $G_{\text{cost}}$ represents the structural network weight. The engine computes the first-order derivative $\frac{\partial \text{PnL}}{\partial A_{\text{in}}} = 0$ locally to determine exact execution size in under $0.82 \text{ ms}$.
+The goal is not to prove a stochastic finance model. The goal is to preserve capital and improve net realized outcomes.
 
-### 2. Bayesian Regime Adaptation
-Instead of relying on rolling averages, the threshold multiplier ($\Lambda_t$) dynamically scales via a continuous conjugate Bayesian update framework. The system models the transaction inclusion success rate as a Bernoulli process ($X \sim \text{Bernoulli}(p)$) with a Beta distribution prior:
+### 1. Post-Victim AMM Topology
+The expected gross edge is modeled from the deterministic displacement of the AMM state after the victim swap. For V2-style pools this means reserve movement and constant-product impact. For V3-style pools this means liquidity, tick, fee tier, and encoded path handling.
 
-$$p \sim \text{Beta}(\alpha_t, \beta_t)$$
+This part is intentionally deterministic. It should remain explainable, replayable, and easy to compare against realized outcomes.
 
-Upon observing execution outcomes in the persistence layer (SQLite), updates to the hyperparameters occur online:
+### 2. Historical Regime Adaptation
+Instead of relying only on static thresholds, the runtime persists execution outcomes and uses them to adjust future rejection behavior. In production, this is primarily an operational calibration layer over `hour + pair + router`, not a claim that the live dispatch path depends on expensive probabilistic inference.
 
-$$\alpha_{t+1} = \alpha_t + \mathbb{I}(\text{Inclusion}), \quad \beta_{t+1} = \beta_t + \mathbb{I}(\text{Revert} \lor \text{Missed})$$
+The practical effect is simple: volatile nodes, toxic hours, weak relays, and bad router/pair contexts require more margin before dispatch.
 
-The operational threshold for the EV Gate adapts based on the posterior expected probability of success $\hat{p} = \frac{\alpha}{\alpha + \beta}$:
+### 3. Inclusion and Gas Discipline
+On direct-RPC environments such as Polygon and BNB Chain, inclusion is not a pure function of local speed. Gas caps, endpoint quality, current pressure, and competing state mutations matter.
 
-$$\text{EV}_{\text{threshold}} = \frac{\text{Base\_Threshold}}{\hat{p}} \cdot \left(1 + \sigma_{\text{latency}}^2\right)$$
+The production runtime handles this with measured operational controls:
 
-This mathematical scaling penalizes volatile nodes or toxic hours ($hour + pair + router$) by structurally expanding the required margin before dispatch.
+- chain-specific gas caps
+- submit latency tracking
+- endpoint failure tracking
+- inclusion, miss, and revert history
+- hard rejection when gas or age invalidates the edge
 
-### 3. Queue Position Modeling & Inclusion Probability
-On direct-RPC environments (Polygon/BNB Chain), inclusion is not a pure function of network speed but a stochastic race for block space priority. The engine models block insertion queues using a non-homogeneous Poisson process. 
+Poisson-style or other queue models can be used as offline research tools, but the hot path should remain cheap unless profiling proves otherwise.
 
-The probability $P(I)$ that our transaction is included at block height $H$ before a competitive state mutation occurs is governed by an exponential decay kernel based on the delta between victim observation time ($t_0$) and execution submit timestamp ($t_s$):
+### 4. Outcome-Driven Calibration
+The runtime uses persisted outcomes to calibrate structural risk parameters across execution pathways. The important production loop is:
 
-$$P(I \mid \Delta t) = e^{-\lambda \cdot (t_s - t_0)} \cdot \left( 1 - \Phi\left( \frac{G_{\text{observed}} - G_{\text{cap}}}{\sigma_{\text{gas}}} \right) \right)$$
+`dispatch decision -> submit result -> inclusion/revert/miss -> realized PnL -> persistence -> future threshold calibration`
 
-Where:
-*   $\lambda$ is the empirical intensity parameter of adversarial mempool density.
-*   $\Phi(z)$ is the standard normal cumulative distribution function representing the probability that a competitor outbids our targeted network boundary ($G_{\text{cap}}$).
+This feedback loop is what makes the system stateful. It is more important than any single formula because it lets the runtime learn which contexts are structurally toxic.
 
-### 4. Continuous Reward Mapping (Stochastic Policy)
-The runtime uses a lightweight, model-free policy tracking system to calibrate structural risk parameters across execution pathways. The reward space metric ($R$) formalizes the joint distribution of net returns and pipeline latency:
+## Experimental Research and Systems Modules
 
-$$R = \Delta_{\text{realized\_pnl}} \cdot \mathbb{I}(\text{Success}) - \left( c \cdot \Delta t_{\text{finalization}} \cdot G_{\text{price}} \right) \cdot \mathbb{I}(\text{Revert})$$
+The codebase may include advanced modeling and low-level systems modules. These should be treated as optional research surfaces unless they are wired into the production runtime and backed by profiling evidence.
 
-The engine utilizes this continuous feedback loop to apply gradient adjustments to the pre-flight filters in `adaptive.rs`, optimizing for long-term expected value ($\sum \gamma^k R_{t+k}$) instead of localized execution density.
+### 1. Research Models
 
-## Advanced Ultra-Low Latency & Quantitative Core (Tier-1 Architecture)
+HMM, HJB, Poisson, and Bayesian helper code can be useful for replay analysis, calibration experiments, or future background workers. They are not required for the core live edge.
 
-### 1. High-Frequency Market Microstructure & Stochastic Optimal Control
-The execution kernel transitions from reactive filters to an optimal stopping time problem, treating the liquidity state as a continuous-time jump-diffusion process.
+The production rule is:
 
-*   **Hidden Markov Model (HMM) Regime Switching:** The runtime implements a 3-state localized HMM (Low-Vol, High-Vol/Competitive, Toxic/Reorg-Heavy) directly within `adaptive.rs`. State transitions ($\mathcal{A}_{ij}$) are computed online using a fixed-window Baum-Welch approximation, dynamically updating the EV gate baseline before a single payload is built.
-*   **Stochastic Optimal Control (Hamilton-Jacobi-Bellman formulation):** To maximize capital utility over the finite horizon of a block assembly period ($T$), execution routing solves the HJB equation for the value function $V(x, t)$:
+`no model belongs in the hot path unless it improves realized outcomes after latency and gas costs`
 
-$$-\frac{\partial V}{\partial t} = \max_{u \in \mathcal{U}} \left\{ \mathcal{L}^u V(x, t) + R(x, u) \right\}$$
+Examples of acceptable uses:
 
-Where $u$ represents the continuous boundary push for priority gas fee adjustments, balancing the risk of adverse selection (getting frontrun or trapped in an unprofitable multi-hop leg) against the probability of priority inclusion.
-*   **Queue-Reactive Order Book Models:** On chains with predictable block intervals (e.g., BNB Chain and Polygon), the engine treats the local transaction memory layout as an implicit queue network. It models the probability of transaction displacement at a specific block space index via a discrete-time Markov chain configured by the intensity of competitive direct-RPC incoming bursts.
+- offline replay classification
+- historical toxicity clustering
+- threshold tuning
+- sensitivity analysis
+- background calibration jobs
 
-### 2. Hardcore Systems Optimization & Low-Level Hardware Alignment
-The Rust implementation is fundamentally designed to minimize hardware-induced microsecond degradation, targeting bare-metal structural efficiency.
+Examples of risky uses:
+
+- blocking dispatch on heavy inference
+- increasing payload delay for marginal score precision
+- replacing deterministic EV checks with opaque model output
+
+These models should not be presented as the core edge. They are optional aids for studying execution history.
+
+### 2. Systems Optimization Targets
+The systems layer should be documented through measured impact, not theoretical hardware claims.
 
 ```text
 [Network Frame] ──> [io_uring / XDP Direct Ingest] ──> [SIMD Fast Decode] ──> [NUMA-Local Thread Pool]
@@ -136,22 +192,18 @@ The Rust implementation is fundamentally designed to minimize hardware-induced m
 [Hardware Bus Client] <── [Lock-Free Ring Buffer] <── [Cache-Aligned Layout] <───────┘
 ```
 
-*   **Lock-Free Concurrency & Cache-Aware Layouts:** Critical state primitives in `rpc.rs` and `mev/runtime.rs` avoid OS-level mutex contention by leveraging lock-free atomic rings (`crossbeam-channel` derivatives) and explicit cache-line padding (`#[link_section]` or 64-byte alignment hints) to entirely mitigate false sharing across high-throughput CPU cores.
-*   **Custom Allocator Tuning (`jemalloc` / `mimalloc` Integration):** High-frequency execution paths isolate memory allocation entirely. The runtime disables the default OS allocator in favor of a statically-tuned `jemalloc` profile, configuring dedicated arena pools to completely bypass runtime thread-cache contention during burst mempool events.
-*   **Zero-Copy Byte Parsing via SIMD:** Transaction payload decoding replaces iterative structural matching with SIMD vectorization routines. Target AMM method selectors (`0x38ed1739`, `0x7ff36ab5`) are evaluated across raw network bytes using vector instructions in a single clock cycle.
-*   **NUMA Awareness & Thread Pinning:** For multi-socket deployments, execution workers are pinned via explicit affinity masks (`core_affinity`) to distinct physical CPU cores sharing localized L3 caches with the PCIe network interface card (NIC), bypassing Cross-Socket Interconnect (QPI/UPI) latency bottlenecks.
+*   **Cache-Aware Layouts:** Cache alignment is available for selected hot structures and should be validated with profiling before being treated as material.
+*   **Allocator Tuning:** `jemalloc` is available on Unix targets as an operational tuning option.
+*   **SIMD Selector Matching:** Selector matching includes a SIMD-capable path with scalar fallback.
+*   **Thread Pinning:** CPU affinity helpers exist for deployment experiments where pinning can be measured.
 
-### 3. Empirical Economic Validation & Private Statistical Bounds
-While production trading results are strictly restricted from public tracking repositories, the framework evaluates execution health against formal high-frequency financial metrics.
+### 3. Empirical Economic Validation
+Production credibility should come from measured runtime artifacts.
 
-*   **Adverse Selection Metrics:** The engine calculates the Conditional Value-at-Risk ($\text{CVaR}_\alpha$) of all transaction submissions. If the realized post-execution price drift inside the targeted AMM pool systematically opposes our entry vectors within a 3-block horizon, the system automatically marks the router/pair cluster as *toxic* and scales down the allocation profile.
-*   **Inclusion Win-Rate Decay Curves:** The system tracks the statistical divergence between our simulated local pre-flight expectation and the live blockchain block reality (Live-Replay Divergence). Winning trajectories are plotted continuously against an empirical decay curve:
-
-$$W(\Delta t) = W_0 \cdot e^{-\kappa \cdot \Delta t_{\text{network}}}$$
-
-Where $\kappa$ measures the instantaneous competitive density of the ecosystem. This decay profile allows the engine to adaptively drop payloads if the RPC socket confirmation latency slips by more than $1.8 \text{ ms}$ off the historical baseline.
-
-*   **Sharpe-Like Operational Stability:** Capital efficiency is bounded via a custom High-Frequency Sortino Ratio, tracking net extraction yield strictly against the downside variance of uncompensated gas burn (reverts and missed blocks). The engine's structural goal is to ensure this ratio trends strictly positive even during extreme network congestion regimes.
+*   **Reject Quality:** How many candidates are rejected, why, and whether those rejects avoided reverts or gas waste.
+*   **Inclusion Quality:** Submit success, accepted-not-included rate, revert rate, and finalization latency by relay or RPC path.
+*   **Realized Economics:** Realized PnL versus expected PnL, gas paid, and capital committed.
+*   **Contextual Toxicity:** Router/pair/hour contexts that repeatedly underperform should become harder to execute.
 
 # Real-World Validation
 
@@ -223,14 +275,17 @@ Production trust is materially improved through visible runtime proof.
 ### Recommended Deployment Evidence
 - Live dashboard screenshots
 - Relay ranking telemetry screenshots
+- Context toxicity table screenshots or `/api/export` JSON
 - Treasury recommendation control screenshots
-- Replay harness execution outputs
+- Replay harness execution outputs with pass rates, false positives/negatives, gas avoided, and realized/expected capture
 - Network benchmark mode outputs
 - Executor wallet balance and treasury lifecycle screenshots
 
 ### Suggested Documentation Paths
 - `/docs/dashboard/live_dashboard.png`
 - `/docs/dashboard/relay_ranking.png`
+- `/docs/dashboard/context_toxicity.png`
+- `/docs/dashboard/status_export.json`
 - `/docs/dashboard/treasury_controls.png`
 - `/docs/replay/replay_output.png`
 - `/docs/benchmarks/network_benchmark.png`
@@ -509,7 +564,7 @@ The system operates as a zero-copy, linear, multi-threaded pipeline using bounde
 │ • Gas caps                                                                                 │
 │ • Wallet health                                                                            │
 │                                                                                           │
-│ OPTIONAL WAR-LEVEL EVM PREFLIGHT                                                           │
+│ OPTIONAL EVM PREFLIGHT                                                                     │
 │ • Local EVM simulation                                                                     │
 │ • State overrides                                                                          │
 │ • Revert prediction                                                                        │
@@ -1067,6 +1122,15 @@ Below is the core environment surface used by the active runtime.
 - `MEV_ETH_USD_PRICE`
 - `MEV_MIN_LIQUIDITY_ETH`
 
+### Expensive execution guardrails
+
+- `MEV_EVM_PREFLIGHT_ENABLED`
+- `MEV_EVM_PREFLIGHT_HARD_FAIL`
+
+`MEV_EVM_PREFLIGHT_ENABLED=true` enables local `revm` preflight as an execution guardrail. Treat it as a heavier validation path, not as a default cheap hot-path filter. Keep it disabled for latency-sensitive runs unless replay or live telemetry shows the revert avoidance is worth the added delay.
+
+`MEV_EVM_PREFLIGHT_HARD_FAIL=true` makes preflight failure block execution. Without it, preflight errors are soft failures in the executor path.
+
 ### Capital window controls
 
 - `MEV_CAPITAL_WINDOW_SECS`
@@ -1193,9 +1257,9 @@ It is strong where it is explicit:
 - capital budgeting
 - replay-based decision review
 
-It already includes deterministic post-victim state simulation and slippage-aware sizing gates, but it does not yet include a full local EVM preflight such as `revm` before live direct-RPC submission.
+It includes deterministic post-victim state simulation, slippage-aware sizing gates, and optional local EVM preflight through `revm` with explicit state overrides.
 
-That means the runtime is intentionally safer than a naive mempool bot, but it is not yet equivalent to a full signed-state local execution simulator.
+That means the runtime is safer than a naive mempool bot, but the preflight path should still be treated as an execution guardrail, not a profitability guarantee. Full fork-backed state simulation remains a separate hardening target.
 
 It is not marketed as a universal arbitrage platform or cross-domain MEV framework.
 
