@@ -70,6 +70,7 @@ pub struct MevConfig {
     pub min_liquidity_eth: f64,
     pub latency_trace: bool,
     pub latency_trace_warn_us: u64,
+    pub pool_state_cache_ttl_ms: u64,
     pub executor_min_buffer_eth: f64,
     pub executor_target_buffer_eth: f64,
     pub executor_max_buffer_eth: f64,
@@ -281,6 +282,9 @@ impl Config {
                 .eq_ignore_ascii_case("true"),
             latency_trace_warn_us: env::var("MEV_LATENCY_TRACE_WARN_US")
                 .unwrap_or_else(|_| "5000".to_string())
+                .parse::<u64>()?,
+            pool_state_cache_ttl_ms: env::var("MEV_POOL_STATE_CACHE_TTL_MS")
+                .unwrap_or_else(|_| "120".to_string())
                 .parse::<u64>()?,
             executor_min_buffer_eth: env::var("MEV_EXECUTOR_MIN_BUFFER_ETH")
                 .unwrap_or_else(|_| "0.20".to_string())
