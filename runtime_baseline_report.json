@@ -1,0 +1,84 @@
+{
+  "network": "bsc",
+  "profile": "baseline",
+  "cases": 200,
+  "warmup": 20,
+  "concurrency": 4,
+  "wall_ms": 96.609,
+  "throughput_tps": 2070.20049891832,
+  "latency_budget_p99_us": 250,
+  "budget_pass": false,
+  "processed": 200,
+  "decoded": 200,
+  "decode_reject": 0,
+  "fast_pass": 200,
+  "fast_reject": 0,
+  "adaptive_preflight_pass": 200,
+  "adaptive_preflight_reject": 0,
+  "quote_pass": 200,
+  "quote_reject": 0,
+  "rejection_rate": 0.0,
+  "malformed_rejection_rate": 0.0,
+  "small_notional_rejection_rate": 0.0,
+  "toxic_gas_rejection_rate": 0.0,
+  "long_path_rejection_rate": 0.0,
+  "cluster_burst_rejection_rate": 0.0,
+  "scenarios": {
+    "valid": {
+      "processed": 200,
+      "decoded": 200,
+      "decode_reject": 0,
+      "fast_pass": 200,
+      "fast_reject": 0,
+      "adaptive_preflight_pass": 200,
+      "adaptive_preflight_reject": 0,
+      "quote_pass": 200,
+      "quote_reject": 0
+    }
+  },
+  "decode": {
+    "count": 200,
+    "avg": 10.49,
+    "min": 6,
+    "p50": 8,
+    "p95": 19,
+    "p99": 45,
+    "max": 201
+  },
+  "fast_preflight": {
+    "count": 200,
+    "avg": 54.805,
+    "min": 32,
+    "p50": 39,
+    "p95": 51,
+    "p99": 951,
+    "max": 995
+  },
+  "adaptive_preflight": {
+    "count": 200,
+    "avg": 69.25,
+    "min": 22,
+    "p50": 30,
+    "p95": 43,
+    "p99": 1251,
+    "max": 4270
+  },
+  "adaptive_quote": {
+    "count": 200,
+    "avg": 68.195,
+    "min": 37,
+    "p50": 48,
+    "p95": 68,
+    "p99": 261,
+    "max": 3029
+  },
+  "total_hot_gate": {
+    "count": 200,
+    "avg": 272.59,
+    "min": 142,
+    "p50": 177,
+    "p95": 598,
+    "p99": 1586,
+    "max": 4420
+  }
+}
