@@ -1640,6 +1640,7 @@ mod tests {
                 min_liquidity_eth: 10.0,
                 latency_trace: false,
                 latency_trace_warn_us: 5_000,
+                pool_state_cache_ttl_ms: 120,
                 executor_min_buffer_eth: 0.1,
                 executor_target_buffer_eth: 0.3,
                 executor_max_buffer_eth: 1.0,
