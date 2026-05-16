@@ -108,13 +108,13 @@ impl ExecutionEngine {
             block_hash: None,
             block_number: None,
             transaction_index: None,
-            from: Some(self.config.executor_address),
+            from: self.config.executor_address,
             to: Some(payload.target_contract),
             value: payload.value,
             gas_price: Some(U256::from(0)),
             gas: U256::from(payload.gas_limit),
             input: payload.calldata.clone(),
-            chain_id: Some(self.config.chain_id),
+            chain_id: Some(U256::from(self.config.chain_id)),
             ..Default::default()
         };
 
