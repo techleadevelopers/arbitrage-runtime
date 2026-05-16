@@ -1147,6 +1147,7 @@ mod tests {
             rpc_send_preference: RpcPreference::Auto,
             storage_path: PathBuf::from("test.sqlite"),
             dashboard_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8787),
+            explicit_rpc_urls: Vec::new(),
             mempool_ws_urls: Vec::new(),
             mev: MevConfig {
                 enabled: true,
