@@ -68,6 +68,8 @@ pub struct MevConfig {
     pub min_profit_usd: f64,
     pub eth_usd_price: f64,
     pub min_liquidity_eth: f64,
+    pub latency_trace: bool,
+    pub latency_trace_warn_us: u64,
     pub executor_min_buffer_eth: f64,
     pub executor_target_buffer_eth: f64,
     pub executor_max_buffer_eth: f64,
@@ -273,6 +275,13 @@ impl Config {
             min_liquidity_eth: env::var("MEV_MIN_LIQUIDITY_ETH")
                 .unwrap_or_else(|_| "25.0".to_string())
                 .parse::<f64>()?,
+            latency_trace: env::var("MEV_LATENCY_TRACE")
+                .unwrap_or_else(|_| "false".to_string())
+                .trim()
+                .eq_ignore_ascii_case("true"),
+            latency_trace_warn_us: env::var("MEV_LATENCY_TRACE_WARN_US")
+                .unwrap_or_else(|_| "5000".to_string())
+                .parse::<u64>()?,
             executor_min_buffer_eth: env::var("MEV_EXECUTOR_MIN_BUFFER_ETH")
                 .unwrap_or_else(|_| "0.20".to_string())
                 .parse::<f64>()?,
