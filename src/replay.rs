@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::mev::adaptive::{AdaptivePolicy, AdaptiveQuoteInput, ContextSignal, PreflightInput};
+use crate::mev::cache::pool_cache::PoolCache;
 use crate::mev::opportunity::wei_to_eth_f64;
 use crate::mev::runtime::{
     build_payload, decode_relevant_swap, fast_preflight_gate, passes_ev_gate,
@@ -33,6 +34,8 @@ pub async fn maybe_run_replay_harness(
         .map_err(|_| "RUN_REPLAY_HARNESS=true requires REPLAY_INPUT_PATH")?;
     let replay_limit = env_usize("REPLAY_LIMIT", 500).max(1);
     let provider = Arc::new(Provider::<Http>::try_from(fork_url.clone())?);
+    let pool_cache = PoolCache::new(config.mev.pool_state_cache_ttl_ms);
+    let replay_block = provider.get_block_number().await?.as_u64();
     let remote_chain_id = provider.get_chainid().await?.as_u64();
     if remote_chain_id != config.chain_id {
         return Err(format!(
@@ -80,6 +83,7 @@ pub async fn maybe_run_replay_harness(
             report.observe_latency(&latency_trace);
             continue;
         };
+        report.decoded += 1;
         latency_trace.decode_swap_us = Some(elapsed_us(decode_started));
         let hour_utc = case.hour_utc.unwrap_or(Utc::now().hour() as u8);
         let context_started = Instant::now();
@@ -113,7 +117,9 @@ pub async fn maybe_run_replay_harness(
         latency_trace.fast_preflight_us = Some(elapsed_us(fast_started));
         if !fast_gate.should_continue {
             report.observe_labeled_outcome(false, &case);
+            report.observe_reject_gas(gas_price, config.estimated_exec_gas);
             report.bump_reason("fast_preflight", fast_gate.reject_reason.unwrap_or("reject"));
+            report.observe_toxicity_reject(&signal, hour_utc, &case, "fast_preflight");
             latency_trace.total_internal_us = Some(elapsed_us(case_started));
             report.observe_latency(&latency_trace);
             decision_rows.push(ReplayDecisionRow::reject(
@@ -123,6 +129,7 @@ pub async fn maybe_run_replay_harness(
             ));
             continue;
         }
+        report.fast_preflight_pass += 1;
 
         let cluster = crate::mev::adaptive::ClusterKey {
             router: signal.router,
@@ -150,7 +157,9 @@ pub async fn maybe_run_replay_harness(
         latency_trace.adaptive_preflight_us = Some(elapsed_us(adaptive_preflight_started));
         if !preflight.should_continue {
             report.observe_labeled_outcome(false, &case);
+            report.observe_reject_gas(gas_price, config.estimated_exec_gas);
             report.bump_reason("preflight", preflight.reject_reason.unwrap_or("reject"));
+            report.observe_toxicity_reject(&signal, hour_utc, &case, "preflight");
             latency_trace.total_internal_us = Some(elapsed_us(case_started));
             report.observe_latency(&latency_trace);
             decision_rows.push(ReplayDecisionRow::reject(
@@ -160,6 +169,7 @@ pub async fn maybe_run_replay_harness(
             ));
             continue;
         }
+        report.adaptive_preflight_pass += 1;
 
         let payload_started = Instant::now();
         let Ok(payload) = build_payload(
@@ -168,11 +178,15 @@ pub async fn maybe_run_replay_harness(
             &signal,
             gas_price,
             context_signal,
+            &pool_cache,
+            replay_block,
         )
         .await
         else {
             report.observe_labeled_outcome(false, &case);
+            report.observe_reject_gas(gas_price, config.estimated_exec_gas);
             report.bump("payload_build_reject");
+            report.observe_toxicity_reject(&signal, hour_utc, &case, "payload");
             latency_trace.payload_build_us = Some(elapsed_us(payload_started));
             latency_trace.total_internal_us = Some(elapsed_us(case_started));
             report.observe_latency(&latency_trace);
@@ -181,6 +195,7 @@ pub async fn maybe_run_replay_harness(
         };
         latency_trace.payload_build_us = Some(elapsed_us(payload_started));
         report.payload_built += 1;
+        report.observe_expected_profit(payload.expected_profit_wei);
 
         let ev_gate_started = Instant::now();
         if !passes_ev_gate(
@@ -191,7 +206,9 @@ pub async fn maybe_run_replay_harness(
             min_profit_wei,
         ) {
             report.observe_labeled_outcome(false, &case);
+            report.observe_reject_gas(gas_price, payload.gas_limit);
             report.bump("ev_gate_reject");
+            report.observe_toxicity_reject(&signal, hour_utc, &case, "ev_gate");
             latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
             latency_trace.total_internal_us = Some(elapsed_us(case_started));
             report.observe_latency(&latency_trace);
@@ -199,6 +216,7 @@ pub async fn maybe_run_replay_harness(
             continue;
         }
         latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
+        report.ev_gate_pass += 1;
 
         let execution_cost_wei = gas_price
             .saturating_mul(U256::from(payload.gas_limit))
@@ -207,7 +225,9 @@ pub async fn maybe_run_replay_harness(
         let quality_gate_started = Instant::now();
         if !passes_quality_gate(&config, &payload, execution_cost_wei) {
             report.observe_labeled_outcome(false, &case);
+            report.observe_reject_gas(gas_price, payload.gas_limit);
             report.bump("quality_gate_reject");
+            report.observe_toxicity_reject(&signal, hour_utc, &case, "quality_gate");
             latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
             latency_trace.total_internal_us = Some(elapsed_us(case_started));
             report.observe_latency(&latency_trace);
@@ -219,6 +239,7 @@ pub async fn maybe_run_replay_harness(
             continue;
         }
         latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
+        report.quality_gate_pass += 1;
 
         let adaptive_quote_started = Instant::now();
         let quote = if let Ok(mut model) = adaptive.lock() {
@@ -249,7 +270,9 @@ pub async fn maybe_run_replay_harness(
 
         if !quote.should_execute {
             report.observe_labeled_outcome(false, &case);
+            report.observe_reject_gas(gas_price, payload.gas_limit);
             report.bump_reason("adaptive", quote.reject_reason.unwrap_or("reject"));
+            report.observe_toxicity_reject(&signal, hour_utc, &case, "adaptive");
             latency_trace.total_internal_us = Some(elapsed_us(case_started));
             report.observe_latency(&latency_trace);
             decision_rows.push(ReplayDecisionRow::reject(
@@ -261,7 +284,10 @@ pub async fn maybe_run_replay_harness(
         }
 
         report.execute_candidates += 1;
+        report.adaptive_quote_pass += 1;
         report.observe_labeled_outcome(true, &case);
+        report.observe_realized(&case);
+        report.observe_toxicity_execute(&signal, payload.pair, hour_utc, &case, payload.expected_profit_wei);
         latency_trace.total_internal_us = Some(elapsed_us(case_started));
         report.observe_latency(&latency_trace);
         decision_rows.push(ReplayDecisionRow::execute(
@@ -294,14 +320,24 @@ struct ReplayInputCase {
 #[derive(Default)]
 struct ReplayReport {
     total: u64,
+    decoded: u64,
+    fast_preflight_pass: u64,
+    adaptive_preflight_pass: u64,
     payload_built: u64,
+    ev_gate_pass: u64,
+    quality_gate_pass: u64,
+    adaptive_quote_pass: u64,
     execute_candidates: u64,
     true_positive: u64,
     false_positive: u64,
     true_negative: u64,
     false_negative: u64,
+    estimated_gas_avoided_wei: U256,
+    expected_profit_wei: U256,
+    realized_profit_eth: f64,
     reasons: BTreeMap<String, u64>,
     latency: ReplayLatencySummary,
+    toxicity: BTreeMap<ToxicityReplayKey, ToxicityReplayStats>,
 }
 
 impl ReplayReport {
@@ -330,6 +366,134 @@ impl ReplayReport {
 
     fn observe_latency(&mut self, trace: &ReplayLatencyTrace) {
         self.latency.observe(trace);
+    }
+
+    fn observe_reject_gas(&mut self, gas_price: U256, gas_limit: u64) {
+        self.estimated_gas_avoided_wei = self
+            .estimated_gas_avoided_wei
+            .saturating_add(gas_price.saturating_mul(U256::from(gas_limit)));
+    }
+
+    fn observe_expected_profit(&mut self, expected_profit_wei: U256) {
+        self.expected_profit_wei = self.expected_profit_wei.saturating_add(expected_profit_wei);
+    }
+
+    fn observe_realized(&mut self, case: &ReplayInputCase) {
+        self.realized_profit_eth += case.realized_profit_eth.unwrap_or(0.0);
+    }
+
+    fn observe_toxicity_reject(
+        &mut self,
+        signal: &crate::mev::runtime::SwapSignal,
+        hour_utc: u8,
+        case: &ReplayInputCase,
+        stage: &'static str,
+    ) {
+        let pair = *signal.path.last().unwrap_or(&signal.path[0]);
+        let key = ToxicityReplayKey::new(signal.router, pair, hour_utc);
+        self.toxicity.entry(key).or_default().observe(false, case, None, stage);
+    }
+
+    fn observe_toxicity_execute(
+        &mut self,
+        signal: &crate::mev::runtime::SwapSignal,
+        pair: Address,
+        hour_utc: u8,
+        case: &ReplayInputCase,
+        expected_profit_wei: U256,
+    ) {
+        let key = ToxicityReplayKey::new(signal.router, pair, hour_utc);
+        self.toxicity
+            .entry(key)
+            .or_default()
+            .observe(true, case, Some(expected_profit_wei), "execute");
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ToxicityReplayKey {
+    router: String,
+    pair: String,
+    hour_utc: u8,
+}
+
+impl ToxicityReplayKey {
+    fn new(router: Address, pair: Address, hour_utc: u8) -> Self {
+        Self {
+            router: format!("{:?}", router),
+            pair: format!("{:?}", pair),
+            hour_utc,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ToxicityReplayStats {
+    samples: u64,
+    rejected: u64,
+    executed: u64,
+    profitable_labels: u64,
+    false_positive: u64,
+    false_negative: u64,
+    expected_profit_wei: U256,
+    realized_profit_eth: f64,
+    last_stage: &'static str,
+}
+
+impl ToxicityReplayStats {
+    fn observe(
+        &mut self,
+        executed: bool,
+        case: &ReplayInputCase,
+        expected_profit_wei: Option<U256>,
+        stage: &'static str,
+    ) {
+        self.samples += 1;
+        self.last_stage = stage;
+        let profitable = case
+            .known_outcome
+            .as_deref()
+            .map(is_positive_outcome)
+            .unwrap_or(false)
+            || case.realized_profit_eth.unwrap_or(0.0) > 0.0;
+        if profitable {
+            self.profitable_labels += 1;
+        }
+        if executed {
+            self.executed += 1;
+            self.expected_profit_wei = self
+                .expected_profit_wei
+                .saturating_add(expected_profit_wei.unwrap_or_default());
+            self.realized_profit_eth += case.realized_profit_eth.unwrap_or(0.0);
+            if !profitable {
+                self.false_positive += 1;
+            }
+        } else {
+            self.rejected += 1;
+            if profitable {
+                self.false_negative += 1;
+            }
+        }
+    }
+
+    fn toxicity_score(&self) -> f64 {
+        if self.samples == 0 {
+            return 0.0;
+        }
+        let sample = self.samples as f64;
+        let reject_rate = self.rejected as f64 / sample;
+        let false_positive_rate = self.false_positive as f64 / sample;
+        let false_negative_rate = self.false_negative as f64 / sample;
+        let realized_capture = if self.expected_profit_wei > U256::zero() {
+            (self.realized_profit_eth / wei_to_eth_f64(self.expected_profit_wei)).clamp(0.0, 1.25)
+        } else {
+            0.0
+        };
+        (reject_rate * 0.35
+            + false_positive_rate * 0.30
+            + false_negative_rate * 0.20
+            + (1.0 - realized_capture).clamp(0.0, 1.0) * 0.15)
+            .clamp(0.0, 1.0)
     }
 }
 
@@ -509,7 +673,32 @@ fn print_report(config: &Config, report: &ReplayReport) {
     println!("=== Replay Harness ===");
     println!("Network: {}", config.network);
     println!("Total cases: {}", report.total);
+    println!(
+        "Decode rate: {:.2}%",
+        percent(report.decoded, report.total)
+    );
+    println!(
+        "Fast preflight pass rate: {:.2}%",
+        percent(report.fast_preflight_pass, report.decoded)
+    );
+    println!(
+        "Adaptive preflight pass rate: {:.2}%",
+        percent(report.adaptive_preflight_pass, report.fast_preflight_pass)
+    );
     println!("Payload built: {}", report.payload_built);
+    println!(
+        "Payload build rate: {:.2}%",
+        percent(report.payload_built, report.adaptive_preflight_pass)
+    );
+    println!("EV gate pass rate: {:.2}%", percent(report.ev_gate_pass, report.payload_built));
+    println!(
+        "Quality gate pass rate: {:.2}%",
+        percent(report.quality_gate_pass, report.ev_gate_pass)
+    );
+    println!(
+        "Adaptive quote pass rate: {:.2}%",
+        percent(report.adaptive_quote_pass, report.quality_gate_pass)
+    );
     println!("Execute candidates: {}", report.execute_candidates);
     println!(
         "Acceptance rate: {:.2}%",
@@ -526,7 +715,26 @@ fn print_report(config: &Config, report: &ReplayReport) {
         println!("  false_positive -> {}", report.false_positive);
         println!("  true_negative -> {}", report.true_negative);
         println!("  false_negative -> {}", report.false_negative);
+        println!("  false_positive_rate -> {:.2}%", percent(report.false_positive, report.false_positive + report.true_positive));
+        println!("  false_negative_rate -> {:.2}%", percent(report.false_negative, report.false_negative + report.true_negative));
     }
+    println!(
+        "Expected profit scanned after payload: {:.8} ETH",
+        wei_to_eth_f64(report.expected_profit_wei)
+    );
+    println!("Realized profit labels: {:.8} ETH", report.realized_profit_eth);
+    println!(
+        "Realized/expected capture: {:.2}%",
+        if report.expected_profit_wei.is_zero() {
+            0.0
+        } else {
+            report.realized_profit_eth * 100.0 / wei_to_eth_f64(report.expected_profit_wei).max(1e-12)
+        }
+    );
+    println!(
+        "Estimated gas wasted avoided: {:.8} ETH",
+        wei_to_eth_f64(report.estimated_gas_avoided_wei)
+    );
     println!("Reject breakdown:");
     for (reason, count) in &report.reasons {
         println!("  {} -> {}", reason, count);
@@ -551,6 +759,37 @@ fn print_report(config: &Config, report: &ReplayReport) {
                 snapshot.avg_us as f64 / 1_000.0
             );
         }
+    }
+    println!("Context toxicity by router + pair + hour:");
+    if report.toxicity.is_empty() {
+        println!("  no contextual samples recorded");
+    } else {
+        let mut rows = report.toxicity.iter().collect::<Vec<_>>();
+        rows.sort_by(|(_, left), (_, right)| right.toxicity_score().total_cmp(&left.toxicity_score()));
+        for (key, stats) in rows.into_iter().take(12) {
+            println!(
+                "  hour={} router={} pair={} samples={} rejected={} executed={} profitable_labels={} fp={} fn={} toxicity={:.2} last_stage={}",
+                key.hour_utc,
+                key.router,
+                key.pair,
+                stats.samples,
+                stats.rejected,
+                stats.executed,
+                stats.profitable_labels,
+                stats.false_positive,
+                stats.false_negative,
+                stats.toxicity_score(),
+                stats.last_stage,
+            );
+        }
+    }
+}
+
+fn percent(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 * 100.0 / denominator as f64
     }
 }
 
