@@ -68,7 +68,7 @@ impl ExecutionEngine {
     async fn validate_with_evm_preflight(
         &self,
         payload: &crate::mev::execution::payload_builder::ExecutionPayload,
-        tx_bytes: &Bytes,
+        _tx_bytes: &Bytes,
         block_number: u64,
         pool_state: &AmmState,
         victim_tx: H256,
@@ -1278,6 +1278,7 @@ mod tests {
                 _ => 1,
             },
             allow_send: true,
+            tenderly_rpc_only: false,
             alchemy_keys: vec!["test".to_string()],
             infura_ids: Vec::new(),
             flashbots_relay: if network == "ethereum" {
@@ -1332,6 +1333,7 @@ mod tests {
                 min_liquidity_eth: 10.0,
                 latency_trace: false,
                 latency_trace_warn_us: 5_000,
+                pool_state_cache_ttl_ms: 120,
                 executor_min_buffer_eth: 0.1,
                 executor_target_buffer_eth: 0.3,
                 executor_max_buffer_eth: 1.0,
