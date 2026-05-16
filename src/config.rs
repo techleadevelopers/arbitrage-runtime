@@ -247,12 +247,15 @@ impl Config {
             max_gas_per_tx: env::var("MEV_MAX_GAS_PER_TX")
                 .unwrap_or_else(|_| "260000".to_string())
                 .parse::<u64>()?,
-            max_gas_price_gwei: env::var("MEV_MAX_GAS_PRICE_GWEI")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .map(|value| value.parse::<u64>())
-                .transpose()?,
+            max_gas_price_gwei: parse_network_optional_u64(
+                &network,
+                &[
+                    "MEV_MAX_GAS_PRICE_GWEI",
+                    "MEV_MAX_GAS_PRICE_GWEI_BSC",
+                    "MEV_MAX_GAS_PRICE_GWEI_BNB",
+                    "MEV_MAX_GAS_PRICE_GWEI_POLYGON",
+                ],
+            )?,
             max_price_impact_bps: env::var("MEV_MAX_PRICE_IMPACT_BPS")
                 .unwrap_or_else(|_| "250".to_string())
                 .parse::<u64>()?,
@@ -525,6 +528,50 @@ fn parse_rpc_preference(value: &str) -> Result<RpcPreference, Box<dyn std::error
         "infura" => Ok(RpcPreference::Infura),
         other => Err(format!("unsupported RPC preference: {other}").into()),
     }
+}
+
+fn parse_network_optional_u64(
+    network: &str,
+    keys: &[&str],
+) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    for key in prioritized_network_keys(network, keys) {
+        if let Ok(value) = env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Ok(Some(trimmed.parse::<u64>()?));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn prioritized_network_keys<'a>(network: &str, keys: &'a [&'a str]) -> Vec<&'a str> {
+    let mut prioritized = Vec::new();
+    let suffixes: &[&str] = match network {
+        "bsc" => &["_BSC", "_BNB"],
+        "polygon" => &["_POLYGON"],
+        _ => &[],
+    };
+
+    for suffix in suffixes {
+        for key in keys {
+            if key.ends_with(suffix) && !prioritized.contains(key) {
+                prioritized.push(*key);
+            }
+        }
+    }
+
+    for key in keys {
+        if !key.contains("_BSC")
+            && !key.contains("_BNB")
+            && !key.contains("_POLYGON")
+            && !prioritized.contains(key)
+        {
+            prioritized.push(*key);
+        }
+    }
+
+    prioritized
 }
 
 fn parse_monitored_tokens(
