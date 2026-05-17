@@ -277,8 +277,7 @@ impl AdaptivePolicy {
             chain_competition_mult,
             chain_risk_mult,
             chain_threshold_mult,
-        ) =
-            chain_adaptive_preset(&config.network);
+        ) = chain_adaptive_preset(&config.network);
         Self {
             eth_usd_price: config.mev.eth_usd_price,
             base_threshold_usd: config
@@ -320,7 +319,8 @@ impl AdaptivePolicy {
     pub fn apply_historical_profiles(&mut self, profiles: Vec<HistoricalOutcomeProfile>) {
         self.historical_profiles.clear();
         self.router_hour_profiles.clear();
-        let mut router_hour_rollup: HashMap<RouterHourKey, Vec<HistoricalOutcomeStats>> = HashMap::new();
+        let mut router_hour_rollup: HashMap<RouterHourKey, Vec<HistoricalOutcomeStats>> =
+            HashMap::new();
         for profile in profiles {
             let stats = HistoricalOutcomeStats {
                 samples: profile.samples,
@@ -456,8 +456,8 @@ impl AdaptivePolicy {
             * (1.0 - cluster_heat * 0.16)
             * (1.0 - path_penalty * 0.12);
         let gas_drag_usd = gas_floor_usd * (1.0 + gas_pressure * 0.85);
-        let competition_drag_usd =
-            gross_edge_upper_usd * (cluster_heat * 0.42 + mempool_density * 0.18 + gas_pressure * 0.12);
+        let competition_drag_usd = gross_edge_upper_usd
+            * (cluster_heat * 0.42 + mempool_density * 0.18 + gas_pressure * 0.12);
         let upper_bound_ev_usd = gross_edge_upper_usd - gas_drag_usd - competition_drag_usd;
 
         let preflight_score = (impact_hint * 0.36
@@ -517,7 +517,8 @@ impl AdaptivePolicy {
 
         let expected_profit_usd = wei_to_eth_f64(input.expected_profit_wei) * self.eth_usd_price;
         let gas_cost_usd = wei_to_eth_f64(input.execution_cost_wei) * self.eth_usd_price;
-        let mempool_density = (self.recent_flows.len() as f64 / FLOW_CAPACITY as f64).clamp(0.0, 1.0);
+        let mempool_density =
+            (self.recent_flows.len() as f64 / FLOW_CAPACITY as f64).clamp(0.0, 1.0);
         let cluster_heat = self.cluster_heat(input.cluster, now);
         let gas_pressure = self.gas_pressure(wei_to_gwei_f64(input.gas_price_wei));
         let size_pressure = size_pressure(input.notional_eth);
@@ -573,7 +574,7 @@ impl AdaptivePolicy {
             * (1.0 + (1.0 - context_priority_score.clamp(0.0, 1.0)) * 0.06)
             * (1.0 + context_toxicity_score * 0.20)
             * historical_calibration.competition_mult.max(1e-9))
-            .clamp(0.0, 1.0);
+        .clamp(0.0, 1.0);
         let risk_score = (self.risk_score(
             failure_pressure,
             latency_penalty,
@@ -586,7 +587,7 @@ impl AdaptivePolicy {
             * (1.0 + context_toxicity_score * 0.24)
             * (1.0 - context_priority_score.clamp(0.0, 1.0) * 0.08)
             * historical_calibration.risk_mult.max(1e-9))
-            .clamp(0.0, 1.0);
+        .clamp(0.0, 1.0);
 
         let p_positive = self.probability_positive(
             competition_score,
@@ -604,28 +605,27 @@ impl AdaptivePolicy {
                 + (1.0 - profile.revert_rate) * 0.10
                 + profile.realized_capture.clamp(0.0, 1.0) * 0.10)
                 .clamp(0.04, 0.99);
-            (p_positive * (1.0 - historical_confidence * 0.40) + target * historical_confidence * 0.40)
+            (p_positive * (1.0 - historical_confidence * 0.40)
+                + target * historical_confidence * 0.40)
                 .clamp(0.04, 0.99)
         } else {
             p_positive
         };
 
-        let competition_penalty_usd =
-            self.competition_penalty(
-                expected_profit_usd,
-                competition_score,
-                cluster_heat,
-                builder_pressure,
-                regime,
-            );
-        let risk_penalty_usd =
-            self.risk_penalty(
-                expected_profit_usd,
-                risk_score,
-                failure_pressure,
-                builder_pressure,
-                regime,
-            );
+        let competition_penalty_usd = self.competition_penalty(
+            expected_profit_usd,
+            competition_score,
+            cluster_heat,
+            builder_pressure,
+            regime,
+        );
+        let risk_penalty_usd = self.risk_penalty(
+            expected_profit_usd,
+            risk_score,
+            failure_pressure,
+            builder_pressure,
+            regime,
+        );
         let path_penalty_usd = self.path_execution_penalty_usd(
             expected_profit_usd,
             builder_pressure,
@@ -659,8 +659,7 @@ impl AdaptivePolicy {
                 + (1.0 - profile.success_rate).clamp(0.0, 1.0) * 0.24
                 + (1.0 - profile.realized_capture).clamp(0.0, 1.0) * 0.16)
                 .clamp(0.0, 1.0);
-            threshold_dynamic_usd
-                * (1.0 + threshold_penalty * historical_confidence * 0.75)
+            threshold_dynamic_usd * (1.0 + threshold_penalty * historical_confidence * 0.75)
         } else {
             threshold_dynamic_usd
         };
@@ -746,19 +745,20 @@ impl AdaptivePolicy {
         self.relay_reject_rate_ewma = ewma(self.relay_reject_rate_ewma, 0.0, EWMA_FAST);
         self.accepted_not_included_rate_ewma =
             ewma(self.accepted_not_included_rate_ewma, 0.0, EWMA_FAST);
-        self.included_revert_rate_ewma =
-            ewma(self.included_revert_rate_ewma, 0.0, EWMA_FAST);
+        self.included_revert_rate_ewma = ewma(self.included_revert_rate_ewma, 0.0, EWMA_FAST);
     }
 
     pub fn record_submit_success_for_relay(&mut self, relay: &str, latency_ms: f64) {
-        let stats = self.relay_stats.entry(relay.to_string()).or_insert_with(RelayStats::default);
+        let stats = self
+            .relay_stats
+            .entry(relay.to_string())
+            .or_insert_with(RelayStats::default);
         stats.submit_latency_ewma_ms = ewma(stats.submit_latency_ewma_ms, latency_ms, EWMA_FAST);
         stats.relay_accept_rate_ewma = ewma(stats.relay_accept_rate_ewma, 1.0, EWMA_FAST);
         stats.relay_reject_rate_ewma = ewma(stats.relay_reject_rate_ewma, 0.0, EWMA_FAST);
         stats.accepted_not_included_rate_ewma =
             ewma(stats.accepted_not_included_rate_ewma, 0.0, EWMA_FAST);
-        stats.included_revert_rate_ewma =
-            ewma(stats.included_revert_rate_ewma, 0.0, EWMA_FAST);
+        stats.included_revert_rate_ewma = ewma(stats.included_revert_rate_ewma, 0.0, EWMA_FAST);
         self.record_submit_success(latency_ms);
     }
 
@@ -771,7 +771,10 @@ impl AdaptivePolicy {
     }
 
     pub fn record_submit_failure_for_relay(&mut self, relay: &str, latency_ms: f64) {
-        let stats = self.relay_stats.entry(relay.to_string()).or_insert_with(RelayStats::default);
+        let stats = self
+            .relay_stats
+            .entry(relay.to_string())
+            .or_insert_with(RelayStats::default);
         stats.submit_latency_ewma_ms = ewma(stats.submit_latency_ewma_ms, latency_ms, EWMA_FAST);
         stats.relay_accept_rate_ewma = ewma(stats.relay_accept_rate_ewma, 0.0, EWMA_FAST);
         stats.relay_reject_rate_ewma = ewma(stats.relay_reject_rate_ewma, 1.0, EWMA_FAST);
@@ -785,8 +788,11 @@ impl AdaptivePolicy {
         success: bool,
         finalization_latency_ms: f64,
     ) {
-        self.finalize_latency_ewma_ms =
-            ewma(self.finalize_latency_ewma_ms, finalization_latency_ms, EWMA_FAST);
+        self.finalize_latency_ewma_ms = ewma(
+            self.finalize_latency_ewma_ms,
+            finalization_latency_ms,
+            EWMA_FAST,
+        );
         self.timeout_rate_ewma = ewma(self.timeout_rate_ewma, 0.0, EWMA_FAST);
         self.success_rate_ewma = ewma(
             self.success_rate_ewma,
@@ -798,11 +804,8 @@ impl AdaptivePolicy {
             if success { 1.0 } else { 0.0 },
             EWMA_FAST,
         );
-        self.accepted_not_included_rate_ewma = ewma(
-            self.accepted_not_included_rate_ewma,
-            0.0,
-            EWMA_FAST,
-        );
+        self.accepted_not_included_rate_ewma =
+            ewma(self.accepted_not_included_rate_ewma, 0.0, EWMA_FAST);
         self.included_revert_rate_ewma = ewma(
             self.included_revert_rate_ewma,
             if success { 0.0 } else { 1.0 },
@@ -813,8 +816,11 @@ impl AdaptivePolicy {
             if success { 0.0 } else { 1.0 },
             EWMA_FAST,
         );
-        self.realized_capture_ewma =
-            ewma(self.realized_capture_ewma, capture_ratio(expected_profit_wei, realized_profit_eth), EWMA_SLOW);
+        self.realized_capture_ewma = ewma(
+            self.realized_capture_ewma,
+            capture_ratio(expected_profit_wei, realized_profit_eth),
+            EWMA_SLOW,
+        );
     }
 
     pub fn record_finalization_for_relay(
@@ -825,26 +831,32 @@ impl AdaptivePolicy {
         success: bool,
         finalization_latency_ms: f64,
     ) {
-        let stats = self.relay_stats.entry(relay.to_string()).or_insert_with(RelayStats::default);
-        stats.finalization_latency_ewma_ms =
-            ewma(stats.finalization_latency_ewma_ms, finalization_latency_ms, EWMA_FAST);
+        let stats = self
+            .relay_stats
+            .entry(relay.to_string())
+            .or_insert_with(RelayStats::default);
+        stats.finalization_latency_ewma_ms = ewma(
+            stats.finalization_latency_ewma_ms,
+            finalization_latency_ms,
+            EWMA_FAST,
+        );
         stats.inclusion_success_rate_ewma = ewma(
             stats.inclusion_success_rate_ewma,
             if success { 1.0 } else { 0.0 },
             EWMA_FAST,
         );
-        stats.accepted_not_included_rate_ewma = ewma(
-            stats.accepted_not_included_rate_ewma,
-            0.0,
-            EWMA_FAST,
-        );
+        stats.accepted_not_included_rate_ewma =
+            ewma(stats.accepted_not_included_rate_ewma, 0.0, EWMA_FAST);
         stats.included_revert_rate_ewma = ewma(
             stats.included_revert_rate_ewma,
             if success { 0.0 } else { 1.0 },
             EWMA_FAST,
         );
-        stats.realized_capture_ewma =
-            ewma(stats.realized_capture_ewma, capture_ratio(expected_profit_wei, realized_profit_eth), EWMA_SLOW);
+        stats.realized_capture_ewma = ewma(
+            stats.realized_capture_ewma,
+            capture_ratio(expected_profit_wei, realized_profit_eth),
+            EWMA_SLOW,
+        );
         self.record_finalization(
             expected_profit_wei,
             realized_profit_eth,
@@ -875,8 +887,7 @@ impl AdaptivePolicy {
             ewma(stats.inclusion_success_rate_ewma, success, EWMA_FAST);
         stats.accepted_not_included_rate_ewma =
             ewma(stats.accepted_not_included_rate_ewma, miss, EWMA_FAST);
-        stats.included_revert_rate_ewma =
-            ewma(stats.included_revert_rate_ewma, revert, EWMA_FAST);
+        stats.included_revert_rate_ewma = ewma(stats.included_revert_rate_ewma, revert, EWMA_FAST);
         stats.realized_capture_ewma = ewma(
             stats.realized_capture_ewma,
             capture_ratio(expected_profit_wei, realized_profit_eth),
@@ -886,27 +897,34 @@ impl AdaptivePolicy {
     }
 
     pub fn record_receipt_timeout(&mut self, finalization_latency_ms: f64) {
-        self.finalize_latency_ewma_ms =
-            ewma(self.finalize_latency_ewma_ms, finalization_latency_ms, EWMA_FAST);
+        self.finalize_latency_ewma_ms = ewma(
+            self.finalize_latency_ewma_ms,
+            finalization_latency_ms,
+            EWMA_FAST,
+        );
         self.timeout_rate_ewma = ewma(self.timeout_rate_ewma, 1.0, EWMA_FAST);
         self.inclusion_success_rate_ewma = ewma(self.inclusion_success_rate_ewma, 0.0, EWMA_FAST);
         self.accepted_not_included_rate_ewma =
             ewma(self.accepted_not_included_rate_ewma, 1.0, EWMA_FAST);
-        self.included_revert_rate_ewma =
-            ewma(self.included_revert_rate_ewma, 0.0, EWMA_FAST);
+        self.included_revert_rate_ewma = ewma(self.included_revert_rate_ewma, 0.0, EWMA_FAST);
         self.success_rate_ewma = ewma(self.success_rate_ewma, 0.0, EWMA_FAST);
         self.failure_rate_ewma = ewma(self.failure_rate_ewma, 1.0, EWMA_FAST);
     }
 
     pub fn record_receipt_timeout_for_relay(&mut self, relay: &str, finalization_latency_ms: f64) {
-        let stats = self.relay_stats.entry(relay.to_string()).or_insert_with(RelayStats::default);
-        stats.finalization_latency_ewma_ms =
-            ewma(stats.finalization_latency_ewma_ms, finalization_latency_ms, EWMA_FAST);
+        let stats = self
+            .relay_stats
+            .entry(relay.to_string())
+            .or_insert_with(RelayStats::default);
+        stats.finalization_latency_ewma_ms = ewma(
+            stats.finalization_latency_ewma_ms,
+            finalization_latency_ms,
+            EWMA_FAST,
+        );
         stats.inclusion_success_rate_ewma = ewma(stats.inclusion_success_rate_ewma, 0.0, EWMA_FAST);
         stats.accepted_not_included_rate_ewma =
             ewma(stats.accepted_not_included_rate_ewma, 1.0, EWMA_FAST);
-        stats.included_revert_rate_ewma =
-            ewma(stats.included_revert_rate_ewma, 0.0, EWMA_FAST);
+        stats.included_revert_rate_ewma = ewma(stats.included_revert_rate_ewma, 0.0, EWMA_FAST);
         self.record_receipt_timeout(finalization_latency_ms);
     }
 
@@ -943,7 +961,8 @@ impl AdaptivePolicy {
             let age_secs = now.duration_since(flow.observed_at).as_secs_f64();
             let recency_weight = (-age_secs / 4.0).exp();
             let size_weight = 1.0 + (flow.notional_eth.max(0.0).ln_1p() / 8.0).clamp(0.0, 0.5);
-            let gas_weight = 1.0 + (flow.gas_price_gwei / self.gas_price_ewma_gwei.max(1.0)).clamp(0.0, 2.0) * 0.10;
+            let gas_weight = 1.0
+                + (flow.gas_price_gwei / self.gas_price_ewma_gwei.max(1.0)).clamp(0.0, 2.0) * 0.10;
             let weight = recency_weight * size_weight * gas_weight;
             total_weight += weight;
             total_recent += recency_weight;
@@ -990,9 +1009,7 @@ impl AdaptivePolicy {
         if self.gas_price_ewma_gwei <= f64::EPSILON {
             return 0.0;
         }
-        ((current_gwei / self.gas_price_ewma_gwei) - 1.0)
-            .clamp(0.0, 2.0)
-            / 2.0
+        ((current_gwei / self.gas_price_ewma_gwei) - 1.0).clamp(0.0, 2.0) / 2.0
     }
 
     fn latency_penalty(&self, current_lookup_ms: f64) -> f64 {
@@ -1008,8 +1025,8 @@ impl AdaptivePolicy {
     fn impact_hint(&self, notional_eth: f64, path_len: usize) -> f64 {
         let size_multiple = notional_eth.max(0.0) / self.min_large_swap_eth.max(1e-9);
         let size_curve = (size_multiple.ln_1p() / 3.6).clamp(0.0, 1.0);
-        let profit_curve = ((notional_eth / self.min_profit_eth.max(1e-9)).ln_1p() / 14.0)
-            .clamp(0.0, 1.0);
+        let profit_curve =
+            ((notional_eth / self.min_profit_eth.max(1e-9)).ln_1p() / 14.0).clamp(0.0, 1.0);
         let multi_hop_penalty = path_penalty(path_len) * 0.18;
         (size_curve * 0.58 + profit_curve * 0.42 - multi_hop_penalty).clamp(0.0, 1.0)
     }
@@ -1268,12 +1285,10 @@ impl AdaptivePolicy {
         let inclusion_instability = (1.0 - self.inclusion_success_rate_ewma).clamp(0.0, 1.0);
         let accepted_not_included = self.accepted_not_included_rate_ewma.clamp(0.0, 1.0);
         let included_revert = self.included_revert_rate_ewma.clamp(0.0, 1.0);
-        let submit_latency = ((self.submit_latency_ewma_ms / SUBMIT_TARGET_MS) - 1.0)
-            .clamp(0.0, 2.0)
-            / 2.0;
-        let finalization_latency = ((self.finalize_latency_ewma_ms / FINALIZE_TARGET_MS) - 1.0)
-            .clamp(0.0, 2.0)
-            / 2.0;
+        let submit_latency =
+            ((self.submit_latency_ewma_ms / SUBMIT_TARGET_MS) - 1.0).clamp(0.0, 2.0) / 2.0;
+        let finalization_latency =
+            ((self.finalize_latency_ewma_ms / FINALIZE_TARGET_MS) - 1.0).clamp(0.0, 2.0) / 2.0;
         let poor_realization = (1.0 - self.realized_capture_ewma).clamp(0.0, 1.0);
 
         (relay_rejection * 0.24
@@ -1287,15 +1302,13 @@ impl AdaptivePolicy {
             .clamp(0.0, 1.0)
     }
 
-    fn builder_path_pressure_for_cluster(
-        &self,
-        relay: Option<&str>,
-        cluster: ClusterKey,
-    ) -> f64 {
+    fn builder_path_pressure_for_cluster(&self, relay: Option<&str>, cluster: ClusterKey) -> f64 {
         let base = relay
             .map(|relay| self.builder_path_pressure_for_relay(relay))
             .unwrap_or_else(|| self.builder_path_pressure());
-        let Some(context) = relay.and_then(|relay| self.relay_context_stats.get(&(relay.to_string(), cluster))) else {
+        let Some(context) =
+            relay.and_then(|relay| self.relay_context_stats.get(&(relay.to_string(), cluster)))
+        else {
             return base;
         };
 
@@ -1304,8 +1317,9 @@ impl AdaptivePolicy {
         let revert = context.included_revert_rate_ewma.clamp(0.0, 1.0);
         let poor_realization = (1.0 - context.realized_capture_ewma).clamp(0.0, 1.0);
         let confidence = (context.samples.min(24) as f64 / 24.0).clamp(0.0, 1.0);
-        let contextual = (success_drag * 0.24 + miss * 0.36 + revert * 0.24 + poor_realization * 0.16)
-            .clamp(0.0, 1.0);
+        let contextual =
+            (success_drag * 0.24 + miss * 0.36 + revert * 0.24 + poor_realization * 0.16)
+                .clamp(0.0, 1.0);
         (base * (1.0 - confidence * 0.35) + contextual * confidence * 0.65).clamp(0.0, 1.0)
     }
 
@@ -1340,10 +1354,9 @@ impl AdaptivePolicy {
         let revert = profile.revert_rate.clamp(0.0, 1.0);
         let poor_realization = (1.0 - profile.realized_capture).clamp(0.0, 1.0);
 
-        let competition_mult = 1.0
-            + (miss * 0.34 + instability * 0.18) * confidence;
-        let risk_mult = 1.0
-            + (revert * 0.42 + poor_realization * 0.24 + instability * 0.10) * confidence;
+        let competition_mult = 1.0 + (miss * 0.34 + instability * 0.18) * confidence;
+        let risk_mult =
+            1.0 + (revert * 0.42 + poor_realization * 0.24 + instability * 0.10) * confidence;
         let threshold_mult = 1.0
             + (miss * 0.26 + revert * 0.18 + instability * 0.18 + poor_realization * 0.14)
                 * confidence;
@@ -1446,12 +1459,10 @@ impl AdaptivePolicy {
         let inclusion_instability = (1.0 - stats.inclusion_success_rate_ewma).clamp(0.0, 1.0);
         let accepted_not_included = stats.accepted_not_included_rate_ewma.clamp(0.0, 1.0);
         let included_revert = stats.included_revert_rate_ewma.clamp(0.0, 1.0);
-        let submit_latency = ((stats.submit_latency_ewma_ms / SUBMIT_TARGET_MS) - 1.0)
-            .clamp(0.0, 2.0)
-            / 2.0;
-        let finalization_latency = ((stats.finalization_latency_ewma_ms / FINALIZE_TARGET_MS) - 1.0)
-            .clamp(0.0, 2.0)
-            / 2.0;
+        let submit_latency =
+            ((stats.submit_latency_ewma_ms / SUBMIT_TARGET_MS) - 1.0).clamp(0.0, 2.0) / 2.0;
+        let finalization_latency =
+            ((stats.finalization_latency_ewma_ms / FINALIZE_TARGET_MS) - 1.0).clamp(0.0, 2.0) / 2.0;
         let poor_realization = (1.0 - stats.realized_capture_ewma).clamp(0.0, 1.0);
 
         (relay_rejection * 0.26
@@ -1624,7 +1635,10 @@ impl HiddenMarkovModel {
             normalize_row(&mut alpha, t);
         }
 
-        (0..states).map(|i| alpha[[t_len - 1, i]]).sum::<f64>().clamp(0.0, 1.0)
+        (0..states)
+            .map(|i| alpha[[t_len - 1, i]])
+            .sum::<f64>()
+            .clamp(0.0, 1.0)
     }
 
     pub fn baum_welch(&mut self, observations: &[usize], max_iter: usize, tol: f64) {
@@ -1792,7 +1806,8 @@ impl HjbSolver {
                     let action = action_step as f64 / 100.0;
                     let next_state = ((state as f64 + action * self.dt).round() as usize)
                         .min(self.value_function.len() - 1);
-                    let value = reward_fn(state, action) + self.dt * self.value_function[next_state];
+                    let value =
+                        reward_fn(state, action) + self.dt * self.value_function[next_state];
                     if value > best_value {
                         best_value = value;
                         best_action = action;
@@ -1898,8 +1913,7 @@ mod tests {
                 "https://relay-b.test".to_string(),
             ],
             executor_private_key:
-                "0x59c6995e998f97a5a0044966f0945382d7a7d4f6d8f1f0db6b90e6a2f17d5f52"
-                    .to_string(),
+                "0x59c6995e998f97a5a0044966f0945382d7a7d4f6d8f1f0db6b90e6a2f17d5f52".to_string(),
             executor_address: Address::from_low_u64_be(10),
             vault_address: Address::from_low_u64_be(11),
             profit_address: Address::from_low_u64_be(12),
@@ -1952,6 +1966,8 @@ mod tests {
                 gas_overpay_max_extra_bps: 5_000,
                 stop_loss_consecutive_losses: 3,
                 stop_loss_freeze_secs: 300,
+                context_stop_loss_consecutive_losses: 2,
+                context_stop_loss_freeze_secs: 180,
                 capital_multiplier_aggressive: 2.0,
                 capital_multiplier_neutral: 1.0,
                 capital_multiplier_defensive: 0.3,
@@ -2019,7 +2035,10 @@ mod tests {
 
         assert!(stressed_quote.threshold_dynamic_usd > base_quote.threshold_dynamic_usd);
         assert!(stressed_quote.competition_score >= base_quote.competition_score);
-        assert!(matches!(stressed_quote.regime, MarketRegime::Hot | MarketRegime::Toxic));
+        assert!(matches!(
+            stressed_quote.regime,
+            MarketRegime::Hot | MarketRegime::Toxic
+        ));
     }
 
     #[test]
@@ -2055,6 +2074,9 @@ mod tests {
             &config.builder_relays,
         );
 
-        assert_eq!(quote.selected_relay.as_deref(), Some("https://relay-b.test"));
+        assert_eq!(
+            quote.selected_relay.as_deref(),
+            Some("https://relay-b.test")
+        );
     }
 }
