@@ -6,11 +6,10 @@ use crate::mev::amm::uniswap_v2::V2PoolState;
 use crate::mev::amm::uniswap_v3::V3PoolState;
 use ethers::types::{Address, Bytes, Transaction, H256, U256};
 use revm::{
-    primitives::{
-        AccountInfo, Address as RAddress, Bytecode, B256, TransactTo, KECCAK_EMPTY,
-        U256 as rU256,
-    },
     db::{CacheDB, EmptyDB},
+    primitives::{
+        AccountInfo, Address as RAddress, Bytecode, TransactTo, B256, KECCAK_EMPTY, U256 as rU256,
+    },
     EVM,
 };
 use std::collections::HashMap;
@@ -81,7 +80,7 @@ impl StateSimulator {
         state_overrides: HashMap<Address, AccountState>,
     ) -> Result<EvmPreflightResult, String> {
         debug!("Running EVM preflight for tx: {:?}", tx.hash);
-        
+
         // Setup REVM environment
         let mut evm = EVM::new();
         evm.database(CacheDB::new(EmptyDB::new()));
@@ -116,10 +115,15 @@ impl StateSimulator {
                 code: state.code.map(|code| Bytecode::new_raw(code.0.into())),
             };
             db.insert_account_info(addr, account_info);
-            
+
             // Insert storage slots
             for (slot, value) in state.storage {
-                db.insert_account_storage(addr, rU256::from_limbs(slot.0), rU256::from_limbs(value.0)).unwrap();
+                db.insert_account_storage(
+                    addr,
+                    rU256::from_limbs(slot.0),
+                    rU256::from_limbs(value.0),
+                )
+                .unwrap();
             }
         }
 
@@ -134,17 +138,23 @@ impl StateSimulator {
                     .iter()
                     .map(|log| EvmLog {
                         address: Address::from_slice(log.address.as_slice()),
-                        topics: log.topics.iter().map(|topic| H256::from_slice(topic.as_slice())).collect(),
+                        topics: log
+                            .topics
+                            .iter()
+                            .map(|topic| H256::from_slice(topic.as_slice()))
+                            .collect(),
                         data: Bytes::from(log.data.as_ref().to_vec()),
                     })
                     .collect::<Vec<_>>();
 
                 // Extract profit from logs or result
                 let profit_wei = Self::extract_profit_from_logs(&logs, config.profit_address);
-                
-                debug!("EVm preflight completed: success={}, gas={}, profit={}", 
-                       success, gas_used, profit_wei);
-                
+
+                debug!(
+                    "EVm preflight completed: success={}, gas={}, profit={}",
+                    success, gas_used, profit_wei
+                );
+
                 Ok(EvmPreflightResult {
                     success,
                     gas_used,
@@ -172,7 +182,13 @@ impl StateSimulator {
         // This is simplified - real implementation would decode specific event signatures
         let mut profit = U256::zero();
         for log in logs {
-            if log.topics.len() >= 3 && log.topics[0] == H256::from_str("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef").unwrap() {
+            if log.topics.len() >= 3
+                && log.topics[0]
+                    == H256::from_str(
+                        "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+                    )
+                    .unwrap()
+            {
                 // Transfer event: from, to, value
                 let to = Address::from_slice(&log.topics[2].as_bytes()[12..]);
                 if to == profit_recipient {
