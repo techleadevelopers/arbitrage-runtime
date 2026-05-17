@@ -937,6 +937,19 @@ impl AdaptivePolicy {
         quotes
     }
 
+    pub fn rank_relays_for_cluster(
+        &self,
+        relays: &[String],
+        cluster: ClusterKey,
+    ) -> Vec<RelayQuote> {
+        let mut quotes = relays
+            .iter()
+            .map(|relay| self.relay_quote_for_cluster(relay, cluster))
+            .collect::<Vec<_>>();
+        quotes.sort_by(|left, right| left.score.total_cmp(&right.score));
+        quotes
+    }
+
     fn prune(&mut self, now: Instant) {
         while matches!(
             self.recent_flows.front(),
@@ -1447,6 +1460,25 @@ impl AdaptivePolicy {
             finalization_latency_ms,
             score,
         }
+    }
+
+    fn relay_quote_for_cluster(&self, relay: &str, cluster: ClusterKey) -> RelayQuote {
+        let mut quote = self.relay_quote(relay);
+        let Some(context) = self.relay_context_stats.get(&(relay.to_string(), cluster)) else {
+            return quote;
+        };
+        let confidence = (context.samples.min(24) as f64 / 24.0).clamp(0.0, 1.0);
+        let contextual_miss_penalty =
+            context.accepted_not_included_rate_ewma.clamp(0.0, 1.0) * confidence * 0.22;
+        let contextual_revert_penalty =
+            context.included_revert_rate_ewma.clamp(0.0, 1.0) * confidence * 0.10;
+        let contextual_success_credit =
+            context.inclusion_success_rate_ewma.clamp(0.0, 1.0) * confidence * 0.06;
+        quote.relay_pressure = self.builder_path_pressure_for_cluster(Some(relay), cluster);
+        quote.score = (quote.score + contextual_miss_penalty + contextual_revert_penalty
+            - contextual_success_credit)
+            .clamp(0.0, 2.0);
+        quote
     }
 
     fn builder_path_pressure_for_relay(&self, relay: &str) -> f64 {
@@ -2078,5 +2110,27 @@ mod tests {
             quote.selected_relay.as_deref(),
             Some("https://relay-b.test")
         );
+    }
+
+    #[test]
+    fn cluster_ranking_penalizes_accepted_not_included_paths() {
+        let config = test_config("bsc");
+        let cluster = sample_cluster();
+        let mut policy = AdaptivePolicy::new(&config);
+        for _ in 0..12 {
+            policy.record_contextual_outcome(
+                "https://relay-a.test",
+                cluster,
+                ethers::utils::parse_ether("0.01").unwrap(),
+                0.0,
+                ContextualOutcomeKind::AcceptedNotIncluded,
+            );
+        }
+        let ranked = policy.rank_relays_for_cluster(&config.builder_relays, cluster);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].relay, "https://relay-b.test");
+        assert_eq!(ranked[1].relay, "https://relay-a.test");
+        assert!(ranked[1].score > ranked[0].score);
+        assert!(ranked[1].relay_pressure >= ranked[0].relay_pressure);
     }
 }
