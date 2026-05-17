@@ -7,7 +7,9 @@ use crate::mev::adaptive::{ClusterKey, ContextualOutcomeKind, RelayQuote, Shared
 use crate::mev::execution::payload_builder::AmmRouteKind;
 use crate::mev::opportunity::{wei_to_eth_f64, MevOpportunity};
 use crate::mev::pnl::tracker::{ExecutionResult, PnlTracker};
-use crate::mev::simulation::state_simulator::{AccountState, AmmState, EvmPreflightResult, StateSimulator};
+use crate::mev::simulation::state_simulator::{
+    AccountState, AmmState, EvmPreflightResult, StateSimulator,
+};
 use crate::rpc::{RpcFleet, RpcHandle};
 use ethers::contract::abigen;
 use ethers::prelude::*;
@@ -15,6 +17,7 @@ use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers_flashbots::{BundleRequest, FlashbotsMiddleware};
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
@@ -51,11 +54,42 @@ struct SendContext {
 struct ExecutionGuard {
     consecutive_losses: u32,
     frozen_until: Option<Instant>,
+    context_guards: HashMap<ContextFreezeKey, ContextExecutionGuard>,
+}
+
+#[derive(Clone, Debug, Eq)]
+struct ContextFreezeKey {
+    pair: Address,
+    router: Address,
+    submit_path: String,
+}
+
+impl PartialEq for ContextFreezeKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.pair == other.pair
+            && self.router == other.router
+            && self.submit_path == other.submit_path
+    }
+}
+
+impl Hash for ContextFreezeKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.pair.hash(state);
+        self.router.hash(state);
+        self.submit_path.hash(state);
+    }
+}
+
+#[derive(Default)]
+struct ContextExecutionGuard {
+    consecutive_losses: u32,
+    frozen_until: Option<Instant>,
 }
 
 struct StopLossSnapshot {
     consecutive_losses: u32,
     remaining_freeze_secs: u64,
+    scope: &'static str,
 }
 
 impl ExecutionEngine {
@@ -100,9 +134,13 @@ impl ExecutionEngine {
             }
             AmmState::UniswapV3(pool) => {
                 let mut pool_account = AccountState::empty();
-                pool_account.storage.insert(U256::from(0), pool.sqrt_price_x96);
+                pool_account
+                    .storage
+                    .insert(U256::from(0), pool.sqrt_price_x96);
                 pool_account.storage.insert(U256::from(1), pool.liquidity);
-                pool_account.storage.insert(U256::from(2), U256::from(pool.current_tick as i128));
+                pool_account
+                    .storage
+                    .insert(U256::from(2), U256::from(pool.current_tick as i128));
                 state_overrides.insert(pool.pool, pool_account);
             }
         }
@@ -140,7 +178,13 @@ impl ExecutionEngine {
             ),
         );
 
-        StateSimulator::evm_preflight_execution(&self.config, &mock_tx, block_number, state_overrides).await
+        StateSimulator::evm_preflight_execution(
+            &self.config,
+            &mock_tx,
+            block_number,
+            state_overrides,
+        )
+        .await
     }
 
     pub async fn handle(
@@ -178,7 +222,8 @@ impl ExecutionEngine {
             self.dashboard.event(
                 "warn",
                 format!(
-                    "fee extraction frozen by stop-loss victim={:?}: consecutive_losses={} remaining_freeze_secs={}",
+                    "fee extraction frozen by {} stop-loss victim={:?}: consecutive_losses={} remaining_freeze_secs={}",
+                    snapshot.scope,
                     opportunity.victim_tx,
                     snapshot.consecutive_losses,
                     snapshot.remaining_freeze_secs
@@ -200,7 +245,8 @@ impl ExecutionEngine {
         let hot_balance = send_context.hot_balance;
         let hot_balance_eth = wei_to_eth_f64(hot_balance);
         let buffer_status = self.hot_wallet_status(hot_balance_eth);
-        self.dashboard.set_executor_balance(hot_balance_eth, buffer_status);
+        self.dashboard
+            .set_executor_balance(hot_balance_eth, buffer_status);
         self.maybe_emit_treasury_signal(hot_balance_eth);
         if let Some(max_gas_price_wei) = self.config.mev.max_gas_price_wei() {
             if send_context.gas_price > max_gas_price_wei {
@@ -361,13 +407,32 @@ impl ExecutionEngine {
             );
             return Ok(());
         }
-        let ranked_submit_paths = if self.config.uses_bundle_relays() {
+        let mut ranked_submit_paths = if self.config.uses_bundle_relays() {
             self.rank_relay_submit_paths(opportunity.preferred_relay.as_deref())
         } else {
             self.rank_direct_rpc_submit_paths(&send_context.endpoint)
         };
-        let gas_price_to_use =
-            self.dynamic_gas_price(send_context.gas_price, ranked_submit_paths.first(), &payload);
+        ranked_submit_paths.retain(|quote| {
+            self.context_stop_loss_snapshot(payload.pair, opportunity.router, &quote.relay)
+                .is_none()
+        });
+        if ranked_submit_paths.is_empty() {
+            self.dashboard.event(
+                "warn",
+                format!(
+                    "fee extraction frozen by contextual stop-loss victim={:?}: pair={:?} router={:?} no submit path available",
+                    opportunity.victim_tx,
+                    payload.pair,
+                    opportunity.router
+                ),
+            );
+            return Ok(());
+        }
+        let gas_price_to_use = self.dynamic_gas_price(
+            send_context.gas_price,
+            ranked_submit_paths.first(),
+            &payload,
+        );
         if gas_price_to_use != send_context.gas_price {
             self.dashboard.event(
                 "info",
@@ -415,7 +480,8 @@ impl ExecutionEngine {
         }
 
         if !self.config.uses_bundle_relays() {
-            let submit_endpoints = self.direct_rpc_submit_endpoints(&send_context.endpoint);
+            let submit_endpoints =
+                self.direct_rpc_submit_endpoints_from_ranked_paths(&ranked_submit_paths);
 
             let mut last_submit_error: Option<String> = None;
             let mut submit_set = JoinSet::new();
@@ -427,8 +493,18 @@ impl ExecutionEngine {
                 submit_set.spawn(async move {
                     let started = Instant::now();
                     let submit_outcome = match provider.send_raw_transaction(tx).await {
-                        Ok(pending) => Ok((endpoint_id, endpoint_name, started.elapsed(), pending.tx_hash())),
-                        Err(err) => Err((endpoint_id, endpoint_name, started.elapsed(), err.to_string())),
+                        Ok(pending) => Ok((
+                            endpoint_id,
+                            endpoint_name,
+                            started.elapsed(),
+                            pending.tx_hash(),
+                        )),
+                        Err(err) => Err((
+                            endpoint_id,
+                            endpoint_name,
+                            started.elapsed(),
+                            err.to_string(),
+                        )),
                     };
                     submit_outcome
                 });
@@ -442,14 +518,12 @@ impl ExecutionEngine {
                     Ok((endpoint_id, endpoint_name, elapsed, tx_hash)) => {
                         self.rpc_fleet.reserve_send_selection(endpoint_id);
                         let submit_latency_ms = elapsed.as_millis() as f64;
-                        self.rpc_fleet.record_success(
-                            endpoint_id,
-                            elapsed,
-                            Some(target_block),
-                        );
+                        self.rpc_fleet
+                            .record_success(endpoint_id, elapsed, Some(target_block));
                         let relay_label = format!("rpc://{}", endpoint_name);
                         if let Ok(mut adaptive) = self.adaptive.lock() {
-                            adaptive.record_submit_success_for_relay(&relay_label, submit_latency_ms);
+                            adaptive
+                                .record_submit_success_for_relay(&relay_label, submit_latency_ms);
                         }
                         self.dashboard.record_latency(
                             "fee_rpc_submit",
@@ -479,7 +553,12 @@ impl ExecutionEngine {
                                 submit_latency_ms,
                             )
                             .await?;
-                        self.record_result(&realized);
+                        self.record_result(
+                            &realized,
+                            Some(payload.pair),
+                            Some(opportunity.router),
+                            Some(relay_label.as_str()),
+                        );
                         return Ok(());
                     }
                     Err((endpoint_id, endpoint_name, _elapsed, err_text)) => {
@@ -505,9 +584,7 @@ impl ExecutionEngine {
                                 "warn",
                                 format!(
                                     "fee extraction rpc submit failed victim={:?} via {}: {}",
-                                    opportunity.victim_tx,
-                                    endpoint_name,
-                                    err_text
+                                    opportunity.victim_tx, endpoint_name, err_text
                                 ),
                             );
                         }
@@ -518,6 +595,18 @@ impl ExecutionEngine {
                 }
             }
 
+            if let Some(path) = ranked_submit_paths.first() {
+                self.record_result(
+                    &ExecutionResult {
+                        realized_profit: 0.0,
+                        gas_used: 0,
+                        success: false,
+                    },
+                    Some(payload.pair),
+                    Some(opportunity.router),
+                    Some(path.relay.as_str()),
+                );
+            }
             return Err(last_submit_error
                 .unwrap_or_else(|| "all rpc submit endpoints failed".to_string())
                 .into());
@@ -583,7 +672,10 @@ impl ExecutionEngine {
                         "fee_bundle_submit",
                         submit_latency_ms as u128,
                         None,
-                        Some(&format!("{} via {}", send_context.endpoint.name, relay.relay)),
+                        Some(&format!(
+                            "{} via {}",
+                            send_context.endpoint.name, relay.relay
+                        )),
                     );
                     self.dashboard.event(
                         "success",
@@ -608,11 +700,19 @@ impl ExecutionEngine {
                             submit_latency_ms,
                         )
                         .await?;
-                    self.record_result(&realized);
+                    self.record_result(
+                        &realized,
+                        Some(payload.pair),
+                        Some(opportunity.router),
+                        Some(relay.relay.as_str()),
+                    );
                     return Ok(());
                 }
                 Err((relay, submit_latency_ms, err_text)) => {
-                    warn!("fee extraction bundle failed via {}: {}", relay.relay, err_text);
+                    warn!(
+                        "fee extraction bundle failed via {}: {}",
+                        relay.relay, err_text
+                    );
                     if let Ok(mut adaptive) = self.adaptive.lock() {
                         adaptive.record_submit_failure_for_relay(&relay.relay, submit_latency_ms);
                         adaptive.record_contextual_outcome(
@@ -649,11 +749,18 @@ impl ExecutionEngine {
             }
         }
 
-        self.record_result(&ExecutionResult {
-            realized_profit: 0.0,
-            gas_used: 0,
-            success: false,
-        });
+        self.record_result(
+            &ExecutionResult {
+                realized_profit: 0.0,
+                gas_used: 0,
+                success: false,
+            },
+            Some(payload.pair),
+            Some(opportunity.router),
+            ranked_submit_paths
+                .first()
+                .map(|quote| quote.relay.as_str()),
+        );
         Err(last_error
             .unwrap_or_else(|| "no relay submission path available".to_string())
             .into())
@@ -683,10 +790,8 @@ impl ExecutionEngine {
                     Ok(receipt) => receipt,
                     Err(err) => {
                         let err_text = err.to_string();
-                        self.rpc_fleet.record_failure(
-                            handle.id,
-                            RpcFleet::classify_failure(&err_text),
-                        );
+                        self.rpc_fleet
+                            .record_failure(handle.id, RpcFleet::classify_failure(&err_text));
                         continue;
                     }
                 };
@@ -702,11 +807,21 @@ impl ExecutionEngine {
                     .gas_used
                     .unwrap_or_default()
                     .saturating_mul(effective_gas_price);
-                let success = receipt.status.map(|status| status.as_u64() == 1).unwrap_or(false);
+                let success = receipt
+                    .status
+                    .map(|status| status.as_u64() == 1)
+                    .unwrap_or(false);
                 let realized_profit = if success {
-                    self.realized_profit_eth(handle.provider.clone(), payload, &receipt, gas_paid_wei)
-                        .await
-                        .unwrap_or_else(|| wei_to_eth_f64(payload.expected_profit_wei) - wei_to_eth_f64(gas_paid_wei))
+                    self.realized_profit_eth(
+                        handle.provider.clone(),
+                        payload,
+                        &receipt,
+                        gas_paid_wei,
+                    )
+                    .await
+                    .unwrap_or_else(|| {
+                        wei_to_eth_f64(payload.expected_profit_wei) - wei_to_eth_f64(gas_paid_wei)
+                    })
                 } else {
                     -wei_to_eth_f64(gas_paid_wei)
                 };
@@ -928,8 +1043,16 @@ impl ExecutionEngine {
         handles
     }
 
-    fn record_result(&self, result: &ExecutionResult) {
-        let freeze_armed = {
+    fn record_result(
+        &self,
+        result: &ExecutionResult,
+        pair: Option<Address>,
+        router: Option<Address>,
+        submit_path: Option<&str>,
+    ) {
+        let mut global_freeze_armed = false;
+        let mut contextual_freeze_armed = false;
+        {
             let mut guard = match self.execution_guard.lock() {
                 Ok(guard) => guard,
                 Err(_) => return,
@@ -937,19 +1060,45 @@ impl ExecutionEngine {
             if result.success && result.realized_profit > 0.0 {
                 guard.consecutive_losses = 0;
                 guard.frozen_until = None;
-                false
             } else {
                 guard.consecutive_losses = guard.consecutive_losses.saturating_add(1);
                 if guard.consecutive_losses >= self.config.mev.stop_loss_consecutive_losses {
                     guard.frozen_until = Some(
                         Instant::now() + Duration::from_secs(self.config.mev.stop_loss_freeze_secs),
                     );
-                    true
-                } else {
-                    false
+                    global_freeze_armed = true;
                 }
             }
-        };
+            if let (Some(pair), Some(router), Some(submit_path)) = (pair, router, submit_path) {
+                let key = ContextFreezeKey {
+                    pair,
+                    router,
+                    submit_path: submit_path.to_string(),
+                };
+                let state = guard
+                    .context_guards
+                    .entry(key)
+                    .or_insert_with(ContextExecutionGuard::default);
+                if result.success && result.realized_profit > 0.0 {
+                    state.consecutive_losses = 0;
+                    state.frozen_until = None;
+                } else {
+                    state.consecutive_losses = state.consecutive_losses.saturating_add(1);
+                    if state.consecutive_losses
+                        >= self.config.mev.context_stop_loss_consecutive_losses
+                    {
+                        state.frozen_until = Some(
+                            Instant::now()
+                                + Duration::from_secs(
+                                    self.config.mev.context_stop_loss_freeze_secs,
+                                ),
+                        );
+                        contextual_freeze_armed = true;
+                    }
+                }
+            }
+            prune_context_guards(&mut guard.context_guards);
+        }
         if let Ok(mut pnl) = self.pnl.lock() {
             pnl.record(result);
             self.dashboard.event(
@@ -964,7 +1113,7 @@ impl ExecutionEngine {
                 ),
             );
         }
-        if freeze_armed {
+        if global_freeze_armed {
             self.dashboard.event(
                 "warn",
                 format!(
@@ -973,6 +1122,21 @@ impl ExecutionEngine {
                     self.config.mev.stop_loss_freeze_secs
                 ),
             );
+        }
+        if contextual_freeze_armed {
+            if let (Some(pair), Some(router), Some(submit_path)) = (pair, router, submit_path) {
+                self.dashboard.event(
+                    "warn",
+                    format!(
+                        "contextual stop-loss armed: pair={:?} router={:?} path={} consecutive_losses>={} freeze_secs={}",
+                        pair,
+                        router,
+                        submit_path,
+                        self.config.mev.context_stop_loss_consecutive_losses,
+                        self.config.mev.context_stop_loss_freeze_secs
+                    ),
+                );
+            }
         }
     }
 
@@ -990,6 +1154,37 @@ impl ExecutionEngine {
         Some(StopLossSnapshot {
             consecutive_losses: guard.consecutive_losses,
             remaining_freeze_secs: frozen_until.saturating_duration_since(now).as_secs(),
+            scope: "global",
+        })
+    }
+
+    fn context_stop_loss_snapshot(
+        &self,
+        pair: Address,
+        router: Address,
+        submit_path: &str,
+    ) -> Option<StopLossSnapshot> {
+        let Ok(mut guard) = self.execution_guard.lock() else {
+            return None;
+        };
+        let key = ContextFreezeKey {
+            pair,
+            router,
+            submit_path: submit_path.to_string(),
+        };
+        let state = guard.context_guards.get_mut(&key)?;
+        let frozen_until = state.frozen_until?;
+        let now = Instant::now();
+        if now >= frozen_until {
+            state.frozen_until = None;
+            state.consecutive_losses = 0;
+            guard.context_guards.remove(&key);
+            return None;
+        }
+        Some(StopLossSnapshot {
+            consecutive_losses: state.consecutive_losses,
+            remaining_freeze_secs: frozen_until.saturating_duration_since(now).as_secs(),
+            scope: "contextual",
         })
     }
 
@@ -1063,7 +1258,9 @@ impl ExecutionEngine {
     }
 
     fn direct_rpc_submit_endpoints(&self, preferred_endpoint: &RpcHandle) -> Vec<RpcHandle> {
-        let mut ranked_by_health = self.rpc_fleet.send_candidates(self.config.mev.rpc_fanout_count.max(1));
+        let mut ranked_by_health = self
+            .rpc_fleet
+            .send_candidates(self.config.mev.rpc_fanout_count.max(1));
         if !ranked_by_health
             .iter()
             .any(|endpoint| endpoint.id == preferred_endpoint.id)
@@ -1079,7 +1276,10 @@ impl ExecutionEngine {
                 .find(|endpoint| relay.relay == format!("rpc://{}", endpoint.name))
                 .cloned()
             {
-                if !ordered.iter().any(|existing: &RpcHandle| existing.id == endpoint.id) {
+                if !ordered
+                    .iter()
+                    .any(|existing: &RpcHandle| existing.id == endpoint.id)
+                {
                     ordered.push(endpoint);
                 }
             }
@@ -1089,6 +1289,30 @@ impl ExecutionEngine {
                 ordered.push(endpoint);
             }
         }
+        ordered.truncate(self.config.mev.rpc_fanout_count.max(1));
+        ordered
+    }
+
+    fn direct_rpc_submit_endpoints_from_ranked_paths(
+        &self,
+        ranked_submit_paths: &[RelayQuote],
+    ) -> Vec<RpcHandle> {
+        let mut candidates = self
+            .rpc_fleet
+            .send_candidates(self.config.mev.rpc_fanout_count.max(1));
+        let mut ordered = Vec::with_capacity(candidates.len());
+        for relay in ranked_submit_paths {
+            if let Some(endpoint_name) = relay.relay.strip_prefix("rpc://") {
+                if let Some(index) = candidates
+                    .iter()
+                    .position(|endpoint| endpoint.name == endpoint_name)
+                {
+                    let endpoint = candidates.remove(index);
+                    ordered.push(endpoint);
+                }
+            }
+        }
+        ordered.extend(candidates);
         ordered.truncate(self.config.mev.rpc_fanout_count.max(1));
         ordered
     }
@@ -1166,21 +1390,22 @@ impl ExecutionEngine {
         let token_in = format!("{:?}", opportunity.token_in);
         let token_out = format!("{:?}", opportunity.token_out);
         let victim_tx = format!("{:?}", tx_hash);
-        self.dashboard.record_execution_outcome(ExecutionOutcomeUpdate {
-            relay,
-            target_block,
-            pair: &pair,
-            router: &router,
-            token_in: &token_in,
-            token_out: &token_out,
-            victim_tx: &victim_tx,
-            outcome,
-            expected_profit_eth: wei_to_eth_f64(payload.expected_profit_wei),
-            realized_profit_eth,
-            gas_used,
-            submit_latency_ms,
-            finalization_latency_ms,
-        });
+        self.dashboard
+            .record_execution_outcome(ExecutionOutcomeUpdate {
+                relay,
+                target_block,
+                pair: &pair,
+                router: &router,
+                token_in: &token_in,
+                token_out: &token_out,
+                victim_tx: &victim_tx,
+                outcome,
+                expected_profit_eth: wei_to_eth_f64(payload.expected_profit_wei),
+                realized_profit_eth,
+                gas_used,
+                submit_latency_ms,
+                finalization_latency_ms,
+            });
     }
 
     fn rank_relays(&self, preferred_relay: Option<&str>) -> Vec<RelayQuote> {
@@ -1272,21 +1497,26 @@ impl ExecutionEngine {
         let vault_address = format!("{:?}", self.config.vault_address);
         let profit_address = format!("{:?}", self.config.profit_address);
 
-        self.dashboard.record_treasury_recommendation(TreasuryRecommendationUpdate {
-            executor_address: &executor_address,
-            vault_address: &vault_address,
-            profit_address: &profit_address,
-            balance_eth,
-            min_buffer_eth: self.config.mev.executor_min_buffer_eth,
-            target_buffer_eth: self.config.mev.executor_target_buffer_eth,
-            max_buffer_eth: self.config.mev.executor_max_buffer_eth,
-            action: signal.action,
-            recommended_amount_eth: signal.recommended_amount_eth,
-            status: signal.status,
-            note: signal.note,
-        });
+        self.dashboard
+            .record_treasury_recommendation(TreasuryRecommendationUpdate {
+                executor_address: &executor_address,
+                vault_address: &vault_address,
+                profit_address: &profit_address,
+                balance_eth,
+                min_buffer_eth: self.config.mev.executor_min_buffer_eth,
+                target_buffer_eth: self.config.mev.executor_target_buffer_eth,
+                max_buffer_eth: self.config.mev.executor_max_buffer_eth,
+                action: signal.action,
+                recommended_amount_eth: signal.recommended_amount_eth,
+                status: signal.status,
+                note: signal.note,
+            });
         self.dashboard.event(
-            if signal.status == "critical" { "warn" } else { "info" },
+            if signal.status == "critical" {
+                "warn"
+            } else {
+                "info"
+            },
             format!(
                 "treasury {} executor_balance={:.6} ETH target={:.6} ETH amount={:.6} ETH note={}",
                 signal.action,
@@ -1489,6 +1719,14 @@ fn format_submit_path(amm_kind: &AmmRouteKind, relay: &str) -> String {
     }
 }
 
+fn prune_context_guards(context_guards: &mut HashMap<ContextFreezeKey, ContextExecutionGuard>) {
+    let now = Instant::now();
+    context_guards.retain(|_, state| match state.frozen_until {
+        Some(frozen_until) => now < frozen_until || state.consecutive_losses > 0,
+        None => state.consecutive_losses > 0,
+    });
+}
+
 async fn sign_executor_transaction(
     wallet: &LocalWallet,
     payload: &crate::mev::execution::payload_builder::ExecutionPayload,
@@ -1539,8 +1777,7 @@ mod tests {
                 Vec::new()
             },
             executor_private_key:
-                "0x59c6995e998f97a5a0044966f0945382d7a7d4f6d8f1f0db6b90e6a2f17d5f52"
-                    .to_string(),
+                "0x59c6995e998f97a5a0044966f0945382d7a7d4f6d8f1f0db6b90e6a2f17d5f52".to_string(),
             executor_address: Address::from_low_u64_be(10),
             vault_address: Address::from_low_u64_be(11),
             profit_address: Address::from_low_u64_be(12),
@@ -1593,6 +1830,8 @@ mod tests {
                 gas_overpay_max_extra_bps: 5_000,
                 stop_loss_consecutive_losses: 3,
                 stop_loss_freeze_secs: 300,
+                context_stop_loss_consecutive_losses: 2,
+                context_stop_loss_freeze_secs: 180,
                 capital_multiplier_aggressive: 2.0,
                 capital_multiplier_neutral: 1.0,
                 capital_multiplier_defensive: 0.3,
