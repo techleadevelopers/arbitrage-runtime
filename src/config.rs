@@ -84,6 +84,8 @@ pub struct MevConfig {
     pub gas_overpay_max_extra_bps: u64,
     pub stop_loss_consecutive_losses: u32,
     pub stop_loss_freeze_secs: u64,
+    pub context_stop_loss_consecutive_losses: u32,
+    pub context_stop_loss_freeze_secs: u64,
     pub capital_multiplier_aggressive: f64,
     pub capital_multiplier_neutral: f64,
     pub capital_multiplier_defensive: f64,
@@ -184,22 +186,24 @@ impl Config {
             .ok_or(
                 "environment variable EXECUTOR_PRIVATE_KEY, SENDER_PRIVATE_KEY or CONTROL_PRIVATE_KEY is not configured",
             )?;
-        let executor_private_key =
-            if runtime_load_test_mode && executor_private_key_candidate.parse::<LocalWallet>().is_err()
-            {
-                "0000000000000000000000000000000000000000000000000000000000000001"
-                    .to_string()
-            } else {
-                executor_private_key_candidate
-            };
-        let executor_address = executor_private_key
-            .parse::<LocalWallet>()?
-            .address();
+        let executor_private_key = if runtime_load_test_mode
+            && executor_private_key_candidate
+                .parse::<LocalWallet>()
+                .is_err()
+        {
+            "0000000000000000000000000000000000000000000000000000000000000001".to_string()
+        } else {
+            executor_private_key_candidate
+        };
+        let executor_address = executor_private_key.parse::<LocalWallet>()?.address();
         let control_address = match env::var("CONTROL_ADDRESS") {
             Ok(value) => match value.trim().parse::<Address>() {
                 Ok(address) => address,
                 Err(err) if runtime_load_test_mode => {
-                    warn!("ignoring invalid CONTROL_ADDRESS for runtime load test: {}", err);
+                    warn!(
+                        "ignoring invalid CONTROL_ADDRESS for runtime load test: {}",
+                        err
+                    );
                     executor_address
                 }
                 Err(err) => return Err(err.into()),
@@ -210,9 +214,8 @@ impl Config {
         if control_address == Address::zero() && !runtime_load_test_mode {
             return Err("environment variable CONTROL_ADDRESS is not configured".into());
         }
-        let vault_address =
-            parse_optional_address_env("VAULT_ADDRESS", runtime_load_test_mode)?
-                .unwrap_or(control_address);
+        let vault_address = parse_optional_address_env("VAULT_ADDRESS", runtime_load_test_mode)?
+            .unwrap_or(control_address);
         let profit_address = parse_optional_address_env("PROFIT_ADDRESS", runtime_load_test_mode)?
             .or(parse_optional_address_env(
                 "MEV_SEARCHER_RECIPIENT",
@@ -347,9 +350,11 @@ impl Config {
             gas_overpay_revert_extra_bps: env::var("MEV_GAS_OVERPAY_REVERT_EXTRA_BPS")
                 .unwrap_or_else(|_| "1200".to_string())
                 .parse::<u64>()?,
-            gas_overpay_submit_failure_extra_bps: env::var("MEV_GAS_OVERPAY_SUBMIT_FAILURE_EXTRA_BPS")
-                .unwrap_or_else(|_| "1500".to_string())
-                .parse::<u64>()?,
+            gas_overpay_submit_failure_extra_bps: env::var(
+                "MEV_GAS_OVERPAY_SUBMIT_FAILURE_EXTRA_BPS",
+            )
+            .unwrap_or_else(|_| "1500".to_string())
+            .parse::<u64>()?,
             gas_overpay_max_extra_bps: env::var("MEV_GAS_OVERPAY_MAX_EXTRA_BPS")
                 .unwrap_or_else(|_| "5000".to_string())
                 .parse::<u64>()?,
@@ -360,6 +365,15 @@ impl Config {
             stop_loss_freeze_secs: env::var("MEV_STOP_LOSS_FREEZE_SECS")
                 .unwrap_or_else(|_| "300".to_string())
                 .parse::<u64>()?,
+            context_stop_loss_consecutive_losses: env::var(
+                "MEV_CONTEXT_STOP_LOSS_CONSECUTIVE_LOSSES",
+            )
+            .unwrap_or_else(|_| "2".to_string())
+            .parse::<u32>()?
+            .max(1),
+            context_stop_loss_freeze_secs: env::var("MEV_CONTEXT_STOP_LOSS_FREEZE_SECS")
+                .unwrap_or_else(|_| "180".to_string())
+                .parse::<u64>()?,
             capital_multiplier_aggressive: env::var("MEV_CAPITAL_MULTIPLIER_AGGRESSIVE")
                 .unwrap_or_else(|_| "2.0".to_string())
                 .parse::<f64>()?,
@@ -369,12 +383,16 @@ impl Config {
             capital_multiplier_defensive: env::var("MEV_CAPITAL_MULTIPLIER_DEFENSIVE")
                 .unwrap_or_else(|_| "0.3".to_string())
                 .parse::<f64>()?,
-            capital_multiplier_priority_threshold: env::var("MEV_CAPITAL_MULTIPLIER_PRIORITY_THRESHOLD")
-                .unwrap_or_else(|_| "0.60".to_string())
-                .parse::<f64>()?,
-            capital_multiplier_toxicity_threshold: env::var("MEV_CAPITAL_MULTIPLIER_TOXICITY_THRESHOLD")
-                .unwrap_or_else(|_| "0.65".to_string())
-                .parse::<f64>()?,
+            capital_multiplier_priority_threshold: env::var(
+                "MEV_CAPITAL_MULTIPLIER_PRIORITY_THRESHOLD",
+            )
+            .unwrap_or_else(|_| "0.60".to_string())
+            .parse::<f64>()?,
+            capital_multiplier_toxicity_threshold: env::var(
+                "MEV_CAPITAL_MULTIPLIER_TOXICITY_THRESHOLD",
+            )
+            .unwrap_or_else(|_| "0.65".to_string())
+            .parse::<f64>()?,
             uniswap_v2_factory: parse_optional_address_env(
                 "MEV_UNISWAP_V2_FACTORY",
                 runtime_load_test_mode,
@@ -383,7 +401,10 @@ impl Config {
                 "MEV_UNISWAP_V3_FACTORY",
                 runtime_load_test_mode,
             )?,
-            mev_executor: parse_optional_address_env("MEV_EXECUTOR_ADDRESS", runtime_load_test_mode)?,
+            mev_executor: parse_optional_address_env(
+                "MEV_EXECUTOR_ADDRESS",
+                runtime_load_test_mode,
+            )?,
         };
 
         let mut infura_ids = Vec::new();
@@ -497,11 +518,7 @@ impl MevConfig {
             .map(|value| U256::from(value).saturating_mul(U256::from(1_000_000_000u64)))
     }
 
-    pub fn contextual_capital_multiplier(
-        &self,
-        priority_score: f64,
-        toxicity_score: f64,
-    ) -> f64 {
+    pub fn contextual_capital_multiplier(&self, priority_score: f64, toxicity_score: f64) -> f64 {
         if toxicity_score >= self.capital_multiplier_toxicity_threshold {
             self.capital_multiplier_defensive
         } else if priority_score >= self.capital_multiplier_priority_threshold
@@ -554,7 +571,11 @@ fn parse_alchemy_keys() -> Vec<String> {
     keys
 }
 
-fn parse_mempool_ws_urls(network: &str, tenderly_rpc_only: bool, alchemy_keys: &[String]) -> Vec<String> {
+fn parse_mempool_ws_urls(
+    network: &str,
+    tenderly_rpc_only: bool,
+    alchemy_keys: &[String],
+) -> Vec<String> {
     let mut urls: Vec<String> = Vec::new();
 
     for key in prioritized_network_keys(
@@ -572,7 +593,11 @@ fn parse_mempool_ws_urls(network: &str, tenderly_rpc_only: bool, alchemy_keys: &
         ],
     ) {
         if let Ok(value) = env::var(key) {
-            for item in value.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+            for item in value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
                 if !urls
                     .iter()
                     .any(|existing: &String| existing.eq_ignore_ascii_case(item))
@@ -609,7 +634,11 @@ fn parse_rpc_urls(network: &str) -> Vec<String> {
         ],
     ) {
         if let Ok(value) = env::var(key) {
-            for item in value.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+            for item in value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
                 if !urls
                     .iter()
                     .any(|existing: &String| existing.eq_ignore_ascii_case(item))
@@ -807,8 +836,15 @@ fn parse_builder_relays(primary: &str) -> Vec<String> {
     }
 
     if let Ok(raw) = env::var("BUILDER_RELAYS") {
-        for relay in raw.split(',').map(str::trim).filter(|value| !value.is_empty()) {
-            if !relays.iter().any(|existing| existing.eq_ignore_ascii_case(relay)) {
+        for relay in raw
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if !relays
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(relay))
+            {
                 relays.push(relay.to_string());
             }
         }
