@@ -84,6 +84,8 @@ impl Hash for ContextFreezeKey {
 struct ContextExecutionGuard {
     consecutive_losses: u32,
     frozen_until: Option<Instant>,
+    last_event_at: Option<Instant>,
+    regime_pressure_ewma: f64,
 }
 
 struct StopLossSnapshot {
@@ -408,9 +410,9 @@ impl ExecutionEngine {
             return Ok(());
         }
         let mut ranked_submit_paths = if self.config.uses_bundle_relays() {
-            self.rank_relay_submit_paths(opportunity.preferred_relay.as_deref())
+            self.rank_relay_submit_paths(opportunity.preferred_relay.as_deref(), cluster)
         } else {
-            self.rank_direct_rpc_submit_paths(&send_context.endpoint)
+            self.rank_direct_rpc_submit_paths(&send_context.endpoint, cluster)
         };
         ranked_submit_paths.retain(|quote| {
             self.context_stop_loss_snapshot(payload.pair, opportunity.router, &quote.relay)
@@ -558,6 +560,8 @@ impl ExecutionEngine {
                             Some(payload.pair),
                             Some(opportunity.router),
                             Some(relay_label.as_str()),
+                            Some(payload.context_priority_score),
+                            Some(payload.context_toxicity_score),
                         );
                         return Ok(());
                     }
@@ -605,6 +609,8 @@ impl ExecutionEngine {
                     Some(payload.pair),
                     Some(opportunity.router),
                     Some(path.relay.as_str()),
+                    Some(payload.context_priority_score),
+                    Some(payload.context_toxicity_score),
                 );
             }
             return Err(last_submit_error
@@ -705,6 +711,8 @@ impl ExecutionEngine {
                         Some(payload.pair),
                         Some(opportunity.router),
                         Some(relay.relay.as_str()),
+                        Some(payload.context_priority_score),
+                        Some(payload.context_toxicity_score),
                     );
                     return Ok(());
                 }
@@ -760,6 +768,8 @@ impl ExecutionEngine {
             ranked_submit_paths
                 .first()
                 .map(|quote| quote.relay.as_str()),
+            Some(payload.context_priority_score),
+            Some(payload.context_toxicity_score),
         );
         Err(last_error
             .unwrap_or_else(|| "no relay submission path available".to_string())
@@ -1049,6 +1059,8 @@ impl ExecutionEngine {
         pair: Option<Address>,
         router: Option<Address>,
         submit_path: Option<&str>,
+        context_priority_score: Option<f64>,
+        context_toxicity_score: Option<f64>,
     ) {
         let mut global_freeze_armed = false;
         let mut contextual_freeze_armed = false;
@@ -1079,20 +1091,42 @@ impl ExecutionEngine {
                     .context_guards
                     .entry(key)
                     .or_insert_with(ContextExecutionGuard::default);
+                let now = Instant::now();
+                decay_context_guard(
+                    state,
+                    now,
+                    self.config.mev.context_stop_loss_freeze_secs.max(1),
+                );
+                let regime_pressure = contextual_regime_pressure(
+                    context_priority_score.unwrap_or(0.5),
+                    context_toxicity_score.unwrap_or(0.5),
+                    result.success,
+                    result.realized_profit,
+                );
+                state.regime_pressure_ewma =
+                    ewma_f64(state.regime_pressure_ewma, regime_pressure, 0.35);
+                state.last_event_at = Some(now);
                 if result.success && result.realized_profit > 0.0 {
                     state.consecutive_losses = 0;
                     state.frozen_until = None;
                 } else {
-                    state.consecutive_losses = state.consecutive_losses.saturating_add(1);
-                    if state.consecutive_losses
-                        >= self.config.mev.context_stop_loss_consecutive_losses
-                    {
-                        state.frozen_until = Some(
-                            Instant::now()
-                                + Duration::from_secs(
-                                    self.config.mev.context_stop_loss_freeze_secs,
-                                ),
+                    let loss_increment = if state.regime_pressure_ewma >= 0.82 {
+                        2
+                    } else {
+                        1
+                    };
+                    state.consecutive_losses =
+                        state.consecutive_losses.saturating_add(loss_increment);
+                    let dynamic_threshold = contextual_stop_loss_threshold(
+                        self.config.mev.context_stop_loss_consecutive_losses,
+                        state.regime_pressure_ewma,
+                    );
+                    if state.consecutive_losses >= dynamic_threshold {
+                        let freeze_secs = contextual_freeze_secs(
+                            self.config.mev.context_stop_loss_freeze_secs,
+                            state.regime_pressure_ewma,
                         );
+                        state.frozen_until = Some(now + Duration::from_secs(freeze_secs));
                         contextual_freeze_armed = true;
                     }
                 }
@@ -1133,7 +1167,15 @@ impl ExecutionEngine {
                         router,
                         submit_path,
                         self.config.mev.context_stop_loss_consecutive_losses,
-                        self.config.mev.context_stop_loss_freeze_secs
+                        contextual_freeze_secs(
+                            self.config.mev.context_stop_loss_freeze_secs,
+                            contextual_regime_pressure(
+                                context_priority_score.unwrap_or(0.5),
+                                context_toxicity_score.unwrap_or(0.5),
+                                result.success,
+                                result.realized_profit,
+                            ),
+                        )
                     ),
                 );
             }
@@ -1173,8 +1215,13 @@ impl ExecutionEngine {
             submit_path: submit_path.to_string(),
         };
         let state = guard.context_guards.get_mut(&key)?;
-        let frozen_until = state.frozen_until?;
         let now = Instant::now();
+        decay_context_guard(
+            state,
+            now,
+            self.config.mev.context_stop_loss_freeze_secs.max(1),
+        );
+        let frozen_until = state.frozen_until?;
         if now >= frozen_until {
             state.frozen_until = None;
             state.consecutive_losses = 0;
@@ -1227,18 +1274,26 @@ impl ExecutionEngine {
         }
     }
 
-    fn rank_relay_submit_paths(&self, preferred_relay: Option<&str>) -> Vec<RelayQuote> {
-        self.rank_relays(preferred_relay)
+    fn rank_relay_submit_paths(
+        &self,
+        preferred_relay: Option<&str>,
+        cluster: ClusterKey,
+    ) -> Vec<RelayQuote> {
+        self.rank_relays(preferred_relay, cluster)
     }
 
-    fn rank_direct_rpc_submit_paths(&self, preferred_endpoint: &RpcHandle) -> Vec<RelayQuote> {
+    fn rank_direct_rpc_submit_paths(
+        &self,
+        preferred_endpoint: &RpcHandle,
+        cluster: ClusterKey,
+    ) -> Vec<RelayQuote> {
         let submit_endpoints = self.direct_rpc_submit_endpoints(preferred_endpoint);
         let relay_labels = submit_endpoints
             .iter()
             .map(|endpoint| format!("rpc://{}", endpoint.name))
             .collect::<Vec<_>>();
         if let Ok(adaptive) = self.adaptive.lock() {
-            adaptive.rank_relays(&relay_labels)
+            adaptive.rank_relays_for_cluster(&relay_labels, cluster)
         } else {
             relay_labels
                 .into_iter()
@@ -1408,9 +1463,9 @@ impl ExecutionEngine {
             });
     }
 
-    fn rank_relays(&self, preferred_relay: Option<&str>) -> Vec<RelayQuote> {
+    fn rank_relays(&self, preferred_relay: Option<&str>, cluster: ClusterKey) -> Vec<RelayQuote> {
         let mut relays = if let Ok(adaptive) = self.adaptive.lock() {
-            adaptive.rank_relays(&self.config.builder_relays)
+            adaptive.rank_relays_for_cluster(&self.config.builder_relays, cluster)
         } else {
             self.config
                 .builder_relays
@@ -1725,6 +1780,66 @@ fn prune_context_guards(context_guards: &mut HashMap<ContextFreezeKey, ContextEx
         Some(frozen_until) => now < frozen_until || state.consecutive_losses > 0,
         None => state.consecutive_losses > 0,
     });
+}
+
+fn decay_context_guard(state: &mut ContextExecutionGuard, now: Instant, base_freeze_secs: u64) {
+    let Some(last_event_at) = state.last_event_at else {
+        return;
+    };
+    let decay_window_secs = (base_freeze_secs / 2).max(30);
+    let elapsed_secs = now.saturating_duration_since(last_event_at).as_secs();
+    if elapsed_secs < decay_window_secs || state.consecutive_losses == 0 {
+        return;
+    }
+    let decay_steps = (elapsed_secs / decay_window_secs) as u32;
+    state.consecutive_losses = state.consecutive_losses.saturating_sub(decay_steps.max(1));
+    state.last_event_at = Some(now);
+    state.regime_pressure_ewma *= 0.88_f64.powi(decay_steps.max(1) as i32);
+}
+
+fn contextual_regime_pressure(
+    context_priority_score: f64,
+    context_toxicity_score: f64,
+    success: bool,
+    realized_profit: f64,
+) -> f64 {
+    let toxicity = context_toxicity_score.clamp(0.0, 1.0);
+    let low_priority = (1.0 - context_priority_score.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    let outcome_penalty = if success && realized_profit > 0.0 {
+        0.0
+    } else {
+        0.24
+    };
+    (toxicity * 0.62 + low_priority * 0.22 + outcome_penalty).clamp(0.0, 1.0)
+}
+
+fn contextual_stop_loss_threshold(base_threshold: u32, regime_pressure: f64) -> u32 {
+    if regime_pressure >= 0.78 {
+        base_threshold.saturating_sub(1).max(1)
+    } else {
+        base_threshold.max(1)
+    }
+}
+
+fn contextual_freeze_secs(base_freeze_secs: u64, regime_pressure: f64) -> u64 {
+    let multiplier = if regime_pressure >= 0.90 {
+        2.00
+    } else if regime_pressure >= 0.78 {
+        1.50
+    } else if regime_pressure >= 0.62 {
+        1.20
+    } else {
+        1.0
+    };
+    ((base_freeze_secs as f64) * multiplier).round() as u64
+}
+
+fn ewma_f64(current: f64, sample: f64, alpha: f64) -> f64 {
+    if current <= f64::EPSILON {
+        sample
+    } else {
+        current + (sample - current) * alpha
+    }
 }
 
 async fn sign_executor_transaction(
