@@ -142,7 +142,9 @@ pub fn find_roi_optimal_input(
             capital_cap,
             gas_cost_wei,
             fee_bps,
-            &[50, 100, 200, 350, 500, 750, 1_000, 1_500, 2_000, 2_500, 3_000],
+            &[
+                50, 100, 200, 350, 500, 750, 1_000, 1_500, 2_000, 2_500, 3_000,
+            ],
         ),
         1.0,
         0.0,
@@ -168,7 +170,8 @@ pub fn size_candidates(
         if amount_in.is_zero() {
             continue;
         }
-        let Some(amount_out) = amount_out_exact_in(amount_in, reserve_in, reserve_out, fee_bps) else {
+        let Some(amount_out) = amount_out_exact_in(amount_in, reserve_in, reserve_out, fee_bps)
+        else {
             continue;
         };
         let gross = amount_out.saturating_sub(amount_in);
@@ -208,7 +211,11 @@ pub fn select_best_size_candidate(
     })
 }
 
-fn sizing_score(candidate: SizeCandidate, context_priority_score: f64, context_toxicity_score: f64) -> f64 {
+fn sizing_score(
+    candidate: SizeCandidate,
+    context_priority_score: f64,
+    context_toxicity_score: f64,
+) -> f64 {
     let net_profit = candidate.net_profit_wei.as_u128() as f64;
     let roi_component = candidate.roi_bps as f64 / 10_000.0;
     let size_component = candidate.capital_fraction_bps as f64 / 10_000.0;
