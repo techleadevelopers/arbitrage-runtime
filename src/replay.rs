@@ -3,14 +3,13 @@ use crate::mev::adaptive::{AdaptivePolicy, AdaptiveQuoteInput, ContextSignal, Pr
 use crate::mev::cache::pool_cache::PoolCache;
 use crate::mev::opportunity::wei_to_eth_f64;
 use crate::mev::runtime::{
-    build_payload, decode_relevant_swap, fast_preflight_gate, passes_ev_gate,
-    passes_quality_gate,
+    build_payload, decode_relevant_swap, fast_preflight_gate, passes_ev_gate, passes_quality_gate,
 };
-use crate::storage::Storage;
+use crate::storage::{ensure_exports_dir, Storage};
 use chrono::{Timelike, Utc};
 use ethers::providers::{Http, Middleware, Provider};
 use ethers::types::{Address, Bytes, Transaction, H256, U256, U64};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -45,14 +44,10 @@ pub async fn maybe_run_replay_harness(
         .into());
     }
 
-    let min_large_swap_wei =
-        ethers::utils::parse_ether(config.mev.min_large_swap_eth.to_string())?;
+    let min_large_swap_wei = ethers::utils::parse_ether(config.mev.min_large_swap_eth.to_string())?;
     let min_profit_wei = ethers::utils::parse_ether(config.mev.min_net_profit_eth.to_string())?;
     let cases = load_replay_cases(&input_path, replay_limit)?;
-    let adaptive = AdaptivePolicy::shared(&config);
-    if let Ok(mut model) = adaptive.lock() {
-        model.apply_historical_profiles(storage.outcome_profiles(3, 256)?);
-    }
+    let historical_profiles = storage.outcome_profiles(3, 256)?;
 
     info!(
         "Replay harness started network={} fork={} cases={}",
@@ -61,245 +56,56 @@ pub async fn maybe_run_replay_harness(
         cases.len()
     );
 
-    let mut report = ReplayReport::default();
-    let mut decision_rows = Vec::new();
-    let relay_paths = if config.builder_relays.is_empty() {
-        vec![format!("rpc://{}", config.network)]
-    } else {
-        config.builder_relays.clone()
-    };
-
-    for (index, case) in cases.into_iter().enumerate() {
-        let case_started = Instant::now();
-        let mut latency_trace = ReplayLatencyTrace::default();
-        report.total += 1;
-        let tx = replay_transaction(&case, index as u64)?;
-        let decode_started = Instant::now();
-        let Some(signal) =
-            decode_relevant_swap(&tx, &config.monitored_tokens, min_large_swap_wei)
-        else {
-            report.bump("decode_reject");
-            latency_trace.total_internal_us = Some(elapsed_us(case_started));
-            report.observe_latency(&latency_trace);
-            continue;
-        };
-        report.decoded += 1;
-        latency_trace.decode_swap_us = Some(elapsed_us(decode_started));
-        let hour_utc = case.hour_utc.unwrap_or(Utc::now().hour() as u8);
-        let context_started = Instant::now();
-        let context_signal = if let Ok(model) = adaptive.lock() {
-            model.context_signal(signal.router, hour_utc)
-        } else {
-            ContextSignal {
-                priority_score: 0.50,
-                toxicity_score: 0.50,
-                samples: 0,
+    let tuning_enabled = env_flag("REPLAY_AUTO_TUNE");
+    let selected_run = if tuning_enabled {
+        let tuning_grid = replay_tuning_grid();
+        let mut candidates = Vec::with_capacity(tuning_grid.len());
+        let mut best_run: Option<(ReplayTuningResult, ReplayRunOutput)> = None;
+        for tuning in tuning_grid {
+            let run = run_replay_cases(
+                &config,
+                provider.clone(),
+                &pool_cache,
+                replay_block,
+                &cases,
+                &historical_profiles,
+                min_large_swap_wei,
+                min_profit_wei,
+                tuning,
+            )
+            .await?;
+            let candidate = ReplayTuningResult::from_report(tuning, &run.report);
+            if best_run
+                .as_ref()
+                .map(|(best, _)| candidate.objective_score > best.objective_score)
+                .unwrap_or(true)
+            {
+                best_run = Some((candidate.clone(), run));
             }
-        };
-        latency_trace.context_signal_us = Some(elapsed_us(context_started));
-
-        let gas_price = tx.max_fee_per_gas.or(tx.gas_price).unwrap_or_default();
-        if gas_price.is_zero() {
-            report.bump("missing_gas");
-            latency_trace.total_internal_us = Some(elapsed_us(case_started));
-            report.observe_latency(&latency_trace);
-            continue;
+            candidates.push(candidate);
         }
-
-        let fast_started = Instant::now();
-        let fast_gate = fast_preflight_gate(
-            &signal,
-            gas_price,
-            min_large_swap_wei,
+        let (best, run) = best_run.ok_or("replay auto-tune produced no candidates")?;
+        print_tuning_summary(&best, &candidates);
+        write_tuning_report(&config.network, &best, &candidates)?;
+        run
+    } else {
+        run_replay_cases(
             &config,
-            context_signal,
-        );
-        latency_trace.fast_preflight_us = Some(elapsed_us(fast_started));
-        if !fast_gate.should_continue {
-            report.observe_labeled_outcome(false, &case);
-            report.observe_reject_gas(gas_price, config.estimated_exec_gas);
-            report.bump_reason("fast_preflight", fast_gate.reject_reason.unwrap_or("reject"));
-            report.observe_toxicity_reject(&signal, hour_utc, &case, "fast_preflight");
-            latency_trace.total_internal_us = Some(elapsed_us(case_started));
-            report.observe_latency(&latency_trace);
-            decision_rows.push(ReplayDecisionRow::reject(
-                &case,
-                "fast_preflight",
-                fast_gate.reject_reason.unwrap_or("reject"),
-            ));
-            continue;
-        }
-        report.fast_preflight_pass += 1;
-
-        let cluster = crate::mev::adaptive::ClusterKey {
-            router: signal.router,
-            token_in: signal.path[0],
-            token_out: *signal.path.last().unwrap_or(&signal.path[0]),
-            selector: signal.selector,
-        };
-        let lookup_latency_ms = case.lookup_latency_ms.unwrap_or(75.0);
-        let adaptive_preflight_started = Instant::now();
-        let preflight = if let Ok(mut model) = adaptive.lock() {
-            model.observe_lookup_latency(lookup_latency_ms);
-            model.observe_candidate_flow(cluster, signal.notional_wei, gas_price);
-            model.preflight_score(PreflightInput {
-                cluster,
-                notional_eth: wei_to_eth_f64(signal.notional_wei),
-                gas_price_wei: gas_price,
-                path_len: signal.path.len(),
-            })
-        } else {
-            report.bump("adaptive_lock_error");
-            latency_trace.total_internal_us = Some(elapsed_us(case_started));
-            report.observe_latency(&latency_trace);
-            continue;
-        };
-        latency_trace.adaptive_preflight_us = Some(elapsed_us(adaptive_preflight_started));
-        if !preflight.should_continue {
-            report.observe_labeled_outcome(false, &case);
-            report.observe_reject_gas(gas_price, config.estimated_exec_gas);
-            report.bump_reason("preflight", preflight.reject_reason.unwrap_or("reject"));
-            report.observe_toxicity_reject(&signal, hour_utc, &case, "preflight");
-            latency_trace.total_internal_us = Some(elapsed_us(case_started));
-            report.observe_latency(&latency_trace);
-            decision_rows.push(ReplayDecisionRow::reject(
-                &case,
-                "preflight",
-                preflight.reject_reason.unwrap_or("reject"),
-            ));
-            continue;
-        }
-        report.adaptive_preflight_pass += 1;
-
-        let payload_started = Instant::now();
-        let Ok(payload) = build_payload(
             provider.clone(),
-            &config,
-            &signal,
-            gas_price,
-            context_signal,
             &pool_cache,
             replay_block,
-        )
-        .await
-        else {
-            report.observe_labeled_outcome(false, &case);
-            report.observe_reject_gas(gas_price, config.estimated_exec_gas);
-            report.bump("payload_build_reject");
-            report.observe_toxicity_reject(&signal, hour_utc, &case, "payload");
-            latency_trace.payload_build_us = Some(elapsed_us(payload_started));
-            latency_trace.total_internal_us = Some(elapsed_us(case_started));
-            report.observe_latency(&latency_trace);
-            decision_rows.push(ReplayDecisionRow::reject(&case, "payload", "payload_build_reject"));
-            continue;
-        };
-        latency_trace.payload_build_us = Some(elapsed_us(payload_started));
-        report.payload_built += 1;
-        report.observe_expected_profit(payload.expected_profit_wei);
-
-        let ev_gate_started = Instant::now();
-        if !passes_ev_gate(
-            &config,
-            &payload,
-            &signal,
-            std::time::Duration::from_millis(lookup_latency_ms as u64),
+            &cases,
+            &historical_profiles,
+            min_large_swap_wei,
             min_profit_wei,
-        ) {
-            report.observe_labeled_outcome(false, &case);
-            report.observe_reject_gas(gas_price, payload.gas_limit);
-            report.bump("ev_gate_reject");
-            report.observe_toxicity_reject(&signal, hour_utc, &case, "ev_gate");
-            latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
-            latency_trace.total_internal_us = Some(elapsed_us(case_started));
-            report.observe_latency(&latency_trace);
-            decision_rows.push(ReplayDecisionRow::reject(&case, "ev_gate", "ev_gate_reject"));
-            continue;
-        }
-        latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
-        report.ev_gate_pass += 1;
+            ReplayTuning::default(),
+        )
+        .await?
+    };
 
-        let execution_cost_wei = gas_price
-            .saturating_mul(U256::from(payload.gas_limit))
-            .saturating_mul(U256::from(config.mev.gas_safety_margin_bps))
-            / U256::from(10_000u64);
-        let quality_gate_started = Instant::now();
-        if !passes_quality_gate(&config, &payload, execution_cost_wei) {
-            report.observe_labeled_outcome(false, &case);
-            report.observe_reject_gas(gas_price, payload.gas_limit);
-            report.bump("quality_gate_reject");
-            report.observe_toxicity_reject(&signal, hour_utc, &case, "quality_gate");
-            latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
-            latency_trace.total_internal_us = Some(elapsed_us(case_started));
-            report.observe_latency(&latency_trace);
-            decision_rows.push(ReplayDecisionRow::reject(
-                &case,
-                "quality_gate",
-                "quality_gate_reject",
-            ));
-            continue;
-        }
-        latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
-        report.quality_gate_pass += 1;
-
-        let adaptive_quote_started = Instant::now();
-        let quote = if let Ok(mut model) = adaptive.lock() {
-            model.quote_for_relays(
-                AdaptiveQuoteInput {
-                    cluster,
-                    pair: payload.pair,
-                    hour_utc,
-                    context_priority_score: context_signal.priority_score,
-                    context_toxicity_score: context_signal.toxicity_score,
-                    expected_profit_wei: payload.expected_profit_wei,
-                    execution_cost_wei,
-                    gas_price_wei: gas_price,
-                    lookup_latency_ms,
-                    notional_eth: wei_to_eth_f64(signal.notional_wei),
-                    price_impact_bps: payload.price_impact_bps,
-                    relay_pressure_override: None,
-                },
-                &relay_paths,
-            )
-        } else {
-            report.bump("adaptive_lock_error");
-            latency_trace.total_internal_us = Some(elapsed_us(case_started));
-            report.observe_latency(&latency_trace);
-            continue;
-        };
-        latency_trace.adaptive_quote_us = Some(elapsed_us(adaptive_quote_started));
-
-        if !quote.should_execute {
-            report.observe_labeled_outcome(false, &case);
-            report.observe_reject_gas(gas_price, payload.gas_limit);
-            report.bump_reason("adaptive", quote.reject_reason.unwrap_or("reject"));
-            report.observe_toxicity_reject(&signal, hour_utc, &case, "adaptive");
-            latency_trace.total_internal_us = Some(elapsed_us(case_started));
-            report.observe_latency(&latency_trace);
-            decision_rows.push(ReplayDecisionRow::reject(
-                &case,
-                "adaptive",
-                quote.reject_reason.unwrap_or("reject"),
-            ));
-            continue;
-        }
-
-        report.execute_candidates += 1;
-        report.adaptive_quote_pass += 1;
-        report.observe_labeled_outcome(true, &case);
-        report.observe_realized(&case);
-        report.observe_toxicity_execute(&signal, payload.pair, hour_utc, &case, payload.expected_profit_wei);
-        latency_trace.total_internal_us = Some(elapsed_us(case_started));
-        report.observe_latency(&latency_trace);
-        decision_rows.push(ReplayDecisionRow::execute(
-            &case,
-            payload.expected_profit_wei,
-            &quote,
-            latency_trace.total_internal_us.unwrap_or_default(),
-        ));
-    }
-
-    print_report(&config, &report);
-    maybe_write_decisions(&decision_rows)?;
+    print_report(&config, &selected_run.report);
+    print_linux_validation_hint();
+    maybe_write_decisions(&selected_run.decision_rows)?;
     for path in storage.export_evidence_artifacts(512)? {
         println!("Replay evidence export: {}", path.display());
     }
@@ -318,6 +124,77 @@ struct ReplayInputCase {
     hour_utc: Option<u8>,
     known_outcome: Option<String>,
     realized_profit_eth: Option<f64>,
+}
+
+struct ReplayRunOutput {
+    report: ReplayReport,
+    decision_rows: Vec<ReplayDecisionRow>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct ReplayTuning {
+    threshold_multiplier: f64,
+    priority_shift: f64,
+    toxicity_shift: f64,
+}
+
+impl Default for ReplayTuning {
+    fn default() -> Self {
+        Self {
+            threshold_multiplier: 1.0,
+            priority_shift: 0.0,
+            toxicity_shift: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ReplayTuningResult {
+    threshold_multiplier: f64,
+    priority_shift: f64,
+    toxicity_shift: f64,
+    objective_score: f64,
+    realized_profit_eth: f64,
+    execute_candidates: u64,
+    false_positive: u64,
+    false_negative: u64,
+    capture_ratio: f64,
+}
+
+impl ReplayTuningResult {
+    fn from_report(tuning: ReplayTuning, report: &ReplayReport) -> Self {
+        let capture_ratio = if report.expected_profit_wei.is_zero() {
+            0.0
+        } else {
+            report.realized_profit_eth / wei_to_eth_f64(report.expected_profit_wei).max(1e-12)
+        };
+        let objective_score = report.realized_profit_eth
+            - report.false_positive as f64 * 0.0025
+            - report.false_negative as f64 * 0.0015
+            - report.execute_candidates as f64 * 0.0002;
+        Self {
+            threshold_multiplier: tuning.threshold_multiplier,
+            priority_shift: tuning.priority_shift,
+            toxicity_shift: tuning.toxicity_shift,
+            objective_score,
+            realized_profit_eth: report.realized_profit_eth,
+            execute_candidates: report.execute_candidates,
+            false_positive: report.false_positive,
+            false_negative: report.false_negative,
+            capture_ratio,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ReplayTuningReport {
+    generated_at_utc: String,
+    network: String,
+    build_profile: &'static str,
+    os: &'static str,
+    arch: &'static str,
+    best: ReplayTuningResult,
+    candidates: Vec<ReplayTuningResult>,
 }
 
 #[derive(Default)]
@@ -394,7 +271,10 @@ impl ReplayReport {
     ) {
         let pair = *signal.path.last().unwrap_or(&signal.path[0]);
         let key = ToxicityReplayKey::new(signal.router, pair, hour_utc);
-        self.toxicity.entry(key).or_default().observe(false, case, None, stage);
+        self.toxicity
+            .entry(key)
+            .or_default()
+            .observe(false, case, None, stage);
     }
 
     fn observe_toxicity_execute(
@@ -406,10 +286,12 @@ impl ReplayReport {
         expected_profit_wei: U256,
     ) {
         let key = ToxicityReplayKey::new(signal.router, pair, hour_utc);
-        self.toxicity
-            .entry(key)
-            .or_default()
-            .observe(true, case, Some(expected_profit_wei), "execute");
+        self.toxicity.entry(key).or_default().observe(
+            true,
+            case,
+            Some(expected_profit_wei),
+            "execute",
+        );
     }
 }
 
@@ -515,7 +397,10 @@ struct ReplayDecisionRow {
 impl ReplayDecisionRow {
     fn reject(case: &ReplayInputCase, stage: &str, reason: &str) -> Self {
         Self {
-            tx_hash: case.tx_hash.clone().unwrap_or_else(|| "synthetic".to_string()),
+            tx_hash: case
+                .tx_hash
+                .clone()
+                .unwrap_or_else(|| "synthetic".to_string()),
             stage: stage.to_string(),
             decision: "reject".to_string(),
             reason: reason.to_string(),
@@ -533,7 +418,10 @@ impl ReplayDecisionRow {
         total_latency_us: u64,
     ) -> Self {
         Self {
-            tx_hash: case.tx_hash.clone().unwrap_or_else(|| "synthetic".to_string()),
+            tx_hash: case
+                .tx_hash
+                .clone()
+                .unwrap_or_else(|| "synthetic".to_string()),
             stage: "adaptive".to_string(),
             decision: "execute".to_string(),
             reason: "passed".to_string(),
@@ -586,6 +474,277 @@ impl ReplayLatencySummary {
     }
 }
 
+async fn run_replay_cases(
+    config: &Config,
+    provider: Arc<Provider<Http>>,
+    pool_cache: &PoolCache,
+    replay_block: u64,
+    cases: &[ReplayInputCase],
+    historical_profiles: &[crate::mev::adaptive::HistoricalOutcomeProfile],
+    min_large_swap_wei: U256,
+    min_profit_wei: U256,
+    tuning: ReplayTuning,
+) -> Result<ReplayRunOutput, Box<dyn std::error::Error>> {
+    let adaptive = AdaptivePolicy::shared(config);
+    if let Ok(mut model) = adaptive.lock() {
+        model.apply_historical_profiles(historical_profiles.to_vec());
+    }
+    let relay_paths = if config.builder_relays.is_empty() {
+        vec![format!("rpc://{}", config.network)]
+    } else {
+        config.builder_relays.clone()
+    };
+
+    let mut report = ReplayReport::default();
+    let mut decision_rows = Vec::new();
+    for (index, case) in cases.iter().enumerate() {
+        let case_started = Instant::now();
+        let mut latency_trace = ReplayLatencyTrace::default();
+        report.total += 1;
+        let tx = replay_transaction(case, index as u64)?;
+        let decode_started = Instant::now();
+        let Some(signal) = decode_relevant_swap(&tx, &config.monitored_tokens, min_large_swap_wei)
+        else {
+            report.bump("decode_reject");
+            latency_trace.total_internal_us = Some(elapsed_us(case_started));
+            report.observe_latency(&latency_trace);
+            continue;
+        };
+        report.decoded += 1;
+        latency_trace.decode_swap_us = Some(elapsed_us(decode_started));
+        let hour_utc = case.hour_utc.unwrap_or(Utc::now().hour() as u8);
+        let context_started = Instant::now();
+        let base_context_signal = if let Ok(model) = adaptive.lock() {
+            model.context_signal(signal.router, hour_utc)
+        } else {
+            ContextSignal {
+                priority_score: 0.50,
+                toxicity_score: 0.50,
+                samples: 0,
+            }
+        };
+        let context_signal = tuned_context_signal(base_context_signal, tuning);
+        latency_trace.context_signal_us = Some(elapsed_us(context_started));
+
+        let gas_price = tx.max_fee_per_gas.or(tx.gas_price).unwrap_or_default();
+        if gas_price.is_zero() {
+            report.bump("missing_gas");
+            latency_trace.total_internal_us = Some(elapsed_us(case_started));
+            report.observe_latency(&latency_trace);
+            continue;
+        }
+
+        let fast_started = Instant::now();
+        let fast_gate = fast_preflight_gate(
+            &signal,
+            gas_price,
+            min_large_swap_wei,
+            config,
+            context_signal,
+        );
+        latency_trace.fast_preflight_us = Some(elapsed_us(fast_started));
+        if !fast_gate.should_continue {
+            report.observe_labeled_outcome(false, case);
+            report.observe_reject_gas(gas_price, config.estimated_exec_gas);
+            report.bump_reason(
+                "fast_preflight",
+                fast_gate.reject_reason.unwrap_or("reject"),
+            );
+            report.observe_toxicity_reject(&signal, hour_utc, case, "fast_preflight");
+            latency_trace.total_internal_us = Some(elapsed_us(case_started));
+            report.observe_latency(&latency_trace);
+            decision_rows.push(ReplayDecisionRow::reject(
+                case,
+                "fast_preflight",
+                fast_gate.reject_reason.unwrap_or("reject"),
+            ));
+            continue;
+        }
+        report.fast_preflight_pass += 1;
+
+        let cluster = crate::mev::adaptive::ClusterKey {
+            router: signal.router,
+            token_in: signal.path[0],
+            token_out: *signal.path.last().unwrap_or(&signal.path[0]),
+            selector: signal.selector,
+        };
+        let lookup_latency_ms = case.lookup_latency_ms.unwrap_or(75.0);
+        let adaptive_preflight_started = Instant::now();
+        let preflight = if let Ok(mut model) = adaptive.lock() {
+            model.observe_lookup_latency(lookup_latency_ms);
+            model.observe_candidate_flow(cluster, signal.notional_wei, gas_price);
+            model.preflight_score(PreflightInput {
+                cluster,
+                notional_eth: wei_to_eth_f64(signal.notional_wei),
+                gas_price_wei: gas_price,
+                path_len: signal.path.len(),
+            })
+        } else {
+            report.bump("adaptive_lock_error");
+            latency_trace.total_internal_us = Some(elapsed_us(case_started));
+            report.observe_latency(&latency_trace);
+            continue;
+        };
+        latency_trace.adaptive_preflight_us = Some(elapsed_us(adaptive_preflight_started));
+        if !preflight.should_continue {
+            report.observe_labeled_outcome(false, case);
+            report.observe_reject_gas(gas_price, config.estimated_exec_gas);
+            report.bump_reason("preflight", preflight.reject_reason.unwrap_or("reject"));
+            report.observe_toxicity_reject(&signal, hour_utc, case, "preflight");
+            latency_trace.total_internal_us = Some(elapsed_us(case_started));
+            report.observe_latency(&latency_trace);
+            decision_rows.push(ReplayDecisionRow::reject(
+                case,
+                "preflight",
+                preflight.reject_reason.unwrap_or("reject"),
+            ));
+            continue;
+        }
+        report.adaptive_preflight_pass += 1;
+
+        let payload_started = Instant::now();
+        let Ok(payload) = build_payload(
+            provider.clone(),
+            config,
+            &signal,
+            gas_price,
+            context_signal,
+            pool_cache,
+            replay_block,
+        )
+        .await
+        else {
+            report.observe_labeled_outcome(false, case);
+            report.observe_reject_gas(gas_price, config.estimated_exec_gas);
+            report.bump("payload_build_reject");
+            report.observe_toxicity_reject(&signal, hour_utc, case, "payload");
+            latency_trace.payload_build_us = Some(elapsed_us(payload_started));
+            latency_trace.total_internal_us = Some(elapsed_us(case_started));
+            report.observe_latency(&latency_trace);
+            decision_rows.push(ReplayDecisionRow::reject(
+                case,
+                "payload",
+                "payload_build_reject",
+            ));
+            continue;
+        };
+        latency_trace.payload_build_us = Some(elapsed_us(payload_started));
+        report.payload_built += 1;
+        report.observe_expected_profit(payload.expected_profit_wei);
+
+        let ev_gate_started = Instant::now();
+        if !passes_ev_gate(
+            config,
+            &payload,
+            &signal,
+            std::time::Duration::from_millis(lookup_latency_ms as u64),
+            min_profit_wei,
+        ) {
+            report.observe_labeled_outcome(false, case);
+            report.observe_reject_gas(gas_price, payload.gas_limit);
+            report.bump("ev_gate_reject");
+            report.observe_toxicity_reject(&signal, hour_utc, case, "ev_gate");
+            latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
+            latency_trace.total_internal_us = Some(elapsed_us(case_started));
+            report.observe_latency(&latency_trace);
+            decision_rows.push(ReplayDecisionRow::reject(case, "ev_gate", "ev_gate_reject"));
+            continue;
+        }
+        latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
+        report.ev_gate_pass += 1;
+
+        let execution_cost_wei = gas_price
+            .saturating_mul(U256::from(payload.gas_limit))
+            .saturating_mul(U256::from(config.mev.gas_safety_margin_bps))
+            / U256::from(10_000u64);
+        let quality_gate_started = Instant::now();
+        if !passes_quality_gate(config, &payload, execution_cost_wei) {
+            report.observe_labeled_outcome(false, case);
+            report.observe_reject_gas(gas_price, payload.gas_limit);
+            report.bump("quality_gate_reject");
+            report.observe_toxicity_reject(&signal, hour_utc, case, "quality_gate");
+            latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
+            latency_trace.total_internal_us = Some(elapsed_us(case_started));
+            report.observe_latency(&latency_trace);
+            decision_rows.push(ReplayDecisionRow::reject(
+                case,
+                "quality_gate",
+                "quality_gate_reject",
+            ));
+            continue;
+        }
+        latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
+        report.quality_gate_pass += 1;
+
+        let adaptive_quote_started = Instant::now();
+        let quote = if let Ok(mut model) = adaptive.lock() {
+            model.quote_for_relays(
+                AdaptiveQuoteInput {
+                    cluster,
+                    pair: payload.pair,
+                    hour_utc,
+                    context_priority_score: context_signal.priority_score,
+                    context_toxicity_score: context_signal.toxicity_score,
+                    expected_profit_wei: payload.expected_profit_wei,
+                    execution_cost_wei,
+                    gas_price_wei: gas_price,
+                    lookup_latency_ms,
+                    notional_eth: wei_to_eth_f64(signal.notional_wei),
+                    price_impact_bps: payload.price_impact_bps,
+                    relay_pressure_override: None,
+                },
+                &relay_paths,
+            )
+        } else {
+            report.bump("adaptive_lock_error");
+            latency_trace.total_internal_us = Some(elapsed_us(case_started));
+            report.observe_latency(&latency_trace);
+            continue;
+        };
+        latency_trace.adaptive_quote_us = Some(elapsed_us(adaptive_quote_started));
+
+        if !should_execute_with_tuning(&quote, tuning) {
+            report.observe_labeled_outcome(false, case);
+            report.observe_reject_gas(gas_price, payload.gas_limit);
+            report.bump_reason("adaptive", quote.reject_reason.unwrap_or("reject"));
+            report.observe_toxicity_reject(&signal, hour_utc, case, "adaptive");
+            latency_trace.total_internal_us = Some(elapsed_us(case_started));
+            report.observe_latency(&latency_trace);
+            decision_rows.push(ReplayDecisionRow::reject(
+                case,
+                "adaptive",
+                quote.reject_reason.unwrap_or("reject"),
+            ));
+            continue;
+        }
+
+        report.execute_candidates += 1;
+        report.adaptive_quote_pass += 1;
+        report.observe_labeled_outcome(true, case);
+        report.observe_realized(case);
+        report.observe_toxicity_execute(
+            &signal,
+            payload.pair,
+            hour_utc,
+            case,
+            payload.expected_profit_wei,
+        );
+        latency_trace.total_internal_us = Some(elapsed_us(case_started));
+        report.observe_latency(&latency_trace);
+        decision_rows.push(ReplayDecisionRow::execute(
+            case,
+            payload.expected_profit_wei,
+            &quote,
+            latency_trace.total_internal_us.unwrap_or_default(),
+        ));
+    }
+
+    Ok(ReplayRunOutput {
+        report,
+        decision_rows,
+    })
+}
+
 fn load_replay_cases(
     path: &str,
     limit: usize,
@@ -598,10 +757,133 @@ fn load_replay_cases(
     }
 
     let mut items = Vec::new();
-    for line in raw.lines().filter(|line| !line.trim().is_empty()).take(limit) {
+    for line in raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(limit)
+    {
         items.push(serde_json::from_str::<ReplayInputCase>(line)?);
     }
     Ok(items)
+}
+
+fn replay_tuning_grid() -> Vec<ReplayTuning> {
+    let threshold_multipliers =
+        env_f64_grid("REPLAY_TUNE_THRESHOLD_MULTIPLIERS", &[0.90, 1.00, 1.10]);
+    let priority_shifts = env_f64_grid("REPLAY_TUNE_PRIORITY_SHIFTS", &[-0.05, 0.0, 0.05]);
+    let toxicity_shifts = env_f64_grid("REPLAY_TUNE_TOXICITY_SHIFTS", &[-0.05, 0.0, 0.05]);
+    let mut grid = Vec::new();
+    for threshold_multiplier in threshold_multipliers {
+        for priority_shift in &priority_shifts {
+            for toxicity_shift in &toxicity_shifts {
+                grid.push(ReplayTuning {
+                    threshold_multiplier,
+                    priority_shift: *priority_shift,
+                    toxicity_shift: *toxicity_shift,
+                });
+            }
+        }
+    }
+    if grid.is_empty() {
+        grid.push(ReplayTuning::default());
+    }
+    grid
+}
+
+fn tuned_context_signal(base: ContextSignal, tuning: ReplayTuning) -> ContextSignal {
+    ContextSignal {
+        priority_score: (base.priority_score + tuning.priority_shift).clamp(0.0, 1.0),
+        toxicity_score: (base.toxicity_score + tuning.toxicity_shift).clamp(0.0, 1.0),
+        samples: base.samples,
+    }
+}
+
+fn should_execute_with_tuning(
+    quote: &crate::mev::adaptive::AdaptiveQuote,
+    tuning: ReplayTuning,
+) -> bool {
+    let adjusted_threshold = quote.threshold_dynamic_usd * tuning.threshold_multiplier.max(0.01);
+    let threshold_pass = quote.ev_real_usd > adjusted_threshold;
+    if quote.should_execute {
+        return threshold_pass;
+    }
+    matches!(quote.reject_reason, Some("ev_real_below_threshold")) && threshold_pass
+}
+
+fn env_f64_grid(name: &str, defaults: &[f64]) -> Vec<f64> {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|item| item.trim().parse::<f64>().ok())
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+        .unwrap_or_else(|| defaults.to_vec())
+}
+
+fn print_tuning_summary(best: &ReplayTuningResult, candidates: &[ReplayTuningResult]) {
+    println!("=== Replay Auto-Tune ===");
+    println!("Candidates: {}", candidates.len());
+    println!(
+        "Best tune -> threshold_multiplier={:.3} priority_shift={:.3} toxicity_shift={:.3} objective={:.6} realized={:.6}ETH capture={:.2}%",
+        best.threshold_multiplier,
+        best.priority_shift,
+        best.toxicity_shift,
+        best.objective_score,
+        best.realized_profit_eth,
+        best.capture_ratio * 100.0
+    );
+}
+
+fn write_tuning_report(
+    network: &str,
+    best: &ReplayTuningResult,
+    candidates: &[ReplayTuningResult],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = env::var("REPLAY_TUNE_OUTPUT_PATH")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            ensure_exports_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("exports"))
+                .join("replay_auto_tune.json")
+        });
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let report = ReplayTuningReport {
+        generated_at_utc: Utc::now().to_rfc3339(),
+        network: network.to_string(),
+        build_profile: if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        best: best.clone(),
+        candidates: candidates.to_vec(),
+    };
+    fs::write(path, serde_json::to_string_pretty(&report)?)?;
+    Ok(())
+}
+
+fn print_linux_validation_hint() {
+    if cfg!(target_os = "linux") && !cfg!(debug_assertions) {
+        println!("Replay validation profile: linux release");
+        return;
+    }
+    println!(
+        "Replay validation note: final WAR validation must run on pinned Linux cloud in --release (current os={} profile={}).",
+        std::env::consts::OS,
+        if cfg!(debug_assertions) { "debug" } else { "release" }
+    );
 }
 
 fn replay_transaction(
@@ -656,7 +938,8 @@ fn maybe_write_decisions(rows: &[ReplayDecisionRow]) -> Result<(), Box<dyn std::
     let Some(path) = env::var("REPLAY_OUTPUT_PATH")
         .ok()
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty()) else {
+        .filter(|value| !value.is_empty())
+    else {
         return Ok(());
     };
     let mut out = String::new();
@@ -676,10 +959,7 @@ fn print_report(config: &Config, report: &ReplayReport) {
     println!("=== Replay Harness ===");
     println!("Network: {}", config.network);
     println!("Total cases: {}", report.total);
-    println!(
-        "Decode rate: {:.2}%",
-        percent(report.decoded, report.total)
-    );
+    println!("Decode rate: {:.2}%", percent(report.decoded, report.total));
     println!(
         "Fast preflight pass rate: {:.2}%",
         percent(report.fast_preflight_pass, report.decoded)
@@ -693,7 +973,10 @@ fn print_report(config: &Config, report: &ReplayReport) {
         "Payload build rate: {:.2}%",
         percent(report.payload_built, report.adaptive_preflight_pass)
     );
-    println!("EV gate pass rate: {:.2}%", percent(report.ev_gate_pass, report.payload_built));
+    println!(
+        "EV gate pass rate: {:.2}%",
+        percent(report.ev_gate_pass, report.payload_built)
+    );
     println!(
         "Quality gate pass rate: {:.2}%",
         percent(report.quality_gate_pass, report.ev_gate_pass)
@@ -711,27 +994,44 @@ fn print_report(config: &Config, report: &ReplayReport) {
             report.execute_candidates as f64 * 100.0 / report.total as f64
         }
     );
-    let labeled_total = report.true_positive + report.false_positive + report.true_negative + report.false_negative;
+    let labeled_total =
+        report.true_positive + report.false_positive + report.true_negative + report.false_negative;
     if labeled_total > 0 {
         println!("Labeled outcomes:");
         println!("  true_positive -> {}", report.true_positive);
         println!("  false_positive -> {}", report.false_positive);
         println!("  true_negative -> {}", report.true_negative);
         println!("  false_negative -> {}", report.false_negative);
-        println!("  false_positive_rate -> {:.2}%", percent(report.false_positive, report.false_positive + report.true_positive));
-        println!("  false_negative_rate -> {:.2}%", percent(report.false_negative, report.false_negative + report.true_negative));
+        println!(
+            "  false_positive_rate -> {:.2}%",
+            percent(
+                report.false_positive,
+                report.false_positive + report.true_positive
+            )
+        );
+        println!(
+            "  false_negative_rate -> {:.2}%",
+            percent(
+                report.false_negative,
+                report.false_negative + report.true_negative
+            )
+        );
     }
     println!(
         "Expected profit scanned after payload: {:.8} ETH",
         wei_to_eth_f64(report.expected_profit_wei)
     );
-    println!("Realized profit labels: {:.8} ETH", report.realized_profit_eth);
+    println!(
+        "Realized profit labels: {:.8} ETH",
+        report.realized_profit_eth
+    );
     println!(
         "Realized/expected capture: {:.2}%",
         if report.expected_profit_wei.is_zero() {
             0.0
         } else {
-            report.realized_profit_eth * 100.0 / wei_to_eth_f64(report.expected_profit_wei).max(1e-12)
+            report.realized_profit_eth * 100.0
+                / wei_to_eth_f64(report.expected_profit_wei).max(1e-12)
         }
     );
     println!(
@@ -768,7 +1068,9 @@ fn print_report(config: &Config, report: &ReplayReport) {
         println!("  no contextual samples recorded");
     } else {
         let mut rows = report.toxicity.iter().collect::<Vec<_>>();
-        rows.sort_by(|(_, left), (_, right)| right.toxicity_score().total_cmp(&left.toxicity_score()));
+        rows.sort_by(|(_, left), (_, right)| {
+            right.toxicity_score().total_cmp(&left.toxicity_score())
+        });
         for (key, stats) in rows.into_iter().take(12) {
             println!(
                 "  hour={} router={} pair={} samples={} rejected={} executed={} profitable_labels={} fp={} fn={} toxicity={:.2} last_stage={}",
