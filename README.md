@@ -93,7 +93,7 @@ Performance numbers should be treated as operational evidence only when backed b
 ### 1. Internal Execution Stats (Local Latency Profile)
 Measured locally via `std::time::Instant` precision hooks under simulated or replayed load profiles. These millisecond-scale numbers describe the operational pipeline with realistic runtime overhead: queueing, async scheduling, cache access, payload work, and normal process noise.
 *   **Mempool Ingestion to Decoding (`runtime.rs`):** $< 1.15 \text{ ms}$
-*   **Post-Victim Impact Modeling & Sizing (`payload_builder.rs`):** $< 0.82 \text{ ms}$
+*   **Post-Alvo Impact Modeling & Sizing (`payload_builder.rs`):** $< 0.82 \text{ ms}$
 *   **EV/Gas Gate & Payload Serialization (`executor.rs`):** $< 0.48 \text{ ms}$
 *   **Total Internal Pipeline Latency (End-to-End):** $\sim 2.45 \text{ ms}$
 
@@ -127,8 +127,8 @@ The production decision model is intentionally based on signals that can be meas
 
 The goal is not to prove a stochastic finance model. The goal is to preserve capital and improve net realized outcomes.
 
-### 1. Post-Victim AMM Topology
-The expected gross edge is modeled from the deterministic displacement of the AMM state after the victim swap. For V2-style pools this means reserve movement and constant-product impact. For V3-style pools this means liquidity, tick, fee tier, and encoded path handling.
+### 1. Post-Alvo AMM Topology
+The expected gross edge is modeled from the deterministic displacement of the AMM state after the alvo swap. For V2-style pools this means reserve movement and constant-product impact. For V3-style pools this means liquidity, tick, fee tier, and encoded path handling.
 
 This part is intentionally deterministic. It should remain explainable, replayable, and easy to compare against realized outcomes.
 
@@ -394,7 +394,7 @@ Multi-dimensional scoring based on:
 #### Scenario Parameters
 | Parameter | Value |
 |-----------|-------|
-| **Victim Swap Size** | 142 ETH equivalent |
+| **alvo Swap Size** | 142 ETH equivalent |
 | **AMM Type** | Uniswap V3 exactInput |
 | **Expected Profit** | 0.021 ETH |
 | **Gas Cost** | 0.004 ETH |
@@ -404,8 +404,8 @@ Multi-dimensional scoring based on:
 
 #### Execution Breakdown
 
-1. Victim transaction decoded successfully
-2. Deterministic post-victim state modeled
+1. alvo transaction decoded successfully
+2. Deterministic Post-Alvo state modeled
 3. Payload constructed
 4. EV threshold passed
 5. Adaptive gate approved
@@ -560,7 +560,7 @@ The system operates as a zero-copy, linear, multi-threaded pipeline using bounde
 │                                                                                           │
 │ Stage 3: PAYLOAD BUILD                                                                     │
 │ • V2/V3 pool cache                                                                         │
-│ • Deterministic post-victim simulation                                                     │
+│ • Deterministic Post-Alvo simulation                                                     │
 │ • Flashswap path construction                                                              │
 │ • ROI sizing                                                                               │
 │                                                                                           │
@@ -763,7 +763,7 @@ The active runtime supports two AMM impact paths.
 ### Uniswap V2 path
 
 - pending V2-style swap decoding
-- reserve-based post-victim state reconstruction
+- reserve-based Post-Alvo state reconstruction
 - reverse-path sizing and ROI selection
 - V2 flashswap-oriented execution payload
 
@@ -910,7 +910,7 @@ Execution outcomes are persisted with contextual fields such as:
 - pair
 - router
 - token in/out
-- victim transaction
+- alvo transaction
 - outcome type
 - expected and realized profit
 - submit and finalization latency
@@ -1088,7 +1088,7 @@ Useful knobs:
 - `RUNTIME_LOAD_TEST_CONCURRENCY`: worker count, default CPU parallelism
 - `RUNTIME_LOAD_TEST_PROFILE`: `baseline` or `adversarial`
 - `RUNTIME_LOAD_TEST_ADVERSARIAL`: legacy boolean switch for adversarial mode
-- `RUNTIME_LOAD_TEST_GAS_PRICE_GWEI`: synthetic victim gas price, default chain baseline
+- `RUNTIME_LOAD_TEST_GAS_PRICE_GWEI`: synthetic alvo gas price, default chain baseline
 - `RUNTIME_LOAD_TEST_LATENCY_BUDGET_US`: p99 budget for total hot-gate latency, default `250`
 - `RUNTIME_LOAD_TEST_OUTPUT_PATH`: optional JSON export path
 
@@ -1151,7 +1151,7 @@ Examples:
 
 The active runtime also emits operational events directly through the dashboard event stream for cases that matter during low-capital validation:
 
-- opportunity skipped because observed victim gas is above the configured cap
+- opportunity skipped because observed alvo gas is above the configured cap
 - executor blocked because live RPC gas is above the configured cap
 - RPC submit failed
 - insufficient funds for gas/value during direct-RPC execution attempts
@@ -1460,7 +1460,7 @@ It is strong where it is explicit:
 - capital budgeting
 - replay-based decision review
 
-It includes deterministic post-victim state simulation, slippage-aware sizing gates, and optional local EVM preflight through `revm` with explicit state overrides.
+It includes deterministic Post-Alvo state simulation, slippage-aware sizing gates, and optional local EVM preflight through `revm` with explicit state overrides.
 
 That means the runtime is safer than a naive mempool bot, but the preflight path should still be treated as an execution guardrail, not a profitability guarantee. Full fork-backed state simulation remains a separate hardening target.
 
