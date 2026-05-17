@@ -105,9 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Fee extraction enabled: {}", config.mev.enabled);
     info!(
         "Impact gate: min_large_swap={:.3} ETH min_profit={:.6} ETH min_roi={}bps",
-        config.mev.min_large_swap_eth,
-        config.mev.min_net_profit_eth,
-        config.mev.min_roi_bps
+        config.mev.min_large_swap_eth, config.mev.min_net_profit_eth, config.mev.min_roi_bps
     );
     info!(
         "Gas guardrails: max_gas_per_tx={} max_gas_price={} gwei",
@@ -120,8 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     info!(
         "Latency trace: enabled={} warn_threshold_us={}",
-        config.mev.latency_trace,
-        config.mev.latency_trace_warn_us
+        config.mev.latency_trace, config.mev.latency_trace_warn_us
     );
     info!(
         "Pool cache: state_ttl_ms={}",
