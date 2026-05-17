@@ -186,7 +186,11 @@ impl RpcFleet {
         observed_block: Option<u64>,
     ) {
         let now = Instant::now();
-        let Some(endpoint) = self.endpoints.iter().find(|endpoint| endpoint.id == endpoint_id) else {
+        let Some(endpoint) = self
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == endpoint_id)
+        else {
             return;
         };
         let mut state = endpoint.state.lock().expect("rpc endpoint state lock");
@@ -214,7 +218,11 @@ impl RpcFleet {
 
     pub fn record_failure(&self, endpoint_id: usize, kind: RpcFailureKind) {
         let now = Instant::now();
-        let Some(endpoint) = self.endpoints.iter().find(|endpoint| endpoint.id == endpoint_id) else {
+        let Some(endpoint) = self
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == endpoint_id)
+        else {
             return;
         };
         let mut state = endpoint.state.lock().expect("rpc endpoint state lock");
@@ -227,7 +235,9 @@ impl RpcFleet {
             }
             RpcFailureKind::Timeout => {
                 state.timeout_failures = state.timeout_failures.saturating_add(1);
-                Duration::from_millis(400u64.saturating_mul(2u64.saturating_pow(state.timeout_failures.min(5))))
+                Duration::from_millis(
+                    400u64.saturating_mul(2u64.saturating_pow(state.timeout_failures.min(5))),
+                )
             }
             RpcFailureKind::Stale => {
                 state.stale_failures = state.stale_failures.saturating_add(1);
@@ -475,10 +485,18 @@ impl RpcFleet {
 
     fn reserve_selection(&self, endpoint_id: usize, send_mode: bool) {
         let now = Instant::now();
-        let Some(endpoint) = self.endpoints.iter().find(|endpoint| endpoint.id == endpoint_id) else {
+        let Some(endpoint) = self
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == endpoint_id)
+        else {
             return;
         };
-        self.reserve_burst_units(endpoint, endpoint_burst_cost_units(endpoint.kind, send_mode), now);
+        self.reserve_burst_units(
+            endpoint,
+            endpoint_burst_cost_units(endpoint.kind, send_mode),
+            now,
+        );
     }
 
     fn reserve_burst_units(&self, endpoint: &Arc<RpcEndpoint>, units: u32, now: Instant) {
