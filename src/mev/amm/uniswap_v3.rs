@@ -161,11 +161,16 @@ pub fn select_best_v3_size_candidate(
     let priority = context_priority_score.clamp(0.0, 1.5);
     let toxicity = context_toxicity_score.clamp(0.0, 1.0);
     candidates.iter().copied().max_by(|left, right| {
-        v3_sizing_score(*left, priority, toxicity).total_cmp(&v3_sizing_score(*right, priority, toxicity))
+        v3_sizing_score(*left, priority, toxicity)
+            .total_cmp(&v3_sizing_score(*right, priority, toxicity))
     })
 }
 
-fn v3_sizing_score(candidate: V3SizeCandidate, context_priority_score: f64, context_toxicity_score: f64) -> f64 {
+fn v3_sizing_score(
+    candidate: V3SizeCandidate,
+    context_priority_score: f64,
+    context_toxicity_score: f64,
+) -> f64 {
     let net_profit = candidate.net_profit_wei.as_u128() as f64;
     let roi_component = candidate.roi_bps as f64 / 10_000.0;
     let size_component = candidate.capital_fraction_bps as f64 / 10_000.0;
