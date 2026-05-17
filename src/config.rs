@@ -3,6 +3,7 @@ use ethers::signers::{LocalWallet, Signer};
 use ethers::types::{Address, U256};
 use serde::Deserialize;
 use std::env;
+use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::warn;
@@ -123,6 +124,7 @@ impl RpcPreference {
 impl Config {
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
         dotenvy::dotenv().ok();
+        apply_replay_tuned_runtime_env()?;
 
         let cli = Cli::parse();
         let network = env::var("NETWORK")
@@ -510,6 +512,51 @@ impl Config {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
     }
+}
+
+fn apply_replay_tuned_runtime_env() -> Result<(), Box<dyn std::error::Error>> {
+    if !env_flag("REPLAY_AUTO_TUNE_USE_IN_RUNTIME") {
+        return Ok(());
+    }
+    let path = env::var("REPLAY_AUTO_TUNE_RUNTIME_ENV_PATH")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var("REPLAY_AUTO_TUNE_APPLY_PATH")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| PathBuf::from("exports").join("replay_auto_tune.env"));
+    if !path.exists() {
+        warn!(
+            "runtime auto-tune env requested but file does not exist: {}",
+            path.display()
+        );
+        return Ok(());
+    }
+    let raw = fs::read_to_string(&path)?;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        unsafe {
+            env::set_var(key, value);
+        }
+    }
+    Ok(())
 }
 
 impl MevConfig {
