@@ -5,13 +5,15 @@ use crate::mev::execution::pinning::ThreadPinningConfig;
 use crate::mev::opportunity::wei_to_eth_f64;
 use crate::mev::runtime::{decode_relevant_swap, fast_preflight_gate};
 use crate::rpc::RpcFleet;
-use chrono::Utc;
 use chrono::Timelike;
+use chrono::Utc;
 use ethers::abi::{encode, Token};
 use ethers::middleware::SignerMiddleware;
 use ethers::prelude::*;
 use ethers::types::transaction::eip2718::TypedTransaction;
-use ethers::types::{BlockNumber, Bytes, Filter, NameOrAddress, Transaction, TransactionRequest, H256};
+use ethers::types::{
+    BlockNumber, Bytes, Filter, NameOrAddress, Transaction, TransactionRequest, H256,
+};
 use ethers_flashbots::{BundleRequest, FlashbotsMiddleware};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -499,7 +501,10 @@ fn runtime_load_worker(
             if record {
                 report.decode_reject += 1;
                 report.scenario_mut(scenario).decode_reject += 1;
-                report.samples.total_hot_gate_us.push(elapsed_us(total_started));
+                report
+                    .samples
+                    .total_hot_gate_us
+                    .push(elapsed_us(total_started));
             }
             continue;
         };
@@ -532,7 +537,10 @@ fn runtime_load_worker(
             if record {
                 report.fast_reject += 1;
                 report.scenario_mut(scenario).fast_reject += 1;
-                report.samples.total_hot_gate_us.push(elapsed_us(total_started));
+                report
+                    .samples
+                    .total_hot_gate_us
+                    .push(elapsed_us(total_started));
             }
             continue;
         }
@@ -550,13 +558,19 @@ fn runtime_load_worker(
             path_len: signal.path.len(),
         });
         if record {
-            report.samples.adaptive_preflight_us.push(elapsed_us(started));
+            report
+                .samples
+                .adaptive_preflight_us
+                .push(elapsed_us(started));
         }
         if !preflight.should_continue {
             if record {
                 report.adaptive_preflight_reject += 1;
                 report.scenario_mut(scenario).adaptive_preflight_reject += 1;
-                report.samples.total_hot_gate_us.push(elapsed_us(total_started));
+                report
+                    .samples
+                    .total_hot_gate_us
+                    .push(elapsed_us(total_started));
             }
             continue;
         }
@@ -592,7 +606,10 @@ fn runtime_load_worker(
         );
         if record {
             report.samples.adaptive_quote_us.push(elapsed_us(started));
-            report.samples.total_hot_gate_us.push(elapsed_us(total_started));
+            report
+                .samples
+                .total_hot_gate_us
+                .push(elapsed_us(total_started));
         }
         if quote.should_execute {
             if record {
@@ -1020,14 +1037,20 @@ impl RuntimeLoadReport {
         self.total_hot_gate = summarize_us(&mut self.samples.total_hot_gate_us);
         self.budget_pass = self.total_hot_gate.p99 <= self.latency_budget_p99_us;
         self.rejection_rate = rate(
-            self.decode_reject + self.fast_reject + self.adaptive_preflight_reject + self.quote_reject,
+            self.decode_reject
+                + self.fast_reject
+                + self.adaptive_preflight_reject
+                + self.quote_reject,
             self.processed,
         );
-        self.malformed_rejection_rate = scenario_rejection_rate(&self.scenarios, "malformed_calldata");
-        self.small_notional_rejection_rate = scenario_rejection_rate(&self.scenarios, "small_notional");
+        self.malformed_rejection_rate =
+            scenario_rejection_rate(&self.scenarios, "malformed_calldata");
+        self.small_notional_rejection_rate =
+            scenario_rejection_rate(&self.scenarios, "small_notional");
         self.toxic_gas_rejection_rate = scenario_rejection_rate(&self.scenarios, "toxic_gas");
         self.long_path_rejection_rate = scenario_rejection_rate(&self.scenarios, "long_path");
-        self.cluster_burst_rejection_rate = scenario_rejection_rate(&self.scenarios, "cluster_burst");
+        self.cluster_burst_rejection_rate =
+            scenario_rejection_rate(&self.scenarios, "cluster_burst");
     }
 }
 
@@ -1240,21 +1263,26 @@ fn export_runtime_latency_benchmarks(
     let exports_dir = crate::storage::ensure_exports_dir()?;
     let path = exports_dir.join("runtime_latency_benchmarks.json");
     let mut root = if path.exists() {
-        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&fs::read_to_string(&path)?)
-            .unwrap_or_default()
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&fs::read_to_string(
+            &path,
+        )?)
+        .unwrap_or_default()
     } else {
         serde_json::Map::new()
     };
-    root.insert("updated_at".to_string(), serde_json::Value::String(Utc::now().to_rfc3339()));
-    root.insert("network".to_string(), serde_json::Value::String(report.network.clone()));
+    root.insert(
+        "updated_at".to_string(),
+        serde_json::Value::String(Utc::now().to_rfc3339()),
+    );
+    root.insert(
+        "network".to_string(),
+        serde_json::Value::String(report.network.clone()),
+    );
     root.insert(
         "hardware_metadata".to_string(),
         serde_json::to_value(&report.hardware_metadata)?,
     );
-    root.insert(
-        report.profile.to_string(),
-        serde_json::to_value(report)?,
-    );
+    root.insert(report.profile.to_string(), serde_json::to_value(report)?);
     fs::write(&path, serde_json::to_string_pretty(&root)?)?;
     println!("Runtime benchmark export: {}", path.display());
     Ok(())
@@ -1277,9 +1305,7 @@ fn emit_runtime_budget_warning(report: &RuntimeLoadReport) {
 
     let message = format!(
         "runtime load test exceeded the 250us release budget: total_hot_gate p99={}us max={}us; {}",
-        report.total_hot_gate.p99,
-        report.total_hot_gate.max,
-        environment_hint
+        report.total_hot_gate.p99, report.total_hot_gate.max, environment_hint
     );
 
     if cfg!(debug_assertions) {
@@ -1292,7 +1318,14 @@ fn emit_runtime_budget_warning(report: &RuntimeLoadReport) {
 fn print_latency_us(label: &str, summary: LatencyUsSummary) {
     println!(
         "  {}: n={} avg={:.2}us p50={}us p95={}us p99={}us min={}us max={}us",
-        label, summary.count, summary.avg, summary.p50, summary.p95, summary.p99, summary.min, summary.max
+        label,
+        summary.count,
+        summary.avg,
+        summary.p50,
+        summary.p95,
+        summary.p99,
+        summary.min,
+        summary.max
     );
 }
 
