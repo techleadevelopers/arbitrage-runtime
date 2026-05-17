@@ -270,10 +270,9 @@ impl PayloadBuilder {
             ));
         }
 
-        let executor = config
-            .mev
-            .mev_executor
-            .ok_or_else(|| "MEV_EXECUTOR_ADDRESS is required to build atomic payload".to_string())?;
+        let executor = config.mev.mev_executor.ok_or_else(|| {
+            "MEV_EXECUTOR_ADDRESS is required to build atomic payload".to_string()
+        })?;
         let step = EncodedV3SwapStep {
             router: input.router,
             path: path.clone(),
