@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 // NOVO ARQUIVO: src/mev/cache/pool_cache.rs
-use ethers::types::{Address, U256};
 use ethers::providers::Middleware;
+use ethers::types::{Address, U256};
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock};
@@ -127,15 +127,15 @@ impl PoolCache {
         }
 
         use crate::mev::runtime::UniswapV2Pair;
-        
+
         // Fetch pair info
         let token0_fut = UniswapV2Pair::new(pair, provider.clone()).token_0();
         let token1_fut = UniswapV2Pair::new(pair, provider.clone()).token_1();
         let reserves_fut = UniswapV2Pair::new(pair, provider.clone()).get_reserves();
-        
-        let (token0, token1, reserves) = tokio::try_join!(token0_fut.call(), token1_fut.call(), reserves_fut.call())
-            .ok()?;
-        
+
+        let (token0, token1, reserves) =
+            tokio::try_join!(token0_fut.call(), token1_fut.call(), reserves_fut.call()).ok()?;
+
         let cached = CachedV2Pool {
             pair,
             token0,
@@ -147,15 +147,18 @@ impl PoolCache {
         };
 
         let mut cache = self.v2_pools.write().unwrap();
-        cache.insert(pair, PoolCacheEntry {
-            data: cached.clone(),
-            cached_at: Instant::now(),
-            block_number: current_block,
-        });
+        cache.insert(
+            pair,
+            PoolCacheEntry {
+                data: cached.clone(),
+                cached_at: Instant::now(),
+                block_number: current_block,
+            },
+        );
 
         let mut stats = self.stats.write().unwrap();
         stats.refresh_count += 1;
-        
+
         Some(cached)
     }
 
@@ -189,13 +192,14 @@ impl PoolCache {
         let token1_fut = UniswapV3Pool::new(pool, provider.clone()).token_1();
         let liquidity_fut = UniswapV3Pool::new(pool, provider.clone()).liquidity();
         let slot0_fut = UniswapV3Pool::new(pool, provider.clone()).slot_0();
-        
+
         let (token0, token1, liquidity, slot0) = tokio::try_join!(
             token0_fut.call(),
             token1_fut.call(),
             liquidity_fut.call(),
             slot0_fut.call()
-        ).ok()?;
+        )
+        .ok()?;
 
         let cached = CachedV3Pool {
             pool,
@@ -209,11 +213,14 @@ impl PoolCache {
         };
 
         let mut cache = self.v3_pools.write().unwrap();
-        cache.insert(pool, PoolCacheEntry {
-            data: cached.clone(),
-            cached_at: Instant::now(),
-            block_number: current_block,
-        });
+        cache.insert(
+            pool,
+            PoolCacheEntry {
+                data: cached.clone(),
+                cached_at: Instant::now(),
+                block_number: current_block,
+            },
+        );
 
         Some(cached)
     }
