@@ -1283,8 +1283,28 @@ fn export_runtime_latency_benchmarks(
         serde_json::to_value(&report.hardware_metadata)?,
     );
     root.insert(report.profile.to_string(), serde_json::to_value(report)?);
-    fs::write(&path, serde_json::to_string_pretty(&root)?)?;
+    let json = serde_json::to_string_pretty(&root)?;
+    fs::write(&path, &json)?;
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ");
+    let versioned = exports_dir.join(format!(
+        "runtime_latency_benchmarks.{}.{}.{}.{}.json",
+        report.network,
+        report.profile,
+        std::env::consts::OS,
+        timestamp
+    ));
+    fs::write(&versioned, json)?;
     println!("Runtime benchmark export: {}", path.display());
+    println!(
+        "Runtime benchmark versioned export: {}",
+        versioned.display()
+    );
+    if let Some(reference) = crate::storage::maybe_freeze_reference_artifact(&versioned)? {
+        println!(
+            "Runtime benchmark reference freeze: {}",
+            reference.display()
+        );
+    }
     Ok(())
 }
 
