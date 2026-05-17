@@ -1995,4 +1995,17 @@ mod tests {
         assert!(!test_config("polygon").uses_bundle_relays());
         assert!(test_config("ethereum").uses_bundle_relays());
     }
+
+    #[test]
+    fn contextual_guard_decays_after_quiet_window() {
+        let mut guard = ContextExecutionGuard {
+            consecutive_losses: 3,
+            frozen_until: None,
+            last_event_at: Some(Instant::now() - Duration::from_secs(120)),
+            regime_pressure_ewma: 0.90,
+        };
+        decay_context_guard(&mut guard, Instant::now(), 60);
+        assert!(guard.consecutive_losses < 3);
+        assert!(guard.regime_pressure_ewma < 0.90);
+    }
 }
