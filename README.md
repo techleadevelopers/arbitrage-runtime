@@ -1241,6 +1241,20 @@ For BNB Chain configuration, use the `_BSC` suffix as the canonical operator-fac
 - `MEV_MAX_WINDOW_EXPOSURE_ETH`
 - `MEV_MAX_CLUSTER_WINDOW_EXPOSURE_ETH`
 - `MEV_MAX_PAIR_WINDOW_EXPOSURE_ETH`
+- `MEV_RELAY_FANOUT_COUNT`
+- `MEV_RPC_FANOUT_COUNT`
+- `MEV_GAS_OVERPAY_BASE_EXTRA_BPS`
+- `MEV_GAS_OVERPAY_MISS_EXTRA_BPS`
+- `MEV_GAS_OVERPAY_REVERT_EXTRA_BPS`
+- `MEV_GAS_OVERPAY_SUBMIT_FAILURE_EXTRA_BPS`
+- `MEV_GAS_OVERPAY_MAX_EXTRA_BPS`
+- `MEV_STOP_LOSS_CONSECUTIVE_LOSSES`
+- `MEV_STOP_LOSS_FREEZE_SECS`
+- `MEV_CAPITAL_MULTIPLIER_AGGRESSIVE`
+- `MEV_CAPITAL_MULTIPLIER_NEUTRAL`
+- `MEV_CAPITAL_MULTIPLIER_DEFENSIVE`
+- `MEV_CAPITAL_MULTIPLIER_PRIORITY_THRESHOLD`
+- `MEV_CAPITAL_MULTIPLIER_TOXICITY_THRESHOLD`
 
 ### Executor buffer controls
 
@@ -1298,6 +1312,89 @@ Provide at least:
 
 - `RPC_URL_BSC`
 - `MEMPOOL_WS_URL_BSC`
+
+## WAR Real: Next 48 Hours
+
+The current gap is economic, not raw CPU throughput. For cloud Linux deployment on AMD EPYC class hardware, the next 48 hours should focus on inclusion quality, gas discipline, and capital preservation.
+
+### D0-D1
+
+Ship and validate the production controls already wired into the runtime:
+
+- direct-RPC fanout via `MEV_RPC_FANOUT_COUNT`
+- relay fanout cap via `MEV_RELAY_FANOUT_COUNT`
+- dynamic gas overpay via the `MEV_GAS_OVERPAY_*` controls
+- stop-loss freeze via `MEV_STOP_LOSS_*`
+- contextual capital sizing via `MEV_CAPITAL_MULTIPLIER_*`
+
+Run targets:
+
+```bash
+cargo check
+cargo test
+RUN_RUNTIME_LOAD_TEST=true RUNTIME_LOAD_TEST_PROFILE=baseline cargo run --release -- --network polygon
+RUN_RUNTIME_LOAD_TEST=true RUNTIME_LOAD_TEST_PROFILE=adversarial cargo run --release -- --network polygon
+```
+
+Expected metrics:
+
+- `baseline total_hot_gate p99 <= 250us` on isolated Linux cores
+- adversarial tail should stay explainable by scheduler or injected scenario, not random hot-path regressions
+- no direct-RPC single-endpoint dependency in Polygon/BNB send path
+- no execution after `MEV_STOP_LOSS_CONSECUTIVE_LOSSES` threshold is hit
+
+### D1-D2
+
+Use replay and low-capital live observation to calibrate the economic controls:
+
+- compare inclusion/miss rate before and after fanout
+- compare accepted-but-not-included rate before and after gas overpay
+- compare realized PnL stability before and after stop-loss freeze
+- compare capital committed in toxic vs favorable contexts
+
+Run targets:
+
+```bash
+RUN_REPLAY_HARNESS=true REPLAY_INPUT_PATH=./replay/polygon_cases.jsonl cargo run --release -- --network polygon
+```
+
+Review artifacts:
+
+- `exports/toxicity_profiles.csv`
+- `exports/realized_vs_expected.json`
+- `exports/runtime_latency_benchmarks.json`
+- replay decision output if `REPLAY_OUTPUT_PATH` is set
+
+Expected metrics:
+
+- inclusion rate improvement on top-ranked RPC paths
+- lower `accepted_not_included` share under the same gas cap regime
+- lower consecutive loss streak length
+- lower capital committed to high-toxicity router/pair/hour contexts
+- realized-vs-expected capture trend moving up, not just raw execution count
+
+### Environment Surface Added For This Phase
+
+```text
+MEV_RELAY_FANOUT_COUNT
+MEV_RPC_FANOUT_COUNT
+MEV_GAS_OVERPAY_BASE_EXTRA_BPS
+MEV_GAS_OVERPAY_MISS_EXTRA_BPS
+MEV_GAS_OVERPAY_REVERT_EXTRA_BPS
+MEV_GAS_OVERPAY_SUBMIT_FAILURE_EXTRA_BPS
+MEV_GAS_OVERPAY_MAX_EXTRA_BPS
+MEV_STOP_LOSS_CONSECUTIVE_LOSSES
+MEV_STOP_LOSS_FREEZE_SECS
+MEV_CAPITAL_MULTIPLIER_AGGRESSIVE
+MEV_CAPITAL_MULTIPLIER_NEUTRAL
+MEV_CAPITAL_MULTIPLIER_DEFENSIVE
+MEV_CAPITAL_MULTIPLIER_PRIORITY_THRESHOLD
+MEV_CAPITAL_MULTIPLIER_TOXICITY_THRESHOLD
+```
+
+These controls are aimed at the real production gap:
+
+`accepted -> not included`, gas bleed, false positives in toxic contexts, and repeated loss clusters.
 
 This matters because the generic provider autoconstruction for BNB should not rely on Ethereum/Arbitrum/Polygon-only provider assumptions.
 
