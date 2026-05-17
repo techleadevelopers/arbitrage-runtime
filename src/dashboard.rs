@@ -1263,7 +1263,9 @@ fn wei_str_to_eth(value: &str) -> f64 {
 fn upsert_relay_snapshot(relays: &mut Vec<RelaySnapshot>, update: RelaySnapshotUpdate<'_>) {
     if let Some(entry) = relays.iter_mut().find(|entry| entry.relay == update.relay) {
         entry.accepted = entry.accepted.saturating_add(u64::from(update.accepted));
-        entry.submit_failed = entry.submit_failed.saturating_add(u64::from(update.submit_failed));
+        entry.submit_failed = entry
+            .submit_failed
+            .saturating_add(u64::from(update.submit_failed));
         entry.included_success = entry
             .included_success
             .saturating_add(u64::from(update.included_success));
