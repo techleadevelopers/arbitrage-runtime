@@ -903,7 +903,10 @@ fn csv_field(value: &str) -> String {
 mod tests {
     use super::*;
     use ethers::types::Address;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_path(label: &str) -> std::path::PathBuf {
         let nonce = SystemTime::now()
@@ -1088,5 +1091,37 @@ mod tests {
         assert!(toxicity_raw.contains("router,pair,hour,revert_rate"));
         assert!(realized_raw.contains("\"delta_profit_eth\""));
         assert!(realized_raw.contains("\"capture_ratio\""));
+    }
+
+    #[test]
+    fn reference_artifact_freeze_creates_copy() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let export_dir = std::env::temp_dir().join(format!(
+            "flash_bot_reference_exports_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&export_dir).unwrap();
+        let source = export_dir.join("artifact.json");
+        fs::write(&source, "{\"ok\":true}").unwrap();
+
+        unsafe {
+            std::env::set_var("FREEZE_REFERENCE_ARTIFACTS", "true");
+            std::env::set_var("REFERENCE_ARTIFACTS_DIR", export_dir.join("reference"));
+        }
+
+        let frozen = maybe_freeze_reference_artifact(&source)
+            .unwrap()
+            .expect("reference copy");
+        assert!(frozen.exists());
+        assert_eq!(fs::read_to_string(&frozen).unwrap(), "{\"ok\":true}");
+
+        unsafe {
+            std::env::remove_var("FREEZE_REFERENCE_ARTIFACTS");
+            std::env::remove_var("REFERENCE_ARTIFACTS_DIR");
+        }
+        let _ = fs::remove_dir_all(&export_dir);
     }
 }
