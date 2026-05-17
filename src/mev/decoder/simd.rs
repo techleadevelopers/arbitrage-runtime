@@ -26,7 +26,9 @@ pub fn find_selector(data: &[u8]) -> Option<usize> {
 
 pub fn find_selector_scalar(data: &[u8]) -> Option<usize> {
     let selector = [data[0], data[1], data[2], data[3]];
-    SELECTORS.iter().position(|candidate| *candidate == selector)
+    SELECTORS
+        .iter()
+        .position(|candidate| *candidate == selector)
 }
 
 #[cfg(target_arch = "x86_64")]
