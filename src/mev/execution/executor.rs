@@ -361,12 +361,13 @@ impl ExecutionEngine {
             );
             return Ok(());
         }
-        let relay_ranking = self.rank_relays(opportunity.preferred_relay.as_deref());
-        let gas_price_to_use = self.dynamic_gas_price(
-            send_context.gas_price,
-            relay_ranking.first(),
-            &payload,
-        );
+        let ranked_submit_paths = if self.config.uses_bundle_relays() {
+            self.rank_relay_submit_paths(opportunity.preferred_relay.as_deref())
+        } else {
+            self.rank_direct_rpc_submit_paths(&send_context.endpoint)
+        };
+        let gas_price_to_use =
+            self.dynamic_gas_price(send_context.gas_price, ranked_submit_paths.first(), &payload);
         if gas_price_to_use != send_context.gas_price {
             self.dashboard.event(
                 "info",
@@ -385,14 +386,15 @@ impl ExecutionEngine {
             gas_price_to_use,
         )
         .await?;
-        if !relay_ranking.is_empty() {
-            self.dashboard.set_relay_rankings(relay_ranking.iter().map(relay_snapshot).collect());
+        if !ranked_submit_paths.is_empty() {
+            self.dashboard
+                .set_relay_rankings(ranked_submit_paths.iter().map(relay_snapshot).collect());
             self.dashboard.event(
                 "info",
                 format!(
-                    "relay ranking victim={:?}: {}",
+                    "submit path ranking victim={:?}: {}",
                     opportunity.victim_tx,
-                    relay_ranking
+                    ranked_submit_paths
                         .iter()
                         .map(|quote| format!(
                             "{} score={:.2} pressure={:.2} accept={:.2} inclusion={:.2} miss={:.2} revert={:.2} submit={:.0}ms finalize={:.0}ms",
@@ -413,13 +415,7 @@ impl ExecutionEngine {
         }
 
         if !self.config.uses_bundle_relays() {
-            let mut submit_endpoints = vec![send_context.endpoint.clone()];
-            for endpoint in self.rpc_fleet.send_candidates(3) {
-                if endpoint.id != send_context.endpoint.id {
-                    submit_endpoints.push(endpoint);
-                }
-            }
-            submit_endpoints.truncate(self.config.mev.rpc_fanout_count.max(1));
+            let submit_endpoints = self.direct_rpc_submit_endpoints(&send_context.endpoint);
 
             let mut last_submit_error: Option<String> = None;
             let mut submit_set = JoinSet::new();
@@ -528,9 +524,12 @@ impl ExecutionEngine {
         }
 
         let mut last_error: Option<String> = None;
-        for relay in relay_ranking
+        let tx_hash = signed_tx_hash(&payload.tx);
+        let mut relay_submit_set = JoinSet::new();
+        for relay in ranked_submit_paths
             .iter()
             .take(self.config.mev.relay_fanout_count.max(1))
+            .cloned()
         {
             let relay_url = match Url::parse(&relay.relay) {
                 Ok(url) => url,
@@ -544,16 +543,25 @@ impl ExecutionEngine {
                 SignerMiddleware::new(send_context.endpoint.provider.clone(), wallet.clone());
             let flashbots = FlashbotsMiddleware::new(flashbots_client, relay_url, relay_signer);
             let bundle = self.build_bundle(send_context.block, &opportunity, &payload);
-            let started = std::time::Instant::now();
+            relay_submit_set.spawn(async move {
+                let started = Instant::now();
+                match flashbots.send_bundle(&bundle).await {
+                    Ok(pending) => Ok((
+                        relay,
+                        started.elapsed().as_millis() as f64,
+                        pending.bundle_hash,
+                    )),
+                    Err(err) => Err((relay, started.elapsed().as_millis() as f64, err.to_string())),
+                }
+            });
+        }
 
-            match flashbots
-                .send_bundle(&bundle)
-                .await
-                .map(|pending| pending.bundle_hash)
-            {
-                Ok(bundle_hash) => {
-                    let tx_hash = signed_tx_hash(&payload.tx);
-                    let submit_latency_ms = started.elapsed().as_millis() as f64;
+        while let Some(result) = relay_submit_set.join_next().await {
+            let Ok(submit_result) = result else {
+                continue;
+            };
+            match submit_result {
+                Ok((relay, submit_latency_ms, bundle_hash)) => {
                     if let Ok(mut adaptive) = self.adaptive.lock() {
                         adaptive.record_submit_success_for_relay(&relay.relay, submit_latency_ms);
                     }
@@ -588,6 +596,7 @@ impl ExecutionEngine {
                             wei_to_eth_f64(payload.expected_profit_wei)
                         ),
                     );
+                    relay_submit_set.abort_all();
                     let realized = self
                         .observe_realized_pnl(
                             send_context.endpoint.id,
@@ -602,13 +611,10 @@ impl ExecutionEngine {
                     self.record_result(&realized);
                     return Ok(());
                 }
-                Err(err) => {
-                    warn!("fee extraction bundle failed via {}: {}", relay.relay, err);
+                Err((relay, submit_latency_ms, err_text)) => {
+                    warn!("fee extraction bundle failed via {}: {}", relay.relay, err_text);
                     if let Ok(mut adaptive) = self.adaptive.lock() {
-                        adaptive.record_submit_failure_for_relay(
-                            &relay.relay,
-                            started.elapsed().as_millis() as f64,
-                        );
+                        adaptive.record_submit_failure_for_relay(&relay.relay, submit_latency_ms);
                         adaptive.record_contextual_outcome(
                             &relay.relay,
                             cluster,
@@ -624,7 +630,7 @@ impl ExecutionEngine {
                         included_success: false,
                         included_revert: false,
                         not_included_timeout: false,
-                        submit_latency_ms: Some(started.elapsed().as_millis() as f64),
+                        submit_latency_ms: Some(submit_latency_ms),
                         finalization_latency_ms: None,
                         score: Some(relay.score),
                         pressure: Some(relay.relay_pressure),
@@ -635,10 +641,10 @@ impl ExecutionEngine {
                         "warn",
                         format!(
                             "fee extraction relay failed victim={:?} relay={}: {}",
-                            opportunity.victim_tx, relay.relay, err
+                            opportunity.victim_tx, relay.relay, err_text
                         ),
                     );
-                    last_error = Some(err.to_string());
+                    last_error = Some(err_text);
                 }
             }
         }
@@ -1023,6 +1029,95 @@ impl ExecutionEngine {
             adjusted.min(cap)
         } else {
             adjusted
+        }
+    }
+
+    fn rank_relay_submit_paths(&self, preferred_relay: Option<&str>) -> Vec<RelayQuote> {
+        self.rank_relays(preferred_relay)
+    }
+
+    fn rank_direct_rpc_submit_paths(&self, preferred_endpoint: &RpcHandle) -> Vec<RelayQuote> {
+        let submit_endpoints = self.direct_rpc_submit_endpoints(preferred_endpoint);
+        let relay_labels = submit_endpoints
+            .iter()
+            .map(|endpoint| format!("rpc://{}", endpoint.name))
+            .collect::<Vec<_>>();
+        if let Ok(adaptive) = self.adaptive.lock() {
+            adaptive.rank_relays(&relay_labels)
+        } else {
+            relay_labels
+                .into_iter()
+                .map(|relay| RelayQuote {
+                    relay,
+                    relay_pressure: 0.0,
+                    accept_rate: 1.0,
+                    inclusion_rate: 1.0,
+                    accepted_not_included_rate: 0.0,
+                    revert_rate: 0.0,
+                    submit_latency_ms: 0.0,
+                    finalization_latency_ms: 0.0,
+                    score: 0.0,
+                })
+                .collect()
+        }
+    }
+
+    fn direct_rpc_submit_endpoints(&self, preferred_endpoint: &RpcHandle) -> Vec<RpcHandle> {
+        let mut ranked_by_health = self.rpc_fleet.send_candidates(self.config.mev.rpc_fanout_count.max(1));
+        if !ranked_by_health
+            .iter()
+            .any(|endpoint| endpoint.id == preferred_endpoint.id)
+        {
+            ranked_by_health.insert(0, preferred_endpoint.clone());
+        }
+
+        let ranked_by_path = self.rank_direct_rpc_submit_paths_from_candidates(&ranked_by_health);
+        let mut ordered = Vec::with_capacity(ranked_by_health.len());
+        for relay in ranked_by_path {
+            if let Some(endpoint) = ranked_by_health
+                .iter()
+                .find(|endpoint| relay.relay == format!("rpc://{}", endpoint.name))
+                .cloned()
+            {
+                if !ordered.iter().any(|existing: &RpcHandle| existing.id == endpoint.id) {
+                    ordered.push(endpoint);
+                }
+            }
+        }
+        for endpoint in ranked_by_health {
+            if !ordered.iter().any(|existing| existing.id == endpoint.id) {
+                ordered.push(endpoint);
+            }
+        }
+        ordered.truncate(self.config.mev.rpc_fanout_count.max(1));
+        ordered
+    }
+
+    fn rank_direct_rpc_submit_paths_from_candidates(
+        &self,
+        candidates: &[RpcHandle],
+    ) -> Vec<RelayQuote> {
+        let relay_labels = candidates
+            .iter()
+            .map(|endpoint| format!("rpc://{}", endpoint.name))
+            .collect::<Vec<_>>();
+        if let Ok(adaptive) = self.adaptive.lock() {
+            adaptive.rank_relays(&relay_labels)
+        } else {
+            relay_labels
+                .into_iter()
+                .map(|relay| RelayQuote {
+                    relay,
+                    relay_pressure: 0.0,
+                    accept_rate: 1.0,
+                    inclusion_rate: 1.0,
+                    accepted_not_included_rate: 0.0,
+                    revert_rate: 0.0,
+                    submit_latency_ms: 0.0,
+                    finalization_latency_ms: 0.0,
+                    score: 0.0,
+                })
+                .collect()
         }
     }
 
