@@ -899,3 +899,49 @@ fn parse_builder_relays(primary: &str) -> Vec<String> {
 
     relays
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn replay_tuned_runtime_env_can_be_applied() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = std::env::temp_dir().join(format!(
+            "flash_bot_tuned_env_{}.env",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(
+            &temp,
+            "MEV_GAS_OVERPAY_BASE_EXTRA_BPS=777\nREPLAY_TUNE_GAS_EXTRA_BPS=2000\n",
+        )
+        .unwrap();
+
+        unsafe {
+            env::remove_var("MEV_GAS_OVERPAY_BASE_EXTRA_BPS");
+            env::set_var("REPLAY_AUTO_TUNE_USE_IN_RUNTIME", "true");
+            env::set_var("REPLAY_AUTO_TUNE_RUNTIME_ENV_PATH", &temp);
+        }
+
+        apply_replay_tuned_runtime_env().unwrap();
+
+        assert_eq!(
+            env::var("MEV_GAS_OVERPAY_BASE_EXTRA_BPS").unwrap(),
+            "777".to_string()
+        );
+
+        unsafe {
+            env::remove_var("MEV_GAS_OVERPAY_BASE_EXTRA_BPS");
+            env::remove_var("REPLAY_AUTO_TUNE_USE_IN_RUNTIME");
+            env::remove_var("REPLAY_AUTO_TUNE_RUNTIME_ENV_PATH");
+        }
+        let _ = fs::remove_file(temp);
+    }
+}
