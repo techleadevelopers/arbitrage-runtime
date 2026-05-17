@@ -6,6 +6,7 @@ use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -701,7 +702,20 @@ impl Storage {
         let exports_dir = ensure_exports_dir()?;
         let toxicity = self.write_toxicity_profiles_csv_to(&exports_dir, limit)?;
         let realized = self.write_realized_vs_expected_json_to(&exports_dir, limit)?;
-        Ok(vec![toxicity, realized])
+        let mut outputs = vec![toxicity.clone(), realized.clone()];
+        if let Some(versioned) = self.version_export_copy(&toxicity)? {
+            if let Some(reference) = maybe_freeze_reference_artifact(&versioned)? {
+                outputs.push(reference);
+            }
+            outputs.push(versioned);
+        }
+        if let Some(versioned) = self.version_export_copy(&realized)? {
+            if let Some(reference) = maybe_freeze_reference_artifact(&versioned)? {
+                outputs.push(reference);
+            }
+            outputs.push(versioned);
+        }
+        Ok(outputs)
     }
 
     #[allow(dead_code)]
@@ -773,6 +787,20 @@ impl Storage {
             .map(|(_, value)| value.to_string())
             .unwrap_or_else(|| relay.to_string())
     }
+
+    fn version_export_copy(
+        &self,
+        path: &Path,
+    ) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            return Ok(None);
+        };
+        let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+        let versioned =
+            path.with_file_name(format!("{}.{}.{}", self.network, timestamp, file_name));
+        fs::copy(path, &versioned)?;
+        Ok(Some(versioned))
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -827,6 +855,44 @@ pub fn ensure_exports_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let dir = PathBuf::from("exports");
     fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+pub fn maybe_freeze_reference_artifact(
+    path: &Path,
+) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    if !env_flag("FREEZE_REFERENCE_ARTIFACTS") {
+        return Ok(None);
+    }
+    let base_dir = env::var("REFERENCE_ARTIFACTS_DIR")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            ensure_exports_dir()
+                .unwrap_or_else(|_| PathBuf::from("exports"))
+                .join("reference")
+        });
+    fs::create_dir_all(&base_dir)?;
+    let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+        return Ok(None);
+    };
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ");
+    let frozen = base_dir.join(format!(
+        "{}.{}.{}",
+        timestamp,
+        std::env::consts::OS,
+        file_name
+    ));
+    fs::copy(path, &frozen)?;
+    Ok(Some(frozen))
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("true")
 }
 
 fn csv_field(value: &str) -> String {
