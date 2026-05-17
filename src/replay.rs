@@ -85,8 +85,10 @@ pub async fn maybe_run_replay_harness(
             candidates.push(candidate);
         }
         let (best, run) = best_run.ok_or("replay auto-tune produced no candidates")?;
+        let recommended = recommended_env(&best);
         print_tuning_summary(&best, &candidates);
-        write_tuning_report(&config.network, &best, &candidates)?;
+        maybe_apply_recommended_env(&recommended)?;
+        write_tuning_report(&config.network, &best, &candidates, &recommended)?;
         run
     } else {
         run_replay_cases(
@@ -136,6 +138,7 @@ struct ReplayTuning {
     threshold_multiplier: f64,
     priority_shift: f64,
     toxicity_shift: f64,
+    gas_extra_bps: u64,
 }
 
 impl Default for ReplayTuning {
@@ -144,6 +147,7 @@ impl Default for ReplayTuning {
             threshold_multiplier: 1.0,
             priority_shift: 0.0,
             toxicity_shift: 0.0,
+            gas_extra_bps: 0,
         }
     }
 }
@@ -153,6 +157,7 @@ struct ReplayTuningResult {
     threshold_multiplier: f64,
     priority_shift: f64,
     toxicity_shift: f64,
+    gas_extra_bps: u64,
     objective_score: f64,
     realized_profit_eth: f64,
     execute_candidates: u64,
@@ -171,11 +176,13 @@ impl ReplayTuningResult {
         let objective_score = report.realized_profit_eth
             - report.false_positive as f64 * 0.0025
             - report.false_negative as f64 * 0.0015
-            - report.execute_candidates as f64 * 0.0002;
+            - report.execute_candidates as f64 * 0.0002
+            - tuning.gas_extra_bps as f64 * 0.000_001_5;
         Self {
             threshold_multiplier: tuning.threshold_multiplier,
             priority_shift: tuning.priority_shift,
             toxicity_shift: tuning.toxicity_shift,
+            gas_extra_bps: tuning.gas_extra_bps,
             objective_score,
             realized_profit_eth: report.realized_profit_eth,
             execute_candidates: report.execute_candidates,
@@ -193,6 +200,9 @@ struct ReplayTuningReport {
     build_profile: &'static str,
     os: &'static str,
     arch: &'static str,
+    auto_apply_enabled: bool,
+    auto_apply_env_path: Option<String>,
+    recommended_env: BTreeMap<String, String>,
     best: ReplayTuningResult,
     candidates: Vec<ReplayTuningResult>,
 }
@@ -653,7 +663,10 @@ async fn run_replay_cases(
         latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
         report.ev_gate_pass += 1;
 
-        let execution_cost_wei = gas_price
+        let gas_price_for_tuning = gas_price
+            .saturating_mul(U256::from(10_000u64 + tuning.gas_extra_bps))
+            / U256::from(10_000u64);
+        let execution_cost_wei = gas_price_for_tuning
             .saturating_mul(U256::from(payload.gas_limit))
             .saturating_mul(U256::from(config.mev.gas_safety_margin_bps))
             / U256::from(10_000u64);
@@ -687,7 +700,7 @@ async fn run_replay_cases(
                     context_toxicity_score: context_signal.toxicity_score,
                     expected_profit_wei: payload.expected_profit_wei,
                     execution_cost_wei,
-                    gas_price_wei: gas_price,
+                    gas_price_wei: gas_price_for_tuning,
                     lookup_latency_ms,
                     notional_eth: wei_to_eth_f64(signal.notional_wei),
                     price_impact_bps: payload.price_impact_bps,
@@ -772,15 +785,19 @@ fn replay_tuning_grid() -> Vec<ReplayTuning> {
         env_f64_grid("REPLAY_TUNE_THRESHOLD_MULTIPLIERS", &[0.90, 1.00, 1.10]);
     let priority_shifts = env_f64_grid("REPLAY_TUNE_PRIORITY_SHIFTS", &[-0.05, 0.0, 0.05]);
     let toxicity_shifts = env_f64_grid("REPLAY_TUNE_TOXICITY_SHIFTS", &[-0.05, 0.0, 0.05]);
+    let gas_extra_bps = env_u64_grid("REPLAY_TUNE_GAS_EXTRA_BPS", &[0, 500, 1000, 2000]);
     let mut grid = Vec::new();
     for threshold_multiplier in threshold_multipliers {
         for priority_shift in &priority_shifts {
             for toxicity_shift in &toxicity_shifts {
-                grid.push(ReplayTuning {
-                    threshold_multiplier,
-                    priority_shift: *priority_shift,
-                    toxicity_shift: *toxicity_shift,
-                });
+                for gas_extra_bps in &gas_extra_bps {
+                    grid.push(ReplayTuning {
+                        threshold_multiplier,
+                        priority_shift: *priority_shift,
+                        toxicity_shift: *toxicity_shift,
+                        gas_extra_bps: *gas_extra_bps,
+                    });
+                }
             }
         }
     }
@@ -823,14 +840,28 @@ fn env_f64_grid(name: &str, defaults: &[f64]) -> Vec<f64> {
         .unwrap_or_else(|| defaults.to_vec())
 }
 
+fn env_u64_grid(name: &str, defaults: &[u64]) -> Vec<u64> {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|item| item.trim().parse::<u64>().ok())
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+        .unwrap_or_else(|| defaults.to_vec())
+}
+
 fn print_tuning_summary(best: &ReplayTuningResult, candidates: &[ReplayTuningResult]) {
     println!("=== Replay Auto-Tune ===");
     println!("Candidates: {}", candidates.len());
     println!(
-        "Best tune -> threshold_multiplier={:.3} priority_shift={:.3} toxicity_shift={:.3} objective={:.6} realized={:.6}ETH capture={:.2}%",
+        "Best tune -> threshold_multiplier={:.3} priority_shift={:.3} toxicity_shift={:.3} gas_extra_bps={} objective={:.6} realized={:.6}ETH capture={:.2}%",
         best.threshold_multiplier,
         best.priority_shift,
         best.toxicity_shift,
+        best.gas_extra_bps,
         best.objective_score,
         best.realized_profit_eth,
         best.capture_ratio * 100.0
@@ -841,7 +872,9 @@ fn write_tuning_report(
     network: &str,
     best: &ReplayTuningResult,
     candidates: &[ReplayTuningResult],
+    recommended_env: &BTreeMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let auto_apply_path = auto_apply_env_path();
     let path = env::var("REPLAY_TUNE_OUTPUT_PATH")
         .ok()
         .map(|value| value.trim().to_string())
@@ -867,11 +900,93 @@ fn write_tuning_report(
         },
         os: std::env::consts::OS,
         arch: std::env::consts::ARCH,
+        auto_apply_enabled: env_flag("REPLAY_AUTO_TUNE_APPLY"),
+        auto_apply_env_path: auto_apply_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        recommended_env: recommended_env.clone(),
         best: best.clone(),
         candidates: candidates.to_vec(),
     };
-    fs::write(path, serde_json::to_string_pretty(&report)?)?;
+    let json = serde_json::to_string_pretty(&report)?;
+    fs::write(&path, &json)?;
+    if let Some(parent) = path.parent() {
+        let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ");
+        let versioned = parent.join(format!(
+            "replay_auto_tune.{}.{}.{}.json",
+            network,
+            std::env::consts::OS,
+            timestamp
+        ));
+        fs::write(&versioned, json)?;
+        if let Some(reference) = crate::storage::maybe_freeze_reference_artifact(&versioned)? {
+            println!("Replay auto-tune reference freeze: {}", reference.display());
+        }
+    }
     Ok(())
+}
+
+fn recommended_env(best: &ReplayTuningResult) -> BTreeMap<String, String> {
+    let mut envs = BTreeMap::new();
+    envs.insert(
+        "REPLAY_TUNE_THRESHOLD_MULTIPLIERS".to_string(),
+        format!("{:.2}", best.threshold_multiplier),
+    );
+    envs.insert(
+        "REPLAY_TUNE_PRIORITY_SHIFTS".to_string(),
+        format!("{:.2}", best.priority_shift),
+    );
+    envs.insert(
+        "REPLAY_TUNE_TOXICITY_SHIFTS".to_string(),
+        format!("{:.2}", best.toxicity_shift),
+    );
+    envs.insert(
+        "REPLAY_TUNE_GAS_EXTRA_BPS".to_string(),
+        best.gas_extra_bps.to_string(),
+    );
+    envs
+}
+
+fn maybe_apply_recommended_env(
+    recommended_env: &BTreeMap<String, String>,
+) -> Result<Option<std::path::PathBuf>, Box<dyn std::error::Error>> {
+    if !env_flag("REPLAY_AUTO_TUNE_APPLY") {
+        return Ok(None);
+    }
+    let path = auto_apply_env_path().unwrap_or_else(|| {
+        ensure_exports_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("exports"))
+            .join("replay_auto_tune.env")
+    });
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let mut out = String::new();
+    for (key, value) in recommended_env {
+        out.push_str(key);
+        out.push('=');
+        out.push_str(value);
+        out.push('\n');
+    }
+    fs::write(&path, out)?;
+    println!("Replay auto-tune env applied: {}", path.display());
+    if let Some(reference) = crate::storage::maybe_freeze_reference_artifact(&path)? {
+        println!(
+            "Replay auto-tune env reference freeze: {}",
+            reference.display()
+        );
+    }
+    Ok(Some(path))
+}
+
+fn auto_apply_env_path() -> Option<std::path::PathBuf> {
+    env::var("REPLAY_AUTO_TUNE_APPLY_PATH")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
 }
 
 fn print_linux_validation_hint() {
