@@ -592,20 +592,23 @@ impl Storage {
             LIMIT ?3
             "#,
         )?;
-        let rows = stmt.query_map(params![self.network, min_samples as i64, limit as i64], |row| {
-            let pair = row.get::<_, String>(1)?;
-            let router = row.get::<_, String>(2)?;
-            Ok(HistoricalOutcomeProfile {
-                hour_utc: row.get::<_, i64>(0)? as u8,
-                pair: pair.parse().unwrap_or_default(),
-                router: router.parse().unwrap_or_default(),
-                samples: row.get::<_, i64>(3)? as u64,
-                success_rate: row.get(4)?,
-                accepted_not_included_rate: row.get(5)?,
-                revert_rate: row.get(6)?,
-                realized_capture: row.get(7)?,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![self.network, min_samples as i64, limit as i64],
+            |row| {
+                let pair = row.get::<_, String>(1)?;
+                let router = row.get::<_, String>(2)?;
+                Ok(HistoricalOutcomeProfile {
+                    hour_utc: row.get::<_, i64>(0)? as u8,
+                    pair: pair.parse().unwrap_or_default(),
+                    router: router.parse().unwrap_or_default(),
+                    samples: row.get::<_, i64>(3)? as u64,
+                    success_rate: row.get(4)?,
+                    accepted_not_included_rate: row.get(5)?,
+                    revert_rate: row.get(6)?,
+                    realized_capture: row.get(7)?,
+                })
+            },
+        )?;
 
         let mut items = Vec::new();
         for row in rows {
@@ -765,7 +768,8 @@ impl Storage {
     }
 
     fn unscoped_relay(&self, relay: &str) -> String {
-        relay.split_once("::")
+        relay
+            .split_once("::")
             .map(|(_, value)| value.to_string())
             .unwrap_or_else(|| relay.to_string())
     }
@@ -893,7 +897,11 @@ mod tests {
         let token_in = format!("{:?}", Address::from_low_u64_be(300));
         let token_out = format!("{:?}", Address::from_low_u64_be(400));
 
-        for outcome in ["included_success", "accepted_not_included", "included_success"] {
+        for outcome in [
+            "included_success",
+            "accepted_not_included",
+            "included_success",
+        ] {
             storage.record_execution_outcome(
                 "relay-a",
                 123,
@@ -904,7 +912,11 @@ mod tests {
                 "0xvictim",
                 outcome,
                 0.01,
-                if outcome == "included_success" { 0.008 } else { 0.0 },
+                if outcome == "included_success" {
+                    0.008
+                } else {
+                    0.0
+                },
                 210000,
                 10.0,
                 500.0,
@@ -916,7 +928,9 @@ mod tests {
         let profile = &profiles[0];
         assert_eq!(profile.samples, 3);
         assert!(profile.success_rate > 0.60 && profile.success_rate < 0.70);
-        assert!(profile.accepted_not_included_rate > 0.30 && profile.accepted_not_included_rate < 0.35);
+        assert!(
+            profile.accepted_not_included_rate > 0.30 && profile.accepted_not_included_rate < 0.35
+        );
     }
 
     #[test]
@@ -928,7 +942,11 @@ mod tests {
         let token_in = format!("{:?}", Address::from_low_u64_be(301));
         let token_out = format!("{:?}", Address::from_low_u64_be(401));
 
-        for outcome in ["included_revert", "accepted_not_included", "included_success"] {
+        for outcome in [
+            "included_revert",
+            "accepted_not_included",
+            "included_success",
+        ] {
             storage.record_execution_outcome(
                 "rpc://polygon-a",
                 456,
@@ -939,7 +957,11 @@ mod tests {
                 "0xvictim",
                 outcome,
                 0.01,
-                if outcome == "included_success" { 0.002 } else { 0.0 },
+                if outcome == "included_success" {
+                    0.002
+                } else {
+                    0.0
+                },
                 210000,
                 14.0,
                 700.0,
