@@ -7,27 +7,28 @@ use crate::mev::adaptive::{
 };
 use crate::mev::amm::uniswap_v2::V2PoolState;
 use crate::mev::amm::uniswap_v3::V3PoolState;
-use crate::mev::execution::payload_builder::{AmmRouteKind, FeeExtractionBuildInput, PayloadBuilder};
+use crate::mev::cache::pool_cache::PoolCache;
+use crate::mev::execution::payload_builder::ExecutionPayload;
+use crate::mev::execution::payload_builder::{
+    AmmRouteKind, FeeExtractionBuildInput, PayloadBuilder,
+};
 use crate::mev::execution::ExecutionEngine;
 use crate::mev::opportunity::{roi_bps, wei_to_eth_f64, MevOpportunity};
+use crate::mev::simulation::state_simulator::{
+    AccountState, AmmState, EvmPreflightResult, StateSimulator,
+};
 use crate::rpc::RpcFleet;
 use crate::storage::Storage;
 use chrono::Timelike;
 use ethers::abi::{self, ParamType, Token};
 use ethers::providers::{Middleware, Provider, StreamExt, Ws};
-use crate::mev::execution::payload_builder::ExecutionPayload;
-use ethers::types::{Address, H256, Transaction, U256};
+use ethers::types::{Address, Transaction, H256, U256};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 use tracing::warn;
-use crate::mev::cache::pool_cache::PoolCache;
-use crate::mev::simulation::state_simulator::{
-    AccountState, AmmState, EvmPreflightResult, StateSimulator,
-};
-
 
 const MICROBATCH_WINDOW_MS: u64 = 45;
 const MICROBATCH_MAX_CANDIDATES: usize = 4;
@@ -44,8 +45,6 @@ const SWAP_EXACT_ETH_FOR_TOKENS_SUPPORTING_FEE: [u8; 4] = [0xb6, 0xf9, 0xde, 0x9
 const SWAP_EXACT_TOKENS_FOR_ETH_SUPPORTING_FEE: [u8; 4] = [0x79, 0x1a, 0xc9, 0x47];
 const V3_EXACT_INPUT_SINGLE: [u8; 4] = [0x41, 0x4b, 0xf3, 0x89];
 const V3_EXACT_INPUT: [u8; 4] = [0xc0, 0x4b, 0x8d, 0x59];
-
-
 
 #[derive(Debug, Clone)]
 pub(crate) enum SwapKind {
@@ -132,11 +131,13 @@ impl MicroBatcher {
     }
 
     fn drain_best(&mut self) -> Option<(PendingExecutionCandidate, usize)> {
-        let (best_index, _) = self
-            .candidates
-            .iter()
-            .enumerate()
-            .max_by(|(_, left), (_, right)| left.ranking_score().total_cmp(&right.ranking_score()))?;
+        let (best_index, _) =
+            self.candidates
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| {
+                    left.ranking_score().total_cmp(&right.ranking_score())
+                })?;
         let dropped = self.candidates.len().saturating_sub(1);
         let best = self.candidates.swap_remove(best_index);
         self.candidates.clear();
@@ -177,7 +178,10 @@ impl CandidateLatencyTrace {
                 stage,
                 duration_us.div_ceil(1_000) as u128,
                 None,
-                Some(&format!("victim={:?} outcome={} {}us", victim_tx, outcome, duration_us)),
+                Some(&format!(
+                    "victim={:?} outcome={} {}us",
+                    victim_tx, outcome, duration_us
+                )),
             );
         }
 
@@ -207,11 +211,19 @@ impl CandidateLatencyTrace {
 
     fn stage_pairs(&self) -> Vec<(&'static str, u64)> {
         let mut pairs = Vec::with_capacity(10);
-        push_stage_pair(&mut pairs, "rt.lookup_pending_tx", self.lookup_pending_tx_us);
+        push_stage_pair(
+            &mut pairs,
+            "rt.lookup_pending_tx",
+            self.lookup_pending_tx_us,
+        );
         push_stage_pair(&mut pairs, "rt.decode_swap", self.decode_swap_us);
         push_stage_pair(&mut pairs, "rt.context_signal", self.context_signal_us);
         push_stage_pair(&mut pairs, "rt.fast_preflight", self.fast_preflight_us);
-        push_stage_pair(&mut pairs, "rt.adaptive_preflight", self.adaptive_preflight_us);
+        push_stage_pair(
+            &mut pairs,
+            "rt.adaptive_preflight",
+            self.adaptive_preflight_us,
+        );
         push_stage_pair(&mut pairs, "rt.payload_build", self.payload_build_us);
         push_stage_pair(&mut pairs, "rt.ev_gate", self.ev_gate_us);
         push_stage_pair(&mut pairs, "rt.quality_gate", self.quality_gate_us);
@@ -344,7 +356,10 @@ pub async fn run(
                     }
                 }
             }
-            dashboard.event("info", format!("lookup/decode worker {} stopped", worker_idx));
+            dashboard.event(
+                "info",
+                format!("lookup/decode worker {} stopped", worker_idx),
+            );
         });
     }
     drop(eval_tx);
@@ -368,7 +383,7 @@ pub async fn run(
                     dashboard.clone(),
                     min_large_swap_wei,
                     min_profit_wei,
-                    pool_cache.clone(), 
+                    pool_cache.clone(),
                 )
                 .await
                 {
@@ -464,15 +479,22 @@ fn connect_mempool_fan_in(
                                         return;
                                     }
                                 }
-                                dashboard.event("warn", format!("mempool ws stream ended {}", ws_url));
+                                dashboard
+                                    .event("warn", format!("mempool ws stream ended {}", ws_url));
                             }
                             Err(err) => {
-                                dashboard.event("warn", format!("mempool ws subscribe failed {}: {}", ws_url, err));
+                                dashboard.event(
+                                    "warn",
+                                    format!("mempool ws subscribe failed {}: {}", ws_url, err),
+                                );
                             }
                         }
                     }
                     Err(err) => {
-                        dashboard.event("warn", format!("mempool ws connect failed {}: {}", ws_url, err));
+                        dashboard.event(
+                            "warn",
+                            format!("mempool ws connect failed {}: {}", ws_url, err),
+                        );
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(900)).await;
@@ -500,7 +522,10 @@ fn mark_seen_tx(
     true
 }
 
-async fn lookup_pending_tx_parallel(rpc_fleet: Arc<RpcFleet>, tx_hash: H256) -> Option<Transaction> {
+async fn lookup_pending_tx_parallel(
+    rpc_fleet: Arc<RpcFleet>,
+    tx_hash: H256,
+) -> Option<Transaction> {
     let mut join_set = JoinSet::new();
     for handle in rpc_fleet.read_candidates(3) {
         let rpc_fleet = rpc_fleet.clone();
@@ -522,7 +547,8 @@ async fn lookup_pending_tx_parallel(rpc_fleet: Arc<RpcFleet>, tx_hash: H256) -> 
                     None
                 }
                 Err(err) => {
-                    rpc_fleet.record_failure(handle.id, RpcFleet::classify_failure(&err.to_string()));
+                    rpc_fleet
+                        .record_failure(handle.id, RpcFleet::classify_failure(&err.to_string()));
                     None
                 }
             }
@@ -538,9 +564,7 @@ async fn lookup_pending_tx_parallel(rpc_fleet: Arc<RpcFleet>, tx_hash: H256) -> 
     None
 }
 
-async fn recv_from_shared_channel<T>(
-    rx: &Arc<Mutex<mpsc::Receiver<T>>>,
-) -> Option<T> {
+async fn recv_from_shared_channel<T>(rx: &Arc<Mutex<mpsc::Receiver<T>>>) -> Option<T> {
     let mut guard = rx.lock().await;
     guard.recv().await
 }
@@ -569,7 +593,11 @@ async fn process_lookup_decode_task(
     }
 
     let decode_started = Instant::now();
-    let signal = decode_relevant_swap(&tx, &config.monitored_tokens, ethers::utils::parse_ether(config.mev.min_large_swap_eth.to_string()).ok()?)?;
+    let signal = decode_relevant_swap(
+        &tx,
+        &config.monitored_tokens,
+        ethers::utils::parse_ether(config.mev.min_large_swap_eth.to_string()).ok()?,
+    )?;
     latency_trace.decode_swap_us = Some(elapsed_us(decode_started));
 
     let hour_utc = chrono::Utc::now().hour() as u8;
@@ -607,7 +635,7 @@ async fn process_lookup_decode_task(
         lookup_latency: lookup_started.elapsed(),
         candidate_started: task.candidate_started,
         latency_trace,
-        block_number, 
+        block_number,
     })
 }
 
@@ -616,11 +644,9 @@ async fn get_current_block_parallel(rpc_fleet: Arc<RpcFleet>) -> Option<u64> {
     let mut join_set = JoinSet::new();
     for handle in rpc_fleet.read_candidates(3) {
         let provider = handle.provider.clone();
-        join_set.spawn(async move {
-            provider.get_block_number().await.ok().map(|b| b.as_u64())
-        });
+        join_set.spawn(async move { provider.get_block_number().await.ok().map(|b| b.as_u64()) });
     }
-    
+
     while let Some(result) = join_set.join_next().await {
         if let Ok(Some(block)) = result {
             join_set.abort_all();
@@ -642,10 +668,10 @@ async fn validate_with_evm_preflight(
 ) -> Result<EvmPreflightResult, String> {
     // Obter um provider para o fork
     let _ = (rpc_fleet, dashboard);
-    
+
     // Criar o estado inicial baseado no block_number
     let mut account_states = std::collections::HashMap::new();
-    
+
     // Adicionar o estado do pool antes da execução
     match pool_state {
         AmmState::UniswapV2(pool) => {
@@ -658,13 +684,17 @@ async fn validate_with_evm_preflight(
             let mut account = AccountState::empty();
             account.storage.insert(U256::from(0), pool.sqrt_price_x96);
             account.storage.insert(U256::from(1), pool.liquidity);
-            account.storage.insert(U256::from(2), U256::from(pool.current_tick.max(0) as u64));
+            account
+                .storage
+                .insert(U256::from(2), U256::from(pool.current_tick.max(0) as u64));
             account_states.insert(pool.pool, account);
         }
     }
-    
+
     if let Some(executor) = config.mev.mev_executor {
-        account_states.entry(executor).or_insert_with(AccountState::empty);
+        account_states
+            .entry(executor)
+            .or_insert_with(AccountState::empty);
     }
     account_states
         .entry(config.profit_address)
@@ -679,7 +709,12 @@ async fn validate_with_evm_preflight(
         from: config.executor_address,
         to: Some(payload.target_contract),
         value: payload.value,
-        gas_price: Some(victim_tx.max_fee_per_gas.or(victim_tx.gas_price).unwrap_or_default()),
+        gas_price: Some(
+            victim_tx
+                .max_fee_per_gas
+                .or(victim_tx.gas_price)
+                .unwrap_or_default(),
+        ),
         gas: U256::from(payload.gas_limit),
         input: payload.calldata.clone(),
         chain_id: Some(U256::from(config.chain_id)),
@@ -697,13 +732,14 @@ async fn process_evaluation_task(
     dashboard: DashboardHandle,
     min_large_swap_wei: U256,
     min_profit_wei: U256,
-    pool_cache: Arc<PoolCache>,  // NOVO PARÂMETRO
+    pool_cache: Arc<PoolCache>, // NOVO PARÂMETRO
 ) -> Option<PendingExecutionCandidate> {
     let tx_hash = candidate.tx.hash;
-    
+
     if let Some(max_gas_price_wei) = config.mev.max_gas_price_wei() {
         if candidate.gas_price > max_gas_price_wei {
-            candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+            candidate.latency_trace.total_internal_us =
+                Some(elapsed_us(candidate.candidate_started));
             dashboard.record_reject_reason("gas_price_cap", "victim_gas_price_above_cap");
             dashboard.event(
                 "warn",
@@ -730,7 +766,7 @@ async fn process_evaluation_task(
         candidate.context_signal,
     );
     candidate.latency_trace.fast_preflight_us = Some(elapsed_us(fast_preflight_started));
-    
+
     if !fast_gate.should_continue {
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
         if let Some(reason) = fast_gate.reject_reason {
@@ -747,9 +783,13 @@ async fn process_evaluation_task(
     }
 
     if let Ok(mut model) = adaptive.lock() {
-        model.observe_candidate_flow(candidate.cluster, candidate.signal.notional_wei, candidate.gas_price);
+        model.observe_candidate_flow(
+            candidate.cluster,
+            candidate.signal.notional_wei,
+            candidate.gas_price,
+        );
     }
-    
+
     let adaptive_preflight_started = Instant::now();
     let preflight = if let Ok(mut model) = adaptive.lock() {
         model.preflight_score(PreflightInput {
@@ -763,7 +803,7 @@ async fn process_evaluation_task(
     };
     candidate.latency_trace.adaptive_preflight_us = Some(elapsed_us(adaptive_preflight_started));
     dashboard.set_market_regime(preflight.regime.as_str());
-    
+
     if !preflight.should_continue {
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
         if let Some(reason) = preflight.reject_reason {
@@ -791,20 +831,20 @@ async fn process_evaluation_task(
     )
     .await?;
     candidate.latency_trace.payload_build_us = Some(elapsed_us(payload_started));
-    
+
     // WAR LEVEL: EVM preflight validation (opcional, ativado por env)
     if std::env::var("MEV_EVM_PREFLIGHT_ENABLED")
         .unwrap_or_default()
         .eq_ignore_ascii_case("true")
     {
         let preflight_started = std::time::Instant::now();
-        
+
         // Usar o estado real do pool que está no payload
         let pool_state = &payload.pool_state_before;
-        
+
         // Obter a transação da vítima
         let victim_tx = &candidate.tx;
-        
+
         // Chamar a validação EVM
         match validate_with_evm_preflight(
             &payload,
@@ -814,24 +854,36 @@ async fn process_evaluation_task(
             &config,
             &rpc_fleet,
             &dashboard,
-        ).await {
+        )
+        .await
+        {
             Ok(preflight_result) => {
                 let preflight_elapsed = preflight_started.elapsed();
                 candidate.latency_trace.adaptive_preflight_us = Some(elapsed_us(preflight_started));
-                
+
                 if !preflight_result.success {
-                    candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
-                    dashboard.record_reject_reason("evm_preflight", preflight_result.revert_reason.as_deref().unwrap_or("preflight_failed"));
+                    candidate.latency_trace.total_internal_us =
+                        Some(elapsed_us(candidate.candidate_started));
+                    dashboard.record_reject_reason(
+                        "evm_preflight",
+                        preflight_result
+                            .revert_reason
+                            .as_deref()
+                            .unwrap_or("preflight_failed"),
+                    );
                     candidate.latency_trace.emit(
                         &config,
                         &dashboard,
                         tx_hash,
                         "reject",
-                        preflight_result.revert_reason.as_deref().unwrap_or("evm_preflight"),
+                        preflight_result
+                            .revert_reason
+                            .as_deref()
+                            .unwrap_or("evm_preflight"),
                     );
                     return None;
                 }
-                
+
                 dashboard.event(
                     "info",
                     format!(
@@ -844,7 +896,8 @@ async fn process_evaluation_task(
                 );
             }
             Err(err) => {
-                candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+                candidate.latency_trace.total_internal_us =
+                    Some(elapsed_us(candidate.candidate_started));
                 dashboard.record_reject_reason("evm_preflight_error", &err);
                 candidate.latency_trace.emit(
                     &config,
@@ -868,7 +921,9 @@ async fn process_evaluation_task(
     ) {
         candidate.latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
-        candidate.latency_trace.emit(&config, &dashboard, tx_hash, "reject", "ev_gate");
+        candidate
+            .latency_trace
+            .emit(&config, &dashboard, tx_hash, "reject", "ev_gate");
         return None;
     }
     candidate.latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
@@ -878,12 +933,14 @@ async fn process_evaluation_task(
         .saturating_mul(U256::from(payload.gas_limit))
         .saturating_mul(U256::from(config.mev.gas_safety_margin_bps))
         / U256::from(10_000u64);
-    
+
     let quality_gate_started = Instant::now();
     if !passes_quality_gate(&config, &payload, execution_cost_wei) {
         candidate.latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
-        candidate.latency_trace.emit(&config, &dashboard, tx_hash, "reject", "quality_gate");
+        candidate
+            .latency_trace
+            .emit(&config, &dashboard, tx_hash, "reject", "quality_gate");
         return None;
     }
     candidate.latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
@@ -912,7 +969,7 @@ async fn process_evaluation_task(
     };
     candidate.latency_trace.adaptive_quote_us = Some(elapsed_us(adaptive_quote_started));
     dashboard.set_market_regime(quote.regime.as_str());
-    
+
     if !quote.should_execute {
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
         if let Some(reason) = quote.reject_reason {
@@ -958,7 +1015,7 @@ async fn process_evaluation_task(
         payload,
         quote.selected_relay.clone(),
     );
-    
+
     let capital_efficiency = opportunity
         .execution_payload
         .as_ref()
@@ -968,11 +1025,15 @@ async fn process_evaluation_task(
         })
         .unwrap_or_default()
         .clamp(0.0, 1.0);
-    
+
     candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
-    candidate
-        .latency_trace
-        .emit(&config, &dashboard, tx_hash, "execution_ready", "adaptive_passed");
+    candidate.latency_trace.emit(
+        &config,
+        &dashboard,
+        tx_hash,
+        "execution_ready",
+        "adaptive_passed",
+    );
 
     Some(PendingExecutionCandidate {
         opportunity,
@@ -990,10 +1051,9 @@ pub(crate) fn passes_quality_gate(
     execution_cost_wei: U256,
 ) -> bool {
     let roi = roi_bps(payload.expected_profit_wei, execution_cost_wei);
-    let impact_score = ((payload.price_impact_bps as f64
-        / config.mev.max_price_impact_bps.max(1) as f64)
-        * 100.0)
-        .clamp(0.0, 100.0) as u16;
+    let impact_score =
+        ((payload.price_impact_bps as f64 / config.mev.max_price_impact_bps.max(1) as f64) * 100.0)
+            .clamp(0.0, 100.0) as u16;
     roi >= config.mev.min_roi_bps && impact_score <= 100
 }
 
@@ -1137,7 +1197,9 @@ pub(crate) fn passes_ev_gate_v2(
 ) -> bool {
     let lookup_is_fresh =
         lookup_latency.as_millis() <= u128::from(config.mev.max_pending_age_ms.max(1));
-    let large_enough = signal.notional_wei >= ethers::utils::parse_ether(config.mev.min_large_swap_eth.to_string()).unwrap_or_default();
+    let large_enough = signal.notional_wei
+        >= ethers::utils::parse_ether(config.mev.min_large_swap_eth.to_string())
+            .unwrap_or_default();
     let inevitable_impact = payload.price_impact_bps >= 8;
     let profit_above_threshold = payload.expected_profit_wei >= min_profit_wei;
     let net_ev_usd = wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price;
@@ -1160,8 +1222,9 @@ pub(crate) fn passes_ev_gate_v3(
 ) -> bool {
     let lookup_is_fresh =
         lookup_latency.as_millis() <= u128::from(config.mev.max_pending_age_ms.max(1));
-    let large_enough =
-        signal.notional_wei >= ethers::utils::parse_ether(config.mev.min_large_swap_eth.to_string()).unwrap_or_default();
+    let large_enough = signal.notional_wei
+        >= ethers::utils::parse_ether(config.mev.min_large_swap_eth.to_string())
+            .unwrap_or_default();
     let inevitable_impact = payload.price_impact_bps >= 6;
     let profit_above_threshold = payload.expected_profit_wei >= min_profit_wei;
     let net_ev_usd = wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price;
@@ -1186,7 +1249,16 @@ pub(crate) async fn build_payload<M: Middleware + 'static>(
 ) -> Result<crate::mev::execution::payload_builder::ExecutionPayload, String> {
     match &signal.kind {
         SwapKind::V2 => {
-            build_v2_payload(provider, config, signal, gas_price, context_signal, pool_cache, block_number).await
+            build_v2_payload(
+                provider,
+                config,
+                signal,
+                gas_price,
+                context_signal,
+                pool_cache,
+                block_number,
+            )
+            .await
         }
         SwapKind::V3 {
             fee_tier,
@@ -1215,8 +1287,8 @@ async fn build_payload_with_fallback_parallel(
     signal: SwapSignal,
     gas_price: U256,
     context_signal: ContextSignal,
-    pool_cache: Arc<PoolCache>,  // NOVO
-    block_number: u64,       // NOVO
+    pool_cache: Arc<PoolCache>, // NOVO
+    block_number: u64,          // NOVO
 ) -> Option<ExecutionPayload> {
     let mut join_set = JoinSet::new();
     for handle in rpc_fleet.read_candidates(3) {
@@ -1229,7 +1301,17 @@ async fn build_payload_with_fallback_parallel(
         join_set.spawn(async move {
             rpc_fleet.reserve_read_selection(handle.id);
             let started = Instant::now();
-            match build_payload(provider, &config, &signal, gas_price, context_signal, &pool_cache, block_number).await {
+            match build_payload(
+                provider,
+                &config,
+                &signal,
+                gas_price,
+                context_signal,
+                &pool_cache,
+                block_number,
+            )
+            .await
+            {
                 Ok(payload) => {
                     rpc_fleet.record_success(handle.id, started.elapsed(), Some(block_number));
                     Some(payload)
@@ -1269,29 +1351,40 @@ pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
     signal: &SwapSignal,
     gas_price: U256,
     context_signal: ContextSignal,
-    pool_cache: &PoolCache,  // NOVO PARÂMETRO
-    block_number: u64,       // NOVO PARÂMETRO
+    pool_cache: &PoolCache, // NOVO PARÂMETRO
+    block_number: u64,      // NOVO PARÂMETRO
 ) -> Result<ExecutionPayload, String> {
-    let factory = config.mev.uniswap_v2_factory.ok_or_else(|| "missing uniswap v2 factory".to_string())?;
+    let factory = config
+        .mev
+        .uniswap_v2_factory
+        .ok_or_else(|| "missing uniswap v2 factory".to_string())?;
     let recipient = config.profit_address;
-    let token_in = *signal.path.first().ok_or_else(|| "missing token_in".to_string())?;
-    let token_out = *signal.path.get(1).ok_or_else(|| "missing token_out".to_string())?;
-    
+    let token_in = *signal
+        .path
+        .first()
+        .ok_or_else(|| "missing token_in".to_string())?;
+    let token_out = *signal
+        .path
+        .get(1)
+        .ok_or_else(|| "missing token_out".to_string())?;
+
     let factory_contract = UniswapV2Factory::new(factory, provider.clone());
     let pair = factory_contract
         .get_pair(token_in, token_out)
         .call()
         .await
         .map_err(|err| err.to_string())?;
-    
+
     if pair == Address::zero() {
         return Err("v2 pair not found".to_string());
     }
 
     // Usar cache em vez de chamadas RPC diretas
-    let cached_pool = pool_cache.get_or_fetch_v2(pair, provider.clone(), block_number).await
+    let cached_pool = pool_cache
+        .get_or_fetch_v2(pair, provider.clone(), block_number)
+        .await
         .ok_or_else(|| "failed to fetch pool state".to_string())?;
-    
+
     let pool = V2PoolState {
         pair,
         token0: cached_pool.token0,
@@ -1300,9 +1393,9 @@ pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
         reserve1: cached_pool.reserve1,
         fee_bps: 30,
     };
-    
+
     let capital_available_wei = contextual_capital_available_wei(config, context_signal)?;
-    
+
     PayloadBuilder::build_fee_extraction_v2(
         config,
         FeeExtractionBuildInput {
@@ -1330,8 +1423,8 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
     context_signal: ContextSignal,
     fee_tier: u32,
     encoded_path: ethers::types::Bytes,
-    pool_cache: &PoolCache,  // NOVO PARÂMETRO
-    block_number: u64,       // NOVO PARÂMETRO
+    pool_cache: &PoolCache, // NOVO PARÂMETRO
+    block_number: u64,      // NOVO PARÂMETRO
 ) -> Result<ExecutionPayload, String> {
     let factory = config
         .mev
@@ -1346,22 +1439,24 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
         .path
         .get(1)
         .ok_or_else(|| "missing edge token_out".to_string())?;
-    
+
     let factory = UniswapV3Factory::new(factory, provider.clone());
     let pool = factory
         .get_pool(token_in, token_out, fee_tier)
         .call()
         .await
         .map_err(|err| err.to_string())?;
-    
+
     if pool == Address::zero() {
         return Err("v3 pool not found".to_string());
     }
 
     // Usar cache em vez de chamadas RPC diretas
-    let cached_pool = pool_cache.get_or_fetch_v3(pool, provider.clone(), block_number).await
+    let cached_pool = pool_cache
+        .get_or_fetch_v3(pool, provider.clone(), block_number)
+        .await
         .ok_or_else(|| "failed to fetch v3 pool state".to_string())?;
-    
+
     let state = V3PoolState {
         pool,
         token0: cached_pool.token0,
@@ -1372,9 +1467,9 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
         fee_bps: fee_tier as u64 / 100,
         initialized_ticks: Vec::new(),
     };
-    
+
     let capital_available_wei = contextual_capital_available_wei(config, context_signal)?;
-    
+
     PayloadBuilder::build_fee_extraction_v3(
         config,
         FeeExtractionBuildInput {
@@ -1484,7 +1579,7 @@ pub(crate) fn decode_relevant_swap(
                     fee_tier,
                     encoded_path: encode_v3_path(token_out, fee_tier, token_in),
                     hops: 1,
-        },
+                },
             }
         }
         V3_EXACT_INPUT => {
@@ -1523,7 +1618,7 @@ pub(crate) fn decode_relevant_swap(
                         parsed.token_in,
                     ),
                     hops: parsed.hops,
-        },
+                },
             }
         }
         _ => return None,
@@ -1549,7 +1644,9 @@ fn estimate_notional_wei(
     }
 
     let input = signal.path.first()?;
-    let token = monitored_tokens.iter().find(|token| token.address == *input)?;
+    let token = monitored_tokens
+        .iter()
+        .find(|token| token.address == *input)?;
     let decimals_factor = 10f64.powi(i32::from(token.decimals));
     let normalized = signal.amount_in.to_string().parse::<f64>().ok()? / decimals_factor;
     let value_eth = normalized * token.price_eth;
@@ -1648,7 +1745,10 @@ fn refresh_historical_profiles(
             }
             dashboard.event(
                 "info",
-                format!("historical profile refresh loaded {} pair/router/hour profiles", profile_count),
+                format!(
+                    "historical profile refresh loaded {} pair/router/hour profiles",
+                    profile_count
+                ),
             );
         }
         Err(err) => {
