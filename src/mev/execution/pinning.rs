@@ -59,9 +59,7 @@ impl ThreadPinningConfig {
             ThreadRole::Executor => self.exec_core,
         };
 
-        let success = core_affinity::set_for_current(core_affinity::CoreId {
-            id: requested_core,
-        });
+        let success = core_affinity::set_for_current(core_affinity::CoreId { id: requested_core });
         PinResult {
             requested_core,
             current_core: current_cpu_core_id(),
@@ -81,9 +79,7 @@ impl ThreadPinningConfig {
         } else {
             core_ids[worker_id % core_ids.len()]
         };
-        let success = core_affinity::set_for_current(core_affinity::CoreId {
-            id: requested_core,
-        });
+        let success = core_affinity::set_for_current(core_affinity::CoreId { id: requested_core });
         PinResult {
             requested_core,
             current_core: current_cpu_core_id(),
