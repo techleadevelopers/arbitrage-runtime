@@ -16,12 +16,15 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 use benchmark::{maybe_run_network_benchmark, maybe_run_runtime_load_test};
 use config::Config;
-use dashboard::DashboardHandle;
+use dashboard::{DashboardHandle, WalletSnapshot};
+use ethers::providers::Middleware;
+use ethers::types::U256;
 #[cfg(target_os = "linux")]
 use mev::execution::pinning::ThreadPinningConfig;
 use replay::maybe_run_replay_harness;
 use rpc::RpcFleet;
 use std::sync::Arc;
+use std::time::Instant;
 use storage::Storage;
 use tracing::{error, info};
 use wallets::load_wallets;
@@ -152,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         duplicate_keys,
         invalid_keys,
         storage.clone(),
-        &rpc_fleet,
+        rpc_fleet.clone(),
     );
     let dashboard_server = dashboard.clone();
     let dashboard_addr = config.dashboard_addr;
@@ -168,6 +171,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             dashboard_rankings.flush_storage_buffers();
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
+    });
+
+    let dashboard_wallets = dashboard.clone();
+    let rpc_wallets = rpc_fleet.clone();
+    let config_wallets = config.clone();
+    tokio::spawn(async move {
+        wallet_monitor_loop(config_wallets, rpc_wallets, dashboard_wallets).await;
     });
 
     if duplicate_keys > 0 {
@@ -220,4 +230,131 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+async fn wallet_monitor_loop(
+    config: Arc<Config>,
+    rpc_fleet: Arc<RpcFleet>,
+    dashboard: DashboardHandle,
+) {
+    let mut failure_streak = 0u32;
+
+    loop {
+        let Some(endpoint) = rpc_fleet.read_candidates(1).into_iter().next() else {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            continue;
+        };
+
+        let block_started = Instant::now();
+        match endpoint.provider.get_block_number().await {
+            Ok(block) => {
+                rpc_fleet.record_success(
+                    endpoint.id,
+                    block_started.elapsed(),
+                    Some(block.as_u64()),
+                );
+            }
+            Err(err) => {
+                rpc_fleet.record_failure(endpoint.id, RpcFleet::classify_failure(&err.to_string()));
+                failure_streak = failure_streak.saturating_add(1);
+                if failure_streak <= 3 || failure_streak % 10 == 0 {
+                    dashboard.event(
+                        "warn",
+                        format!("wallet monitor rpc probe failed endpoint={}: {}", endpoint.name, err),
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                continue;
+            }
+        }
+
+        let probe_started = Instant::now();
+        let executor = config.executor_address;
+        let vault = config.vault_address;
+        let profit = config.profit_address;
+        let control = config.control_address;
+        let provider = endpoint.provider.clone();
+        let (executor_balance, vault_balance, profit_balance, control_balance) = tokio::join!(
+            provider.get_balance(executor, None),
+            provider.get_balance(vault, None),
+            provider.get_balance(profit, None),
+            provider.get_balance(control, None),
+        );
+
+        let mut snapshots = Vec::new();
+        if let Ok(balance) = executor_balance {
+            let balance_eth = wei_to_eth_f64(balance);
+            let status = executor_buffer_status(&config, balance_eth);
+            dashboard.set_executor_balance(balance_eth, status);
+            snapshots.push(WalletSnapshot {
+                role: "executor".to_string(),
+                address: format!("{executor:?}"),
+                balance_eth: format!("{balance_eth:.6}"),
+                rpc: endpoint.name.clone(),
+                status: status.to_string(),
+                note: "hot execution wallet".to_string(),
+            });
+        }
+        if let Ok(balance) = profit_balance {
+            let balance_eth = wei_to_eth_f64(balance);
+            snapshots.push(WalletSnapshot {
+                role: "profit".to_string(),
+                address: format!("{profit:?}"),
+                balance_eth: format!("{balance_eth:.6}"),
+                rpc: endpoint.name.clone(),
+                status: if balance_eth > 0.0 { "harvesting" } else { "idle" }.to_string(),
+                note: "realized pnl destination".to_string(),
+            });
+        }
+        if let Ok(balance) = vault_balance {
+            let balance_eth = wei_to_eth_f64(balance);
+            snapshots.push(WalletSnapshot {
+                role: "vault".to_string(),
+                address: format!("{vault:?}"),
+                balance_eth: format!("{balance_eth:.6}"),
+                rpc: endpoint.name.clone(),
+                status: "reserve".to_string(),
+                note: "cold treasury reserve".to_string(),
+            });
+        }
+        if let Ok(balance) = control_balance {
+            let balance_eth = wei_to_eth_f64(balance);
+            snapshots.push(WalletSnapshot {
+                role: "control".to_string(),
+                address: format!("{control:?}"),
+                balance_eth: format!("{balance_eth:.6}"),
+                rpc: endpoint.name.clone(),
+                status: "control".to_string(),
+                note: "coordination / admin path".to_string(),
+            });
+        }
+
+        if !snapshots.is_empty() {
+            dashboard.set_hot_wallets(snapshots);
+            dashboard.record_latency(
+                "wallet_probe",
+                probe_started.elapsed().as_millis(),
+                None,
+                Some(&format!("endpoint={}", endpoint.name)),
+            );
+        }
+        failure_streak = 0;
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+fn executor_buffer_status(config: &Config, balance_eth: f64) -> &'static str {
+    if balance_eth < config.mev.executor_min_buffer_eth {
+        "underfunded"
+    } else if balance_eth > config.mev.executor_max_buffer_eth {
+        "overfunded"
+    } else if balance_eth < config.mev.executor_target_buffer_eth {
+        "below_target"
+    } else {
+        "healthy"
+    }
+}
+
+fn wei_to_eth_f64(value: U256) -> f64 {
+    value.as_u128() as f64 / 1e18
 }
