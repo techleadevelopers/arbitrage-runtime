@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, RwLock};
 pub struct DashboardHandle {
     inner: Arc<RwLock<DashboardState>>,
     storage: Storage,
+    rpc_fleet: Arc<RpcFleet>,
     pending: Arc<Mutex<PendingStorageWrites>>,
 }
 
@@ -89,9 +90,12 @@ pub struct DashboardEvent {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct WalletSnapshot {
+    pub role: String,
     pub address: String,
     pub balance_eth: String,
     pub rpc: String,
+    pub status: String,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -237,7 +241,7 @@ impl DashboardHandle {
         duplicate_keys: usize,
         invalid_keys: usize,
         storage: Storage,
-        rpc_fleet: &RpcFleet,
+        rpc_fleet: Arc<RpcFleet>,
     ) -> Self {
         let recent_events = storage
             .recent_events(50)
@@ -346,17 +350,58 @@ impl DashboardHandle {
                 execution_outcomes,
             })),
             storage,
+            rpc_fleet,
             pending: Arc::new(Mutex::new(PendingStorageWrites::default())),
         }
     }
 
     pub fn snapshot(&self) -> DashboardState {
         let mut state = self.inner.read().expect("dashboard state lock").clone();
+        state.rpc_endpoints = self.rpc_fleet.snapshot();
         if let Ok(toxicity_profiles) = self.storage.toxicity_profiles(12) {
             state.toxicity_profiles = toxicity_profiles;
         }
         if let Ok(relay_rankings) = self.storage.relay_rankings(12) {
             state.relay_rankings = relay_rankings;
+        }
+        if let Ok(top_residual_wallets) = self.storage.top_wallet_residuals(10) {
+            state.top_residual_wallets = top_residual_wallets
+                .into_iter()
+                .map(
+                    |(
+                        wallet,
+                        asset_class,
+                        detections,
+                        successful_sweeps,
+                        detected_profit_wei,
+                        realized_profit_wei,
+                        last_seen_at,
+                    )| {
+                        let detected = wei_str_to_eth(&detected_profit_wei);
+                        let realized = wei_str_to_eth(&realized_profit_wei);
+                        let score = detections
+                            .saturating_mul(100)
+                            .saturating_add(successful_sweeps.saturating_mul(250))
+                            .saturating_add((detected * 10_000.0) as u64);
+                        WalletResidualSnapshot {
+                            wallet,
+                            asset_class,
+                            detections,
+                            successful_sweeps,
+                            detected_profit_eth: format!("{detected:.6}"),
+                            realized_profit_eth: format!("{realized:.6}"),
+                            residual_score: score,
+                            last_seen_at,
+                        }
+                    },
+                )
+                .collect();
+        }
+        if let Ok(treasury_rebalance_trail) = self.storage.treasury_rebalance_trail(12) {
+            state.treasury_rebalance_trail = treasury_rebalance_trail;
+        }
+        if let Ok(execution_outcomes) = self.storage.execution_outcomes(12) {
+            state.execution_outcomes = execution_outcomes;
         }
         state
     }
@@ -446,6 +491,11 @@ impl DashboardHandle {
         let mut state = self.inner.write().expect("dashboard state lock");
         state.executor_balance_eth = Some(format!("{:.6}", balance_eth));
         state.executor_buffer_status = status.to_string();
+    }
+
+    pub fn set_hot_wallets(&self, wallets: Vec<WalletSnapshot>) {
+        let mut state = self.inner.write().expect("dashboard state lock");
+        state.hot_wallets = wallets;
     }
 
     pub fn record_treasury_recommendation(&self, update: TreasuryRecommendationUpdate<'_>) {
@@ -657,6 +707,12 @@ pub async fn run_server(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/", get(index))
+        .route("/styles.css", get(styles))
+        .route("/favicon.svg", get(favicon))
+        .route("/js/app.js", get(js_app))
+        .route("/js/data.js", get(js_data))
+        .route("/js/fx.js", get(js_fx))
+        .route("/js/radar.js", get(js_radar))
         .route("/api/status", get(status))
         .route("/api/export", get(status))
         .with_state(dashboard);
@@ -669,7 +725,49 @@ pub async fn run_server(
 async fn index() -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "text/html; charset=utf-8")],
-        Html(INDEX_HTML),
+        Html(STATIC_INDEX_HTML),
+    )
+}
+
+async fn styles() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/css; charset=utf-8")],
+        STATIC_STYLES_CSS,
+    )
+}
+
+async fn favicon() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "image/svg+xml")],
+        STATIC_FAVICON_SVG,
+    )
+}
+
+async fn js_app() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        STATIC_JS_APP,
+    )
+}
+
+async fn js_data() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        STATIC_JS_DATA,
+    )
+}
+
+async fn js_fx() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        STATIC_JS_FX,
+    )
+}
+
+async fn js_radar() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        STATIC_JS_RADAR,
     )
 }
 
@@ -742,6 +840,15 @@ fn upsert_latency_metric(metrics: &mut Vec<LatencyMetric>, stage: &str, duration
     });
 }
 
+const STATIC_INDEX_HTML: &str = include_str!("../web/static/index.html");
+const STATIC_STYLES_CSS: &str = include_str!("../web/static/styles.css");
+const STATIC_JS_APP: &str = include_str!("../web/static/js/app.js");
+const STATIC_JS_DATA: &str = include_str!("../web/static/js/data.js");
+const STATIC_JS_FX: &str = include_str!("../web/static/js/fx.js");
+const STATIC_JS_RADAR: &str = include_str!("../web/static/js/radar.js");
+const STATIC_FAVICON_SVG: &[u8] = include_bytes!("../web/static/favicon.svg");
+
+#[allow(dead_code)]
 const INDEX_HTML: &str = r#"<!doctype html>
 <html lang="en">
 <head>
