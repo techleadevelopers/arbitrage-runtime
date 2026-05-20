@@ -737,10 +737,7 @@ async fn styles() -> impl IntoResponse {
 }
 
 async fn favicon() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "image/svg+xml")],
-        STATIC_FAVICON_SVG,
-    )
+    ([(CONTENT_TYPE, "image/svg+xml")], STATIC_FAVICON_SVG)
 }
 
 async fn js_app() -> impl IntoResponse {
@@ -840,13 +837,13 @@ fn upsert_latency_metric(metrics: &mut Vec<LatencyMetric>, stage: &str, duration
     });
 }
 
-const STATIC_INDEX_HTML: &str = include_str!("../web/static/index.html");
-const STATIC_STYLES_CSS: &str = include_str!("../web/static/styles.css");
-const STATIC_JS_APP: &str = include_str!("../web/static/js/app.js");
-const STATIC_JS_DATA: &str = include_str!("../web/static/js/data.js");
-const STATIC_JS_FX: &str = include_str!("../web/static/js/fx.js");
-const STATIC_JS_RADAR: &str = include_str!("../web/static/js/radar.js");
-const STATIC_FAVICON_SVG: &[u8] = include_bytes!("../web/static/favicon.svg");
+const STATIC_INDEX_HTML: &str = INDEX_HTML;
+const STATIC_STYLES_CSS: &str = "";
+const STATIC_JS_APP: &str = "";
+const STATIC_JS_DATA: &str = "";
+const STATIC_JS_FX: &str = "";
+const STATIC_JS_RADAR: &str = "";
+const STATIC_FAVICON_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#0e141b"/><path d="M18 3 8 18h7l-1 11 10-16h-7l1-10Z" fill="#42c58a"/></svg>"##;
 
 #[allow(dead_code)]
 const INDEX_HTML: &str = r#"<!doctype html>
