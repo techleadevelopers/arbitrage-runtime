@@ -89,8 +89,8 @@ contract ArbitrageRuntimeExecutor is ArbitrageRuntimeExecutorBase {
         if (borrowedAmount == 0) {
             borrowedAmount = ctx.borrowAmount;
         }
-        repaymentAmount = _v2RepaymentAmount(borrowedAmount);
-        _transferToken(ctx.borrowToken, ctx.pair, repaymentAmount);
+        repaymentAmount = _v2RepaymentAmountIn(ctx.pair, ctx.borrowToken, ctx.profitToken, borrowedAmount);
+        _transferToken(ctx.profitToken, ctx.pair, repaymentAmount);
     }
 
     function _settleV3PoolDebt(
