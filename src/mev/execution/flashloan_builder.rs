@@ -24,6 +24,7 @@ pub fn build_v2_flashswap_call(
     borrow_amount: U256,
     min_profit: U256,
     profit_token: Address,
+    profit_recipient: Address,
     steps: &[EncodedSwapStep],
 ) -> V2FlashSwapCall {
     V2FlashSwapCall {
@@ -34,6 +35,7 @@ pub fn build_v2_flashswap_call(
             borrow_amount,
             min_profit,
             profit_token,
+            profit_recipient,
             steps,
         ),
     }
@@ -47,6 +49,7 @@ pub fn build_v3_flashswap_call(
     fee_tier: u32,
     min_profit: U256,
     profit_token: Address,
+    profit_recipient: Address,
     steps: &[EncodedV3SwapStep],
 ) -> V3FlashSwapCall {
     V3FlashSwapCall {
@@ -58,6 +61,7 @@ pub fn build_v3_flashswap_call(
             fee_tier,
             min_profit,
             profit_token,
+            profit_recipient,
             steps,
         ),
     }
