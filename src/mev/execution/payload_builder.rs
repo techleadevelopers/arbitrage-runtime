@@ -150,7 +150,7 @@ impl PayloadBuilder {
         let step = EncodedSwapStep {
             router: input.router,
             path: vec![input.token_out, input.token_in],
-            amount_in: U256::MAX,
+            amount_in,
             min_out: min_amount_out,
         };
         let call = build_v2_flashswap_call(
@@ -160,6 +160,7 @@ impl PayloadBuilder {
             amount_in,
             min_profit_wei,
             input.token_in,
+            input.recipient,
             &[step],
         );
 
@@ -276,7 +277,7 @@ impl PayloadBuilder {
         let step = EncodedV3SwapStep {
             router: input.router,
             path: path.clone(),
-            amount_in: U256::MAX,
+            amount_in,
             min_out: min_amount_out,
         };
         let call = build_v3_flashswap_call(
@@ -287,6 +288,7 @@ impl PayloadBuilder {
             fee_tier,
             min_profit_wei,
             input.token_in,
+            input.recipient,
             &[step],
         );
 
