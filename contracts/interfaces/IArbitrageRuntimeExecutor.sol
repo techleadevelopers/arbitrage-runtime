@@ -42,6 +42,7 @@ interface IArbitrageRuntimeExecutor {
     /// @param borrowAmount Amount borrowed from the pair.
     /// @param minProfit Minimum required net profit before successful completion.
     /// @param profitToken Token in which profitability is evaluated.
+    /// @param profitRecipient Address that receives realized profit.
     /// @param steps Ordered execution steps used after borrowing liquidity.
     struct V2ExecutionRequest {
         address pair;
@@ -49,6 +50,7 @@ interface IArbitrageRuntimeExecutor {
         uint256 borrowAmount;
         uint256 minProfit;
         address profitToken;
+        address profitRecipient;
         V2SwapStep[] steps;
     }
 
@@ -59,6 +61,7 @@ interface IArbitrageRuntimeExecutor {
     /// @param feeTier Fee tier associated with the V3 pool.
     /// @param minProfit Minimum required net profit before successful completion.
     /// @param profitToken Token in which profitability is evaluated.
+    /// @param profitRecipient Address that receives realized profit.
     /// @param steps Ordered execution steps used after borrowing liquidity.
     struct V3ExecutionRequest {
         address pool;
@@ -67,6 +70,7 @@ interface IArbitrageRuntimeExecutor {
         uint24 feeTier;
         uint256 minProfit;
         address profitToken;
+        address profitRecipient;
         V3SwapStep[] steps;
     }
 
@@ -138,6 +142,7 @@ interface IArbitrageRuntimeExecutor {
     /// @param borrowAmount Amount borrowed from the pair.
     /// @param minProfit Minimum acceptable net profit in `profitToken` units.
     /// @param profitToken Token used to evaluate profitability.
+    /// @param profitRecipient Address that receives realized profit.
     /// @param steps Ordered swap steps executed after the borrow.
     function startV2FlashSwap(
         address pair,
@@ -145,6 +150,7 @@ interface IArbitrageRuntimeExecutor {
         uint256 borrowAmount,
         uint256 minProfit,
         address profitToken,
+        address profitRecipient,
         V2SwapStep[] calldata steps
     ) external;
 
@@ -155,6 +161,7 @@ interface IArbitrageRuntimeExecutor {
     /// @param feeTier Pool fee tier.
     /// @param minProfit Minimum acceptable net profit in `profitToken` units.
     /// @param profitToken Token used to evaluate profitability.
+    /// @param profitRecipient Address that receives realized profit.
     /// @param steps Ordered swap steps executed after the borrow.
     function startV3FlashSwap(
         address pool,
@@ -163,6 +170,7 @@ interface IArbitrageRuntimeExecutor {
         uint24 feeTier,
         uint256 minProfit,
         address profitToken,
+        address profitRecipient,
         V3SwapStep[] calldata steps
     ) external;
 
