@@ -260,7 +260,10 @@ async fn wallet_monitor_loop(
                 if failure_streak <= 3 || failure_streak % 10 == 0 {
                     dashboard.event(
                         "warn",
-                        format!("wallet monitor rpc probe failed endpoint={}: {}", endpoint.name, err),
+                        format!(
+                            "wallet monitor rpc probe failed endpoint={}: {}",
+                            endpoint.name, err
+                        ),
                     );
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(4)).await;
@@ -302,7 +305,12 @@ async fn wallet_monitor_loop(
                 address: format!("{profit:?}"),
                 balance_eth: format!("{balance_eth:.6}"),
                 rpc: endpoint.name.clone(),
-                status: if balance_eth > 0.0 { "harvesting" } else { "idle" }.to_string(),
+                status: if balance_eth > 0.0 {
+                    "harvesting"
+                } else {
+                    "idle"
+                }
+                .to_string(),
                 note: "realized pnl destination".to_string(),
             });
         }
