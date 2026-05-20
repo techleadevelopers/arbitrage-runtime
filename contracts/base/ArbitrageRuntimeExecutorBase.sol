@@ -13,6 +13,7 @@ interface IERC20Minimal {
 interface IUniswapV2PairLike {
     function token0() external view returns (address);
     function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
     function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
 }
 
@@ -87,6 +88,7 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
         uint256 borrowAmount;
         uint256 minProfit;
         address profitToken;
+        address profitRecipient;
         V2SwapStep[] steps;
     }
 
@@ -98,6 +100,7 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
         uint24 feeTier;
         uint256 minProfit;
         address profitToken;
+        address profitRecipient;
         V3SwapStep[] steps;
     }
 
@@ -169,9 +172,10 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
         uint256 borrowAmount,
         uint256 minProfit,
         address profitToken,
+        address profitRecipient,
         V2SwapStep[] calldata steps
     ) external onlyAuthorizedOperator {
-        if (pair == address(0) || borrowToken == address(0) || profitToken == address(0)) {
+        if (pair == address(0) || borrowToken == address(0) || profitToken == address(0) || profitRecipient == address(0)) {
             revert ZeroAddress();
         }
         if (borrowAmount == 0) revert ZeroAmount();
@@ -190,6 +194,7 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
             borrowAmount,
             minProfit,
             profitToken,
+            profitRecipient,
             steps.length
         );
         _beginExecution(executionId);
@@ -201,6 +206,7 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
             borrowAmount: borrowAmount,
             minProfit: minProfit,
             profitToken: profitToken,
+            profitRecipient: profitRecipient,
             steps: steps
         });
 
@@ -218,9 +224,10 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
         uint24 feeTier,
         uint256 minProfit,
         address profitToken,
+        address profitRecipient,
         V3SwapStep[] calldata steps
     ) external onlyAuthorizedOperator {
-        if (pool == address(0) || borrowToken == address(0) || profitToken == address(0)) {
+        if (pool == address(0) || borrowToken == address(0) || profitToken == address(0) || profitRecipient == address(0)) {
             revert ZeroAddress();
         }
         if (borrowAmount == 0) revert ZeroAmount();
@@ -240,6 +247,7 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
             borrowAmount,
             minProfit,
             profitToken,
+            profitRecipient,
             steps.length
         );
         _beginExecution(executionId);
@@ -252,6 +260,7 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
             feeTier: feeTier,
             minProfit: minProfit,
             profitToken: profitToken,
+            profitRecipient: profitRecipient,
             steps: steps
         });
 
@@ -298,7 +307,13 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
         uint256 repaymentAmount = _settleV2PairDebt(ctx, amount0, amount1);
         uint256 postProfitBalance = _balanceOf(ctx.profitToken);
         uint256 grossProfit = postProfitBalance > preProfitBalance ? postProfitBalance - preProfitBalance : 0;
-        uint256 netProfit = _finalizeExecution(ctx.executionId, ctx.profitToken, grossProfit, repaymentAmount);
+        uint256 netProfit = _finalizeExecution(
+            ctx.executionId,
+            ctx.profitToken,
+            ctx.profitRecipient,
+            grossProfit,
+            repaymentAmount
+        );
         if (netProfit < ctx.minProfit) revert ProfitBelowMinimum(netProfit, ctx.minProfit);
     }
 
@@ -322,7 +337,13 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
         uint256 repaymentAmount = _settleV3PoolDebt(ctx, amount0Delta, amount1Delta);
         uint256 postProfitBalance = _balanceOf(ctx.profitToken);
         uint256 grossProfit = postProfitBalance > preProfitBalance ? postProfitBalance - preProfitBalance : 0;
-        uint256 netProfit = _finalizeExecution(ctx.executionId, ctx.profitToken, grossProfit, repaymentAmount);
+        uint256 netProfit = _finalizeExecution(
+            ctx.executionId,
+            ctx.profitToken,
+            ctx.profitRecipient,
+            grossProfit,
+            repaymentAmount
+        );
         if (netProfit < ctx.minProfit) revert ProfitBelowMinimum(netProfit, ctx.minProfit);
     }
 
@@ -335,10 +356,14 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
     function _finalizeExecution(
         bytes32 executionId,
         address profitToken,
+        address profitRecipient,
         uint256 grossProfit,
         uint256 repaymentAmount
     ) internal returns (uint256 netProfit) {
         netProfit = grossProfit;
+        if (netProfit > 0 && profitRecipient != address(this)) {
+            _transferToken(profitToken, profitRecipient, netProfit);
+        }
         emit ExecutionSettled(executionId, profitToken, grossProfit, netProfit, repaymentAmount);
         executionInProgress = false;
         activeExecutionId = bytes32(0);
@@ -371,6 +396,7 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
         uint256 borrowAmount,
         uint256 minProfit,
         address profitToken,
+        address profitRecipient,
         uint256 stepCount
     ) internal view returns (bytes32) {
         return keccak256(
@@ -383,6 +409,7 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
                 borrowAmount,
                 minProfit,
                 profitToken,
+                profitRecipient,
                 stepCount,
                 block.number
             )
@@ -435,6 +462,35 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
 
     function _v2RepaymentAmount(uint256 borrowedAmount) internal pure returns (uint256) {
         return ((borrowedAmount * 1000) / 997) + 1;
+    }
+
+    function _v2RepaymentAmountIn(
+        address pair,
+        address borrowedToken,
+        address repaymentToken,
+        uint256 borrowedAmount
+    ) internal view returns (uint256) {
+        if (repaymentToken == borrowedToken) {
+            return _v2RepaymentAmount(borrowedAmount);
+        }
+
+        address token0 = IUniswapV2PairLike(pair).token0();
+        address token1 = IUniswapV2PairLike(pair).token1();
+        if (
+            !((borrowedToken == token0 && repaymentToken == token1) ||
+                (borrowedToken == token1 && repaymentToken == token0))
+        ) {
+            revert UnsupportedBorrowToken();
+        }
+
+        (uint112 reserve0, uint112 reserve1, ) = IUniswapV2PairLike(pair).getReserves();
+        uint256 reserveIn = repaymentToken == token0 ? uint256(reserve0) : uint256(reserve1);
+        uint256 reserveOut = borrowedToken == token0 ? uint256(reserve0) : uint256(reserve1);
+        if (borrowedAmount >= reserveOut) revert RepaymentFailed();
+
+        uint256 numerator = reserveIn * borrowedAmount * 1000;
+        uint256 denominator = (reserveOut - borrowedAmount) * 997;
+        return (numerator / denominator) + 1;
     }
 
     function _executeV2Step(
