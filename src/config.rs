@@ -211,11 +211,13 @@ impl Config {
                 Err(err) => return Err(err.into()),
             },
             Err(_) if runtime_load_test_mode => executor_address,
-            Err(_) => Address::zero(),
+            Err(_) => {
+                warn!(
+                    "CONTROL_ADDRESS is not configured; using executor address as control address"
+                );
+                executor_address
+            }
         };
-        if control_address == Address::zero() && !runtime_load_test_mode {
-            return Err("environment variable CONTROL_ADDRESS is not configured".into());
-        }
         let vault_address = parse_optional_address_env("VAULT_ADDRESS", runtime_load_test_mode)?
             .unwrap_or(control_address);
         let profit_address = parse_optional_address_env("PROFIT_ADDRESS", runtime_load_test_mode)?
@@ -834,6 +836,11 @@ fn parse_monitored_tokens(
     };
 
     let raw = env::var(env_name).unwrap_or_default();
+    let raw = if raw.trim().is_empty() {
+        default_monitored_tokens(network).to_string()
+    } else {
+        raw
+    };
     if raw.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -873,6 +880,16 @@ fn parse_monitored_tokens(
     }
 
     Ok(tokens)
+}
+
+fn default_monitored_tokens(network: &str) -> &'static str {
+    match network {
+        "bsc" => "WBNB:0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c:18:1.0",
+        "polygon" => "WPOL:0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270:18:1.0",
+        "ethereum" => "WETH:0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2:18:1.0",
+        "arbitrum" => "WETH:0x82aF49447D8a07e3bd95BD0d56f35241523fBab1:18:1.0",
+        _ => "",
+    }
 }
 
 fn parse_builder_relays(primary: &str) -> Vec<String> {
