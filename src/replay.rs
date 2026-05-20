@@ -1,14 +1,20 @@
 use crate::config::Config;
 use crate::mev::adaptive::{AdaptivePolicy, AdaptiveQuoteInput, ContextSignal, PreflightInput};
 use crate::mev::cache::pool_cache::PoolCache;
+use crate::mev::execution::payload_builder::ExecutionPayload;
 use crate::mev::opportunity::wei_to_eth_f64;
 use crate::mev::runtime::{
     build_payload, decode_relevant_swap, fast_preflight_gate, passes_ev_gate, passes_quality_gate,
 };
 use crate::storage::{ensure_exports_dir, Storage};
 use chrono::{Timelike, Utc};
+use ethers::contract::abigen;
 use ethers::providers::{Http, Middleware, Provider};
-use ethers::types::{Address, Bytes, Transaction, H256, U256, U64};
+use ethers::signers::{LocalWallet, Signer};
+use ethers::types::transaction::eip2718::TypedTransaction;
+use ethers::types::{
+    Address, BlockId, BlockNumber, Bytes, Transaction, TransactionRequest, H256, U256, U64,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
@@ -17,6 +23,13 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::info;
+
+abigen!(
+    ReplayErc20BalanceView,
+    r#"[
+        function balanceOf(address owner) external view returns (uint256)
+    ]"#,
+);
 
 pub async fn maybe_run_replay_harness(
     config: Arc<Config>,
@@ -222,6 +235,10 @@ struct ReplayReport {
     false_positive: u64,
     true_negative: u64,
     false_negative: u64,
+    fork_execution_attempts: u64,
+    fork_execution_success: u64,
+    fork_execution_reverts: u64,
+    fork_realized_profit_eth: f64,
     estimated_gas_avoided_wei: U256,
     expected_profit_wei: U256,
     realized_profit_eth: f64,
@@ -733,6 +750,42 @@ async fn run_replay_cases(
 
         report.execute_candidates += 1;
         report.adaptive_quote_pass += 1;
+        if env_flag("REPLAY_EXECUTE_ON_FORK") {
+            report.fork_execution_attempts += 1;
+            match execute_payload_on_fork(config, provider.clone(), &payload, gas_price_for_tuning)
+                .await
+            {
+                Ok(outcome) => {
+                    if outcome.success {
+                        report.fork_execution_success += 1;
+                    } else {
+                        report.fork_execution_reverts += 1;
+                    }
+                    report.fork_realized_profit_eth += outcome.realized_profit_eth;
+                    println!(
+                        "Tenderly fork execution tx={:?} success={} gas_used={} realized_profit_eth={:.12}",
+                        outcome.tx_hash,
+                        outcome.success,
+                        outcome.gas_used,
+                        outcome.realized_profit_eth
+                    );
+                    if !outcome.success && env_flag("REPLAY_FORK_HARD_FAIL") {
+                        return Err(format!(
+                            "Tenderly fork execution reverted tx={:?}",
+                            outcome.tx_hash
+                        )
+                        .into());
+                    }
+                }
+                Err(err) => {
+                    report.fork_execution_reverts += 1;
+                    if env_flag("REPLAY_FORK_HARD_FAIL") {
+                        return Err(err);
+                    }
+                    println!("Tenderly fork execution failed: {err}");
+                }
+            }
+        }
         report.observe_labeled_outcome(true, case);
         report.observe_realized(case);
         report.observe_toxicity_execute(
@@ -756,6 +809,106 @@ async fn run_replay_cases(
         report,
         decision_rows,
     })
+}
+
+struct ForkExecutionOutcome {
+    tx_hash: H256,
+    success: bool,
+    gas_used: u64,
+    realized_profit_eth: f64,
+}
+
+async fn execute_payload_on_fork(
+    config: &Config,
+    provider: Arc<Provider<Http>>,
+    payload: &ExecutionPayload,
+    gas_price: U256,
+) -> Result<ForkExecutionOutcome, Box<dyn std::error::Error>> {
+    let wallet = config
+        .executor_private_key
+        .parse::<LocalWallet>()?
+        .with_chain_id(config.chain_id);
+    let from = wallet.address();
+    let nonce = provider.get_transaction_count(from, None).await?;
+    let raw_tx = sign_replay_executor_transaction(&wallet, payload, nonce, gas_price).await?;
+
+    let pre_balance = token_balance_at(
+        provider.clone(),
+        payload.profit_token,
+        payload.profit_recipient,
+        BlockId::Number(BlockNumber::Latest),
+    )
+    .await?;
+    let pending = provider.send_raw_transaction(raw_tx).await?;
+    let tx_hash = pending.tx_hash();
+    let receipt = pending
+        .await?
+        .ok_or_else(|| format!("fork transaction {:?} was not mined", tx_hash))?;
+    let block_number = receipt
+        .block_number
+        .ok_or_else(|| format!("fork transaction {:?} missing block number", tx_hash))?;
+    let post_balance = token_balance_at(
+        provider.clone(),
+        payload.profit_token,
+        payload.profit_recipient,
+        BlockId::Number(BlockNumber::Number(block_number)),
+    )
+    .await?;
+    let gas_paid_wei = receipt
+        .effective_gas_price
+        .unwrap_or(gas_price)
+        .saturating_mul(receipt.gas_used.unwrap_or_default());
+    let token_meta = config
+        .monitored_tokens
+        .iter()
+        .find(|token| token.address == payload.profit_token);
+    let balance_delta = post_balance.saturating_sub(pre_balance);
+    let gross_eth = if let Some(token_meta) = token_meta {
+        let token_units = 10f64.powi(i32::from(token_meta.decimals));
+        balance_delta.to_string().parse::<f64>().unwrap_or(0.0) / token_units
+            * token_meta.price_eth
+    } else {
+        wei_to_eth_f64(balance_delta)
+    };
+
+    Ok(ForkExecutionOutcome {
+        tx_hash,
+        success: receipt.status == Some(U64::from(1u64)),
+        gas_used: receipt.gas_used.unwrap_or_default().as_u64(),
+        realized_profit_eth: gross_eth - wei_to_eth_f64(gas_paid_wei),
+    })
+}
+
+async fn sign_replay_executor_transaction(
+    wallet: &LocalWallet,
+    payload: &ExecutionPayload,
+    nonce: U256,
+    gas_price: U256,
+) -> Result<Bytes, Box<dyn std::error::Error>> {
+    let tx: TypedTransaction = TransactionRequest::new()
+        .to(payload.target_contract)
+        .data(payload.calldata.clone())
+        .value(payload.value)
+        .gas(payload.gas_limit)
+        .gas_price(gas_price)
+        .nonce(nonce)
+        .from(wallet.address())
+        .into();
+    let signature = wallet.sign_transaction(&tx).await?;
+    Ok(tx.rlp_signed(&signature))
+}
+
+async fn token_balance_at(
+    provider: Arc<Provider<Http>>,
+    token: Address,
+    owner: Address,
+    block: BlockId,
+) -> Result<U256, Box<dyn std::error::Error>> {
+    Ok(ReplayErc20BalanceView::new(token, provider)
+        .balance_of(owner)
+        .block(block)
+        .call()
+        .await?)
 }
 
 fn load_replay_cases(
@@ -1101,6 +1254,16 @@ fn print_report(config: &Config, report: &ReplayReport) {
         percent(report.adaptive_quote_pass, report.quality_gate_pass)
     );
     println!("Execute candidates: {}", report.execute_candidates);
+    if report.fork_execution_attempts > 0 {
+        println!("Tenderly fork executions:");
+        println!("  attempts -> {}", report.fork_execution_attempts);
+        println!("  success -> {}", report.fork_execution_success);
+        println!("  reverts -> {}", report.fork_execution_reverts);
+        println!(
+            "  realized_profit_eth -> {:.12}",
+            report.fork_realized_profit_eth
+        );
+    }
     println!(
         "Acceptance rate: {:.2}%",
         if report.total == 0 {
