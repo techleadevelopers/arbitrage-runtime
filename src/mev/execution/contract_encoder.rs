@@ -26,10 +26,11 @@ pub fn encode_start_v2_flash_swap(
     borrow_amount: U256,
     min_profit: U256,
     profit_token: Address,
+    profit_recipient: Address,
     steps: &[EncodedSwapStep],
 ) -> Bytes {
     let selector = selector(
-        "startV2FlashSwap(address,address,uint256,uint256,address,(address,address[],uint256,uint256)[])",
+        "startV2FlashSwap(address,address,uint256,uint256,address,address,(address,address[],uint256,uint256)[])",
     );
     encode_with_selector(
         selector,
@@ -39,6 +40,7 @@ pub fn encode_start_v2_flash_swap(
             Token::Uint(borrow_amount),
             Token::Uint(min_profit),
             Token::Address(profit_token),
+            Token::Address(profit_recipient),
             Token::Array(steps.iter().map(step_token).collect()),
         ],
     )
@@ -51,10 +53,11 @@ pub fn encode_start_v3_flash_swap(
     fee_tier: u32,
     min_profit: U256,
     profit_token: Address,
+    profit_recipient: Address,
     steps: &[EncodedV3SwapStep],
 ) -> Bytes {
     let selector = selector(
-        "startV3FlashSwap(address,address,uint256,uint24,uint256,address,(address,bytes,uint256,uint256)[])",
+        "startV3FlashSwap(address,address,uint256,uint24,uint256,address,address,(address,bytes,uint256,uint256)[])",
     );
     encode_with_selector(
         selector,
@@ -65,6 +68,7 @@ pub fn encode_start_v3_flash_swap(
             Token::Uint(U256::from(fee_tier)),
             Token::Uint(min_profit),
             Token::Address(profit_token),
+            Token::Address(profit_recipient),
             Token::Array(steps.iter().map(v3_step_token).collect()),
         ],
     )
