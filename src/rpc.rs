@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpcKind {
     Tenderly,
+    GetBlock,
+    Generic,
     Alchemy,
     Infura,
 }
@@ -21,6 +23,8 @@ impl RpcKind {
     fn as_str(self) -> &'static str {
         match self {
             RpcKind::Tenderly => "tenderly",
+            RpcKind::GetBlock => "getblock",
+            RpcKind::Generic => "generic",
             RpcKind::Alchemy => "alchemy",
             RpcKind::Infura => "infura",
         }
@@ -42,6 +46,8 @@ struct RpcEndpointState {
     timeout_failures: u32,
     rate_limit_failures: u32,
     stale_failures: u32,
+    disabled: bool,
+    disabled_reason: Option<String>,
     cooldown_until: Option<Instant>,
     avg_latency: Option<Duration>,
     last_block: Option<u64>,
@@ -102,6 +108,8 @@ pub struct RpcEndpointSnapshot {
     pub timeout_failures: u32,
     pub rate_limit_failures: u32,
     pub stale_failures: u32,
+    pub disabled: bool,
+    pub disabled_reason: Option<String>,
     pub cooldown_remaining_secs: u64,
     pub avg_latency_ms: Option<u128>,
     pub last_block: Option<u64>,
@@ -117,10 +125,14 @@ impl RpcFleet {
         for (idx, (name, url)) in config.rpc_urls().into_iter().enumerate() {
             let kind = if name.starts_with("tenderly-") {
                 RpcKind::Tenderly
+            } else if name.starts_with("getblock-") {
+                RpcKind::GetBlock
             } else if name.starts_with("alchemy-") {
                 RpcKind::Alchemy
-            } else {
+            } else if name.starts_with("infura-") {
                 RpcKind::Infura
+            } else {
+                RpcKind::Generic
             };
 
             let provider = Provider::<Http>::try_from(url.as_str())?;
@@ -136,6 +148,8 @@ impl RpcFleet {
                     timeout_failures: 0,
                     rate_limit_failures: 0,
                     stale_failures: 0,
+                    disabled: false,
+                    disabled_reason: None,
                     cooldown_until: None,
                     avg_latency: None,
                     last_block: None,
@@ -169,6 +183,46 @@ impl RpcFleet {
 
     pub fn send_candidates(&self, limit: usize) -> Vec<RpcHandle> {
         self.select_candidates(true, limit)
+    }
+
+    pub fn set_endpoint_enabled(
+        &self,
+        endpoint_id: usize,
+        enabled: bool,
+        reason: Option<String>,
+    ) -> Result<(), String> {
+        let endpoint = self
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == endpoint_id)
+            .ok_or_else(|| format!("unknown RPC endpoint id {endpoint_id}"))?;
+        let mut state = endpoint.state.lock().expect("rpc endpoint state lock");
+        state.disabled = !enabled;
+        state.disabled_reason = if enabled {
+            None
+        } else {
+            Some(reason.unwrap_or_else(|| "disabled from dashboard".to_string()))
+        };
+        drop(state);
+        self.invalidate_score_cache();
+        Ok(())
+    }
+
+    pub fn keep_only_getblock_enabled(&self) -> usize {
+        let mut disabled = 0usize;
+        for endpoint in &self.endpoints {
+            let mut state = endpoint.state.lock().expect("rpc endpoint state lock");
+            if matches!(endpoint.kind, RpcKind::GetBlock) {
+                state.disabled = false;
+                state.disabled_reason = None;
+            } else if !state.disabled {
+                state.disabled = true;
+                state.disabled_reason = Some("disabled by getblock-only control".to_string());
+                disabled += 1;
+            }
+        }
+        self.invalidate_score_cache();
+        disabled
     }
 
     pub fn reserve_read_selection(&self, endpoint_id: usize) {
@@ -314,6 +368,8 @@ impl RpcFleet {
                     timeout_failures: state.timeout_failures,
                     rate_limit_failures: state.rate_limit_failures,
                     stale_failures: state.stale_failures,
+                    disabled: state.disabled,
+                    disabled_reason: state.disabled_reason.clone(),
                     cooldown_remaining_secs,
                     avg_latency_ms: state.avg_latency.map(|value| value.as_millis()),
                     last_block: state.last_block,
@@ -377,6 +433,9 @@ impl RpcFleet {
         }
 
         let state = endpoint.state.lock().expect("rpc endpoint state lock");
+        if state.disabled {
+            return None;
+        }
         if matches!(state.cooldown_until, Some(until) if until > now) {
             return None;
         }
@@ -399,6 +458,10 @@ impl RpcFleet {
         let kind_bias = match (endpoint.kind, send_mode) {
             (RpcKind::Tenderly, true) => -80.0,
             (RpcKind::Tenderly, false) => -120.0,
+            (RpcKind::GetBlock, true) => -140.0,
+            (RpcKind::GetBlock, false) => -140.0,
+            (RpcKind::Generic, true) => -20.0,
+            (RpcKind::Generic, false) => -20.0,
             (RpcKind::Alchemy, true) => 0.0,
             (RpcKind::Alchemy, false) => -100.0,
             (RpcKind::Infura, true) => -50.0,
@@ -535,6 +598,7 @@ impl RpcFleet {
     fn matches_preference(&self, kind: RpcKind, preference: RpcPreference) -> bool {
         match preference {
             RpcPreference::Auto => true,
+            RpcPreference::GetBlock => matches!(kind, RpcKind::GetBlock),
             RpcPreference::Alchemy => matches!(kind, RpcKind::Alchemy),
             RpcPreference::Infura => matches!(kind, RpcKind::Infura),
         }
@@ -631,6 +695,10 @@ fn endpoint_burst_capacity_units(kind: RpcKind, send_mode: bool) -> u32 {
         (RpcKind::Infura, true) => 12,
         (RpcKind::Tenderly, false) => 10,
         (RpcKind::Tenderly, true) => 8,
+        (RpcKind::GetBlock, false) => 18,
+        (RpcKind::GetBlock, true) => 14,
+        (RpcKind::Generic, false) => 12,
+        (RpcKind::Generic, true) => 10,
     }
 }
 
@@ -642,5 +710,9 @@ fn endpoint_burst_cost_units(kind: RpcKind, send_mode: bool) -> u32 {
         (RpcKind::Infura, true) => 6,
         (RpcKind::Tenderly, false) => 2,
         (RpcKind::Tenderly, true) => 8,
+        (RpcKind::GetBlock, false) => 1,
+        (RpcKind::GetBlock, true) => 5,
+        (RpcKind::Generic, false) => 2,
+        (RpcKind::Generic, true) => 6,
     }
 }

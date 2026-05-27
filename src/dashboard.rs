@@ -1,13 +1,14 @@
 use crate::config::Config;
 use crate::rpc::{RpcEndpointSnapshot, RpcFleet};
 use crate::storage::Storage;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::header::CONTENT_TYPE;
+use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, RwLock};
@@ -233,6 +234,19 @@ pub struct LatencyMetric {
     pub last_ms: Option<u128>,
     pub avg_ms: Option<u128>,
     pub max_ms: Option<u128>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcToggleRequest {
+    enabled: bool,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RpcControlResponse {
+    ok: bool,
+    message: String,
+    rpc_endpoints: Vec<RpcEndpointSnapshot>,
 }
 
 impl DashboardHandle {
@@ -718,6 +732,8 @@ pub async fn run_server(
         .route("/js/radar.js", get(js_radar))
         .route("/api/status", get(status))
         .route("/api/export", get(status))
+        .route("/api/rpc/:id/enabled", post(set_rpc_enabled))
+        .route("/api/rpc/only-getblock", post(only_getblock))
         .with_state(dashboard)
         .layer(CorsLayer::permissive());
 
@@ -774,6 +790,55 @@ async fn js_radar() -> impl IntoResponse {
 
 async fn status(State(dashboard): State<DashboardHandle>) -> Json<DashboardState> {
     Json(dashboard.snapshot())
+}
+
+async fn set_rpc_enabled(
+    State(dashboard): State<DashboardHandle>,
+    Path(endpoint_id): Path<usize>,
+    Json(payload): Json<RpcToggleRequest>,
+) -> impl IntoResponse {
+    match dashboard.rpc_fleet.set_endpoint_enabled(
+        endpoint_id,
+        payload.enabled,
+        payload.reason,
+    ) {
+        Ok(()) => {
+            let status = if payload.enabled { "enabled" } else { "disabled" };
+            dashboard.event(
+                "warn",
+                format!("rpc endpoint {endpoint_id} {status} from dashboard"),
+            );
+            (
+                StatusCode::OK,
+                Json(RpcControlResponse {
+                    ok: true,
+                    message: format!("rpc endpoint {endpoint_id} {status}"),
+                    rpc_endpoints: dashboard.rpc_fleet.snapshot(),
+                }),
+            )
+        }
+        Err(message) => (
+            StatusCode::NOT_FOUND,
+            Json(RpcControlResponse {
+                ok: false,
+                message,
+                rpc_endpoints: dashboard.rpc_fleet.snapshot(),
+            }),
+        ),
+    }
+}
+
+async fn only_getblock(State(dashboard): State<DashboardHandle>) -> Json<RpcControlResponse> {
+    let disabled = dashboard.rpc_fleet.keep_only_getblock_enabled();
+    dashboard.event(
+        "warn",
+        format!("getblock-only mode enabled from dashboard; disabled {disabled} rpc endpoints"),
+    );
+    Json(RpcControlResponse {
+        ok: true,
+        message: format!("getblock-only mode enabled; disabled {disabled} rpc endpoints"),
+        rpc_endpoints: dashboard.rpc_fleet.snapshot(),
+    })
 }
 
 fn push_event(queue: &mut VecDeque<DashboardEvent>, level: &str, message: String) {

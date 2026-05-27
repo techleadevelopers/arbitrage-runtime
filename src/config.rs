@@ -107,6 +107,7 @@ pub struct MonitoredTokenConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpcPreference {
     Auto,
+    GetBlock,
     Alchemy,
     Infura,
 }
@@ -115,6 +116,7 @@ impl RpcPreference {
     pub fn as_str(self) -> &'static str {
         match self {
             RpcPreference::Auto => "auto",
+            RpcPreference::GetBlock => "getblock",
             RpcPreference::Alchemy => "alchemy",
             RpcPreference::Infura => "infura",
         }
@@ -473,6 +475,10 @@ impl Config {
             if let Some(infura_url) = infura_url_for_network(&self.network, infura_id) {
                 urls.push((format!("infura-{}", idx + 1), infura_url));
             }
+        }
+
+        if let Some(filter) = rpc_provider_filter() {
+            urls.retain(|(name, _)| rpc_name_matches_filter(name, &filter));
         }
 
         urls
@@ -841,10 +847,30 @@ fn infura_url_for_network(network: &str, key: &str) -> Option<String> {
 fn parse_rpc_preference(value: &str) -> Result<RpcPreference, Box<dyn std::error::Error>> {
     match value.trim().to_lowercase().as_str() {
         "auto" => Ok(RpcPreference::Auto),
+        "getblock" => Ok(RpcPreference::GetBlock),
         "alchemy" => Ok(RpcPreference::Alchemy),
         "infura" => Ok(RpcPreference::Infura),
         other => Err(format!("unsupported RPC preference: {other}").into()),
     }
+}
+
+fn rpc_provider_filter() -> Option<Vec<String>> {
+    let raw = env::var("RPC_PROVIDER_FILTER")
+        .or_else(|_| env::var("RPC_ENABLED_PROVIDERS"))
+        .ok()?;
+    let providers: Vec<String> = raw
+        .split(',')
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty() && value != "auto" && value != "all")
+        .collect();
+    (!providers.is_empty()).then_some(providers)
+}
+
+fn rpc_name_matches_filter(name: &str, providers: &[String]) -> bool {
+    let lower = name.to_ascii_lowercase();
+    providers.iter().any(|provider| {
+        lower == *provider || lower.starts_with(&format!("{provider}-"))
+    })
 }
 
 fn parse_network_optional_u64(
