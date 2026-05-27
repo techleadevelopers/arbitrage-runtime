@@ -1539,7 +1539,12 @@ struct ProbeSummary {
 }
 
 fn print_endpoint_report(report: &EndpointBenchmarkReport) {
-    println!("[{}] {} ({})", report.kind, report.name, report.url);
+    println!(
+        "[{}] {} ({})",
+        report.kind,
+        report.name,
+        redact_rpc_url(&report.url)
+    );
     println!(
         "  scores: read={:.2} send={:.2}",
         report.read_score, report.send_score
@@ -1548,6 +1553,19 @@ fn print_endpoint_report(report: &EndpointBenchmarkReport) {
         print_metrics(probe.label, &probe.metrics);
     }
     println!();
+}
+
+fn redact_rpc_url(url: &str) -> String {
+    if let Some((prefix, _)) = url.split_once("/v3/") {
+        return format!("{prefix}/v3/<redacted>");
+    }
+    if let Ok(parsed) = Url::parse(url) {
+        return parsed
+            .host_str()
+            .map(|host| format!("{}://{host}/<redacted>", parsed.scheme()))
+            .unwrap_or_else(|| "<redacted-rpc-url>".to_string());
+    }
+    "<redacted-rpc-url>".to_string()
 }
 
 fn print_rankings(reports: &[EndpointBenchmarkReport]) {
