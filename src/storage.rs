@@ -295,6 +295,20 @@ impl Storage {
         }
     }
 
+    pub fn clear_events(&self) -> Result<(), Box<dyn std::error::Error>> {
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                let conn = conn.lock().map_err(|_| "storage lock poisoned")?;
+                conn.execute("DELETE FROM events", [])?;
+                Ok(())
+            }
+            StorageBackend::Postgres(pool) => {
+                Self::wait(sqlx::query("DELETE FROM events").execute(pool))?;
+                Ok(())
+            }
+        }
+    }
+
     pub fn log_telemetry(
         &self,
         stage: &str,

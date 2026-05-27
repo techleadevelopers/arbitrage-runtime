@@ -249,6 +249,12 @@ struct RpcControlResponse {
     rpc_endpoints: Vec<RpcEndpointSnapshot>,
 }
 
+#[derive(Debug, Serialize)]
+struct EventsControlResponse {
+    ok: bool,
+    message: String,
+}
+
 impl DashboardHandle {
     pub fn new(
         config: &Config,
@@ -430,6 +436,16 @@ impl DashboardHandle {
         }
         let mut state = self.inner.write().expect("dashboard state lock");
         push_event(&mut state.recent_events, level, message);
+    }
+
+    pub fn clear_events(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.events.clear();
+        }
+        self.storage.clear_events()?;
+        let mut state = self.inner.write().expect("dashboard state lock");
+        state.recent_events.clear();
+        Ok(())
     }
 
     pub fn record_latency(
@@ -732,8 +748,9 @@ pub async fn run_server(
         .route("/js/radar.js", get(js_radar))
         .route("/api/status", get(status))
         .route("/api/export", get(status))
-        .route("/api/rpc/:id/enabled", post(set_rpc_enabled))
+        .route("/api/rpc/{id}/enabled", post(set_rpc_enabled))
         .route("/api/rpc/only-getblock", post(only_getblock))
+        .route("/api/events/clear", post(clear_events))
         .with_state(dashboard)
         .layer(CorsLayer::permissive());
 
@@ -839,6 +856,25 @@ async fn only_getblock(State(dashboard): State<DashboardHandle>) -> Json<RpcCont
         message: format!("getblock-only mode enabled; disabled {disabled} rpc endpoints"),
         rpc_endpoints: dashboard.rpc_fleet.snapshot(),
     })
+}
+
+async fn clear_events(State(dashboard): State<DashboardHandle>) -> impl IntoResponse {
+    match dashboard.clear_events() {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(EventsControlResponse {
+                ok: true,
+                message: "events feed cleared".to_string(),
+            }),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(EventsControlResponse {
+                ok: false,
+                message: err.to_string(),
+            }),
+        ),
+    }
 }
 
 fn push_event(queue: &mut VecDeque<DashboardEvent>, level: &str, message: String) {
