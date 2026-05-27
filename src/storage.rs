@@ -689,40 +689,79 @@ impl Storage {
         &self,
         limit: usize,
     ) -> Result<Vec<RelaySnapshot>, Box<dyn std::error::Error>> {
-        let conn = self.conn.lock().map_err(|_| "storage lock poisoned")?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT relay, score, pressure, accept_rate, inclusion_rate,
-                   accepted, submit_failed, included_success, included_revert,
-                   not_included_timeout, submit_latency_ms, finalization_latency_ms
-            FROM relay_metrics
-            WHERE network = ?1
-            ORDER BY score ASC, included_success DESC, accept_rate DESC
-            LIMIT ?2
-            "#,
-        )?;
-        let rows = stmt.query_map(params![self.network, limit as i64], |row| {
-            Ok(RelaySnapshot {
-                relay: self.unscoped_relay(&row.get::<_, String>(0)?),
-                score: row.get(1)?,
-                pressure: row.get(2)?,
-                accept_rate: row.get(3)?,
-                inclusion_rate: row.get(4)?,
-                accepted: row.get(5)?,
-                submit_failed: row.get(6)?,
-                included_success: row.get(7)?,
-                included_revert: row.get(8)?,
-                not_included_timeout: row.get(9)?,
-                submit_latency_ms: row.get(10)?,
-                finalization_latency_ms: row.get(11)?,
-            })
-        })?;
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                let conn = conn.lock().map_err(|_| "storage lock poisoned")?;
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT relay, score, pressure, accept_rate, inclusion_rate,
+                           accepted, submit_failed, included_success, included_revert,
+                           not_included_timeout, submit_latency_ms, finalization_latency_ms
+                    FROM relay_metrics
+                    WHERE network = ?1
+                    ORDER BY score ASC, included_success DESC, accept_rate DESC
+                    LIMIT ?2
+                    "#,
+                )?;
+                let rows = stmt.query_map(params![self.network, limit as i64], |row| {
+                    Ok(RelaySnapshot {
+                        relay: self.unscoped_relay(&row.get::<_, String>(0)?),
+                        score: row.get(1)?,
+                        pressure: row.get(2)?,
+                        accept_rate: row.get(3)?,
+                        inclusion_rate: row.get(4)?,
+                        accepted: row.get(5)?,
+                        submit_failed: row.get(6)?,
+                        included_success: row.get(7)?,
+                        included_revert: row.get(8)?,
+                        not_included_timeout: row.get(9)?,
+                        submit_latency_ms: row.get(10)?,
+                        finalization_latency_ms: row.get(11)?,
+                    })
+                })?;
 
-        let mut items = Vec::new();
-        for row in rows {
-            items.push(row?);
+                let mut items = Vec::new();
+                for row in rows {
+                    items.push(row?);
+                }
+                Ok(items)
+            }
+            StorageBackend::Postgres(pool) => {
+                let rows = Self::wait(
+                    sqlx::query(
+                        r#"
+                        SELECT relay, score, pressure, accept_rate, inclusion_rate,
+                               accepted, submit_failed, included_success, included_revert,
+                               not_included_timeout, submit_latency_ms, finalization_latency_ms
+                        FROM relay_metrics
+                        WHERE network = $1
+                        ORDER BY score ASC, included_success DESC, accept_rate DESC
+                        LIMIT $2
+                        "#,
+                    )
+                    .bind(self.network.clone())
+                    .bind(limit as i64)
+                    .fetch_all(pool),
+                )?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| RelaySnapshot {
+                        relay: self.unscoped_relay(&row.get::<String, _>("relay")),
+                        score: row.get("score"),
+                        pressure: row.get("pressure"),
+                        accept_rate: row.get("accept_rate"),
+                        inclusion_rate: row.get("inclusion_rate"),
+                        accepted: row.get::<i64, _>("accepted") as u64,
+                        submit_failed: row.get::<i64, _>("submit_failed") as u64,
+                        included_success: row.get::<i64, _>("included_success") as u64,
+                        included_revert: row.get::<i64, _>("included_revert") as u64,
+                        not_included_timeout: row.get::<i64, _>("not_included_timeout") as u64,
+                        submit_latency_ms: row.get("submit_latency_ms"),
+                        finalization_latency_ms: row.get("finalization_latency_ms"),
+                    })
+                    .collect())
+            }
         }
-        Ok(items)
     }
 
     pub fn record_treasury_recommendation(
@@ -740,31 +779,62 @@ impl Storage {
         note: &str,
     ) {
         let now = Utc::now().to_rfc3339();
-        if let Ok(conn) = self.conn.lock() {
-            let _ = conn.execute(
-                r#"
-                INSERT INTO treasury_rebalance (
-                    network, at, executor_address, vault_address, profit_address,
-                    balance_eth, min_buffer_eth, target_buffer_eth, max_buffer_eth,
-                    action, recommended_amount_eth, status, note
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-                "#,
-                params![
-                    self.network,
-                    now,
-                    executor_address,
-                    vault_address,
-                    profit_address,
-                    balance_eth,
-                    min_buffer_eth,
-                    target_buffer_eth,
-                    max_buffer_eth,
-                    action,
-                    recommended_amount_eth,
-                    status,
-                    note,
-                ],
-            );
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                if let Ok(conn) = conn.lock() {
+                    let _ = conn.execute(
+                        r#"
+                        INSERT INTO treasury_rebalance (
+                            network, at, executor_address, vault_address, profit_address,
+                            balance_eth, min_buffer_eth, target_buffer_eth, max_buffer_eth,
+                            action, recommended_amount_eth, status, note
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                        "#,
+                        params![
+                            self.network,
+                            now,
+                            executor_address,
+                            vault_address,
+                            profit_address,
+                            balance_eth,
+                            min_buffer_eth,
+                            target_buffer_eth,
+                            max_buffer_eth,
+                            action,
+                            recommended_amount_eth,
+                            status,
+                            note,
+                        ],
+                    );
+                }
+            }
+            StorageBackend::Postgres(pool) => {
+                let _ = Self::wait(
+                    sqlx::query(
+                        r#"
+                        INSERT INTO treasury_rebalance (
+                            network, at, executor_address, vault_address, profit_address,
+                            balance_eth, min_buffer_eth, target_buffer_eth, max_buffer_eth,
+                            action, recommended_amount_eth, status, note
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                        "#,
+                    )
+                    .bind(self.network.clone())
+                    .bind(now)
+                    .bind(executor_address.to_string())
+                    .bind(vault_address.to_string())
+                    .bind(profit_address.to_string())
+                    .bind(balance_eth)
+                    .bind(min_buffer_eth)
+                    .bind(target_buffer_eth)
+                    .bind(max_buffer_eth)
+                    .bind(action.to_string())
+                    .bind(recommended_amount_eth)
+                    .bind(status.to_string())
+                    .bind(note.to_string())
+                    .execute(pool),
+                );
+            }
         }
     }
 
@@ -772,40 +842,79 @@ impl Storage {
         &self,
         limit: usize,
     ) -> Result<Vec<TreasurySnapshot>, Box<dyn std::error::Error>> {
-        let conn = self.conn.lock().map_err(|_| "storage lock poisoned")?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT at, executor_address, vault_address, profit_address,
-                   balance_eth, min_buffer_eth, target_buffer_eth, max_buffer_eth,
-                   action, recommended_amount_eth, status, note
-            FROM treasury_rebalance
-            WHERE network = ?1
-            ORDER BY id DESC
-            LIMIT ?2
-            "#,
-        )?;
-        let rows = stmt.query_map(params![self.network, limit as i64], |row| {
-            Ok(TreasurySnapshot {
-                at: row.get(0)?,
-                executor_address: row.get(1)?,
-                vault_address: row.get(2)?,
-                profit_address: row.get(3)?,
-                balance_eth: row.get(4)?,
-                min_buffer_eth: row.get(5)?,
-                target_buffer_eth: row.get(6)?,
-                max_buffer_eth: row.get(7)?,
-                action: row.get(8)?,
-                recommended_amount_eth: row.get(9)?,
-                status: row.get(10)?,
-                note: row.get(11)?,
-            })
-        })?;
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                let conn = conn.lock().map_err(|_| "storage lock poisoned")?;
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT at, executor_address, vault_address, profit_address,
+                           balance_eth, min_buffer_eth, target_buffer_eth, max_buffer_eth,
+                           action, recommended_amount_eth, status, note
+                    FROM treasury_rebalance
+                    WHERE network = ?1
+                    ORDER BY id DESC
+                    LIMIT ?2
+                    "#,
+                )?;
+                let rows = stmt.query_map(params![self.network, limit as i64], |row| {
+                    Ok(TreasurySnapshot {
+                        at: row.get(0)?,
+                        executor_address: row.get(1)?,
+                        vault_address: row.get(2)?,
+                        profit_address: row.get(3)?,
+                        balance_eth: row.get(4)?,
+                        min_buffer_eth: row.get(5)?,
+                        target_buffer_eth: row.get(6)?,
+                        max_buffer_eth: row.get(7)?,
+                        action: row.get(8)?,
+                        recommended_amount_eth: row.get(9)?,
+                        status: row.get(10)?,
+                        note: row.get(11)?,
+                    })
+                })?;
 
-        let mut items = Vec::new();
-        for row in rows {
-            items.push(row?);
+                let mut items = Vec::new();
+                for row in rows {
+                    items.push(row?);
+                }
+                Ok(items)
+            }
+            StorageBackend::Postgres(pool) => {
+                let rows = Self::wait(
+                    sqlx::query(
+                        r#"
+                        SELECT at, executor_address, vault_address, profit_address,
+                               balance_eth, min_buffer_eth, target_buffer_eth, max_buffer_eth,
+                               action, recommended_amount_eth, status, note
+                        FROM treasury_rebalance
+                        WHERE network = $1
+                        ORDER BY id DESC
+                        LIMIT $2
+                        "#,
+                    )
+                    .bind(self.network.clone())
+                    .bind(limit as i64)
+                    .fetch_all(pool),
+                )?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| TreasurySnapshot {
+                        at: row.get("at"),
+                        executor_address: row.get("executor_address"),
+                        vault_address: row.get("vault_address"),
+                        profit_address: row.get("profit_address"),
+                        balance_eth: row.get("balance_eth"),
+                        min_buffer_eth: row.get("min_buffer_eth"),
+                        target_buffer_eth: row.get("target_buffer_eth"),
+                        max_buffer_eth: row.get("max_buffer_eth"),
+                        action: row.get("action"),
+                        recommended_amount_eth: row.get("recommended_amount_eth"),
+                        status: row.get("status"),
+                        note: row.get("note"),
+                    })
+                    .collect())
+            }
         }
-        Ok(items)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -826,33 +935,66 @@ impl Storage {
         finalization_latency_ms: f64,
     ) {
         let now = Utc::now().to_rfc3339();
-        if let Ok(conn) = self.conn.lock() {
-            let _ = conn.execute(
-                r#"
-                INSERT INTO execution_outcomes (
-                    network, at, relay, target_block, pair, router, token_in, token_out,
-                    victim_tx, outcome, expected_profit_eth, realized_profit_eth,
-                    gas_used, submit_latency_ms, finalization_latency_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-                "#,
-                params![
-                    self.network,
-                    now,
-                    relay,
-                    target_block as i64,
-                    pair,
-                    router,
-                    token_in,
-                    token_out,
-                    victim_tx,
-                    outcome,
-                    expected_profit_eth,
-                    realized_profit_eth,
-                    gas_used as i64,
-                    submit_latency_ms,
-                    finalization_latency_ms,
-                ],
-            );
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                if let Ok(conn) = conn.lock() {
+                    let _ = conn.execute(
+                        r#"
+                        INSERT INTO execution_outcomes (
+                            network, at, relay, target_block, pair, router, token_in, token_out,
+                            victim_tx, outcome, expected_profit_eth, realized_profit_eth,
+                            gas_used, submit_latency_ms, finalization_latency_ms
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                        "#,
+                        params![
+                            self.network,
+                            now,
+                            relay,
+                            target_block as i64,
+                            pair,
+                            router,
+                            token_in,
+                            token_out,
+                            victim_tx,
+                            outcome,
+                            expected_profit_eth,
+                            realized_profit_eth,
+                            gas_used as i64,
+                            submit_latency_ms,
+                            finalization_latency_ms,
+                        ],
+                    );
+                }
+            }
+            StorageBackend::Postgres(pool) => {
+                let _ = Self::wait(
+                    sqlx::query(
+                        r#"
+                        INSERT INTO execution_outcomes (
+                            network, at, relay, target_block, pair, router, token_in, token_out,
+                            victim_tx, outcome, expected_profit_eth, realized_profit_eth,
+                            gas_used, submit_latency_ms, finalization_latency_ms
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                        "#,
+                    )
+                    .bind(self.network.clone())
+                    .bind(now)
+                    .bind(relay.to_string())
+                    .bind(target_block as i64)
+                    .bind(pair.to_string())
+                    .bind(router.to_string())
+                    .bind(token_in.to_string())
+                    .bind(token_out.to_string())
+                    .bind(victim_tx.to_string())
+                    .bind(outcome.to_string())
+                    .bind(expected_profit_eth)
+                    .bind(realized_profit_eth)
+                    .bind(gas_used as i64)
+                    .bind(submit_latency_ms)
+                    .bind(finalization_latency_ms)
+                    .execute(pool),
+                );
+            }
         }
     }
 
@@ -860,42 +1002,83 @@ impl Storage {
         &self,
         limit: usize,
     ) -> Result<Vec<ExecutionOutcomeSnapshot>, Box<dyn std::error::Error>> {
-        let conn = self.conn.lock().map_err(|_| "storage lock poisoned")?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT at, relay, target_block, pair, router, token_in, token_out, victim_tx,
-                   outcome, expected_profit_eth, realized_profit_eth, gas_used,
-                   submit_latency_ms, finalization_latency_ms
-            FROM execution_outcomes
-            WHERE network = ?1
-            ORDER BY id DESC
-            LIMIT ?2
-            "#,
-        )?;
-        let rows = stmt.query_map(params![self.network, limit as i64], |row| {
-            Ok(ExecutionOutcomeSnapshot {
-                at: row.get(0)?,
-                relay: row.get(1)?,
-                target_block: row.get(2)?,
-                pair: row.get(3)?,
-                router: row.get(4)?,
-                token_in: row.get(5)?,
-                token_out: row.get(6)?,
-                victim_tx: row.get(7)?,
-                outcome: row.get(8)?,
-                expected_profit_eth: row.get(9)?,
-                realized_profit_eth: row.get(10)?,
-                gas_used: row.get(11)?,
-                submit_latency_ms: row.get(12)?,
-                finalization_latency_ms: row.get(13)?,
-            })
-        })?;
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                let conn = conn.lock().map_err(|_| "storage lock poisoned")?;
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT at, relay, target_block, pair, router, token_in, token_out, victim_tx,
+                           outcome, expected_profit_eth, realized_profit_eth, gas_used,
+                           submit_latency_ms, finalization_latency_ms
+                    FROM execution_outcomes
+                    WHERE network = ?1
+                    ORDER BY id DESC
+                    LIMIT ?2
+                    "#,
+                )?;
+                let rows = stmt.query_map(params![self.network, limit as i64], |row| {
+                    Ok(ExecutionOutcomeSnapshot {
+                        at: row.get(0)?,
+                        relay: row.get(1)?,
+                        target_block: row.get(2)?,
+                        pair: row.get(3)?,
+                        router: row.get(4)?,
+                        token_in: row.get(5)?,
+                        token_out: row.get(6)?,
+                        victim_tx: row.get(7)?,
+                        outcome: row.get(8)?,
+                        expected_profit_eth: row.get(9)?,
+                        realized_profit_eth: row.get(10)?,
+                        gas_used: row.get(11)?,
+                        submit_latency_ms: row.get(12)?,
+                        finalization_latency_ms: row.get(13)?,
+                    })
+                })?;
 
-        let mut items = Vec::new();
-        for row in rows {
-            items.push(row?);
+                let mut items = Vec::new();
+                for row in rows {
+                    items.push(row?);
+                }
+                Ok(items)
+            }
+            StorageBackend::Postgres(pool) => {
+                let rows = Self::wait(
+                    sqlx::query(
+                        r#"
+                        SELECT at, relay, target_block, pair, router, token_in, token_out, victim_tx,
+                               outcome, expected_profit_eth, realized_profit_eth, gas_used,
+                               submit_latency_ms, finalization_latency_ms
+                        FROM execution_outcomes
+                        WHERE network = $1
+                        ORDER BY id DESC
+                        LIMIT $2
+                        "#,
+                    )
+                    .bind(self.network.clone())
+                    .bind(limit as i64)
+                    .fetch_all(pool),
+                )?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| ExecutionOutcomeSnapshot {
+                        at: row.get("at"),
+                        relay: row.get("relay"),
+                        target_block: row.get::<i64, _>("target_block") as u64,
+                        pair: row.get("pair"),
+                        router: row.get("router"),
+                        token_in: row.get("token_in"),
+                        token_out: row.get("token_out"),
+                        victim_tx: row.get("victim_tx"),
+                        outcome: row.get("outcome"),
+                        expected_profit_eth: row.get("expected_profit_eth"),
+                        realized_profit_eth: row.get("realized_profit_eth"),
+                        gas_used: row.get::<i64, _>("gas_used") as u64,
+                        submit_latency_ms: row.get("submit_latency_ms"),
+                        finalization_latency_ms: row.get("finalization_latency_ms"),
+                    })
+                    .collect())
+            }
         }
-        Ok(items)
     }
 
     pub fn outcome_profiles(
@@ -903,59 +1086,120 @@ impl Storage {
         min_samples: u64,
         limit: usize,
     ) -> Result<Vec<HistoricalOutcomeProfile>, Box<dyn std::error::Error>> {
-        let conn = self.conn.lock().map_err(|_| "storage lock poisoned")?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT CAST(substr(at, 12, 2) AS INTEGER) AS hour_utc,
-                   pair,
-                   router,
-                   COUNT(*) AS samples,
-                   AVG(CASE WHEN outcome = 'included_success' THEN 1.0 ELSE 0.0 END) AS success_rate,
-                   AVG(CASE WHEN outcome = 'accepted_not_included' THEN 1.0 ELSE 0.0 END) AS miss_rate,
-                   AVG(CASE WHEN outcome = 'included_revert' THEN 1.0 ELSE 0.0 END) AS revert_rate,
-                   AVG(
-                       CASE
-                           WHEN expected_profit_eth > 0 THEN
-                               MIN(MAX(realized_profit_eth / expected_profit_eth, 0.0), 1.25)
-                           ELSE 0.0
-                       END
-                   ) AS realized_capture
-            FROM execution_outcomes
-            WHERE network = ?1
-            GROUP BY hour_utc, pair, router
-            HAVING COUNT(*) >= ?2
-            ORDER BY samples DESC
-            LIMIT ?3
-            "#,
-        )?;
-        let rows = stmt.query_map(
-            params![self.network, min_samples as i64, limit as i64],
-            |row| {
-                let pair = row.get::<_, String>(1)?;
-                let router = row.get::<_, String>(2)?;
-                Ok(HistoricalOutcomeProfile {
-                    hour_utc: row.get::<_, i64>(0)? as u8,
-                    pair: pair.parse().unwrap_or_default(),
-                    router: router.parse().unwrap_or_default(),
-                    samples: row.get::<_, i64>(3)? as u64,
-                    success_rate: row.get(4)?,
-                    accepted_not_included_rate: row.get(5)?,
-                    revert_rate: row.get(6)?,
-                    realized_capture: row.get(7)?,
-                })
-            },
-        )?;
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                let conn = conn.lock().map_err(|_| "storage lock poisoned")?;
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT CAST(substr(at, 12, 2) AS INTEGER) AS hour_utc,
+                           pair,
+                           router,
+                           COUNT(*) AS samples,
+                           AVG(CASE WHEN outcome = 'included_success' THEN 1.0 ELSE 0.0 END) AS success_rate,
+                           AVG(CASE WHEN outcome = 'accepted_not_included' THEN 1.0 ELSE 0.0 END) AS miss_rate,
+                           AVG(CASE WHEN outcome = 'included_revert' THEN 1.0 ELSE 0.0 END) AS revert_rate,
+                           AVG(
+                               CASE
+                                   WHEN expected_profit_eth > 0 THEN
+                                       MIN(MAX(realized_profit_eth / expected_profit_eth, 0.0), 1.25)
+                                   ELSE 0.0
+                               END
+                           ) AS realized_capture
+                    FROM execution_outcomes
+                    WHERE network = ?1
+                    GROUP BY hour_utc, pair, router
+                    HAVING COUNT(*) >= ?2
+                    ORDER BY samples DESC
+                    LIMIT ?3
+                    "#,
+                )?;
+                let rows = stmt.query_map(
+                    params![self.network, min_samples as i64, limit as i64],
+                    |row| {
+                        let pair = row.get::<_, String>(1)?;
+                        let router = row.get::<_, String>(2)?;
+                        Ok(HistoricalOutcomeProfile {
+                            hour_utc: row.get::<_, i64>(0)? as u8,
+                            pair: pair.parse().unwrap_or_default(),
+                            router: router.parse().unwrap_or_default(),
+                            samples: row.get::<_, i64>(3)? as u64,
+                            success_rate: row.get(4)?,
+                            accepted_not_included_rate: row.get(5)?,
+                            revert_rate: row.get(6)?,
+                            realized_capture: row.get(7)?,
+                        })
+                    },
+                )?;
 
-        let mut items = Vec::new();
-        for row in rows {
-            let profile = row?;
-            if profile.pair != ethers::types::Address::zero()
-                && profile.router != ethers::types::Address::zero()
-            {
-                items.push(profile);
+                let mut items = Vec::new();
+                for row in rows {
+                    let profile = row?;
+                    if profile.pair != ethers::types::Address::zero()
+                        && profile.router != ethers::types::Address::zero()
+                    {
+                        items.push(profile);
+                    }
+                }
+                Ok(items)
+            }
+            StorageBackend::Postgres(pool) => {
+                let rows = Self::wait(
+                    sqlx::query(
+                        r#"
+                        SELECT CAST(substr(at, 12, 2) AS INTEGER) AS hour_utc,
+                               pair,
+                               router,
+                               COUNT(*) AS samples,
+                               AVG(CASE WHEN outcome = 'included_success' THEN 1.0 ELSE 0.0 END) AS success_rate,
+                               AVG(CASE WHEN outcome = 'accepted_not_included' THEN 1.0 ELSE 0.0 END) AS miss_rate,
+                               AVG(CASE WHEN outcome = 'included_revert' THEN 1.0 ELSE 0.0 END) AS revert_rate,
+                               AVG(
+                                   CASE
+                                       WHEN expected_profit_eth > 0 THEN
+                                           LEAST(GREATEST(realized_profit_eth / expected_profit_eth, 0.0), 1.25)
+                                       ELSE 0.0
+                                   END
+                               ) AS realized_capture
+                        FROM execution_outcomes
+                        WHERE network = $1
+                        GROUP BY hour_utc, pair, router
+                        HAVING COUNT(*) >= $2
+                        ORDER BY samples DESC
+                        LIMIT $3
+                        "#,
+                    )
+                    .bind(self.network.clone())
+                    .bind(min_samples as i64)
+                    .bind(limit as i64)
+                    .fetch_all(pool),
+                )?;
+                let mut items = Vec::new();
+                for row in rows {
+                    let profile = HistoricalOutcomeProfile {
+                        hour_utc: row.get::<i32, _>("hour_utc") as u8,
+                        pair: row
+                            .get::<String, _>("pair")
+                            .parse()
+                            .unwrap_or_default(),
+                        router: row
+                            .get::<String, _>("router")
+                            .parse()
+                            .unwrap_or_default(),
+                        samples: row.get::<i64, _>("samples") as u64,
+                        success_rate: row.get("success_rate"),
+                        accepted_not_included_rate: row.get("miss_rate"),
+                        revert_rate: row.get("revert_rate"),
+                        realized_capture: row.get("realized_capture"),
+                    };
+                    if profile.pair != ethers::types::Address::zero()
+                        && profile.router != ethers::types::Address::zero()
+                    {
+                        items.push(profile);
+                    }
+                }
+                Ok(items)
             }
         }
-        Ok(items)
     }
 
     pub fn toxicity_profiles(
