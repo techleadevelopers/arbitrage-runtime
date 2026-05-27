@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let rpc_fleet = Arc::new(RpcFleet::from_config(&config)?);
-    let storage = Storage::new(&config.storage_path, &config.network)?;
+    let storage = Storage::new(&config.storage_path, &config.network).await?;
     let loaded_wallets = load_wallets(&config.wallets, config.chain_id)?;
     let total_read = loaded_wallets.total_read;
     let duplicate_keys = loaded_wallets.duplicates;

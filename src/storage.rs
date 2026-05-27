@@ -1206,72 +1206,132 @@ impl Storage {
         &self,
         limit: usize,
     ) -> Result<Vec<ToxicitySnapshot>, Box<dyn std::error::Error>> {
-        let conn = self.conn.lock().map_err(|_| "storage lock poisoned")?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT CAST(substr(at, 12, 2) AS INTEGER) AS hour_utc,
-                   pair,
-                   router,
-                   COUNT(*) AS samples,
-                   AVG(CASE WHEN outcome = 'included_success' THEN 1.0 ELSE 0.0 END) AS success_rate,
-                   AVG(CASE WHEN outcome = 'accepted_not_included' THEN 1.0 ELSE 0.0 END) AS miss_rate,
-                   AVG(CASE WHEN outcome = 'included_revert' THEN 1.0 ELSE 0.0 END) AS revert_rate,
-                   AVG(
-                       CASE
-                           WHEN expected_profit_eth > 0 THEN
-                               MIN(MAX(realized_profit_eth / expected_profit_eth, 0.0), 1.25)
-                           ELSE 0.0
-                       END
-                   ) AS realized_capture
-            FROM execution_outcomes
-            WHERE network = ?1
-            GROUP BY hour_utc, pair, router
-            HAVING COUNT(*) >= 1
-            ORDER BY
-                (
-                    (1.0 - AVG(CASE WHEN outcome = 'included_success' THEN 1.0 ELSE 0.0 END)) * 0.30
-                    + AVG(CASE WHEN outcome = 'accepted_not_included' THEN 1.0 ELSE 0.0 END) * 0.30
-                    + AVG(CASE WHEN outcome = 'included_revert' THEN 1.0 ELSE 0.0 END) * 0.25
-                    + (1.0 - AVG(
-                       CASE
-                           WHEN expected_profit_eth > 0 THEN
-                               MIN(MAX(realized_profit_eth / expected_profit_eth, 0.0), 1.25)
-                           ELSE 0.0
-                       END
-                    )) * 0.15
-                ) DESC,
-                samples DESC
-            LIMIT ?2
-            "#,
-        )?;
-        let rows = stmt.query_map(params![self.network, limit as i64], |row| {
-            let success_rate = row.get::<_, f64>(4)?;
-            let miss_rate = row.get::<_, f64>(5)?;
-            let revert_rate = row.get::<_, f64>(6)?;
-            let realized_capture = row.get::<_, f64>(7)?;
-            let toxicity_score = ((1.0 - success_rate).clamp(0.0, 1.0) * 0.30
-                + miss_rate.clamp(0.0, 1.0) * 0.30
-                + revert_rate.clamp(0.0, 1.0) * 0.25
-                + (1.0 - realized_capture).clamp(0.0, 1.0) * 0.15)
-                .clamp(0.0, 1.0);
-            Ok(ToxicitySnapshot {
-                hour_utc: row.get::<_, i64>(0)? as u8,
-                pair: row.get(1)?,
-                router: row.get(2)?,
-                samples: row.get::<_, i64>(3)? as u64,
-                success_rate,
-                miss_rate,
-                revert_rate,
-                realized_capture,
-                toxicity_score,
-            })
-        })?;
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                let conn = conn.lock().map_err(|_| "storage lock poisoned")?;
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT CAST(substr(at, 12, 2) AS INTEGER) AS hour_utc,
+                           pair,
+                           router,
+                           COUNT(*) AS samples,
+                           AVG(CASE WHEN outcome = 'included_success' THEN 1.0 ELSE 0.0 END) AS success_rate,
+                           AVG(CASE WHEN outcome = 'accepted_not_included' THEN 1.0 ELSE 0.0 END) AS miss_rate,
+                           AVG(CASE WHEN outcome = 'included_revert' THEN 1.0 ELSE 0.0 END) AS revert_rate,
+                           AVG(
+                               CASE
+                                   WHEN expected_profit_eth > 0 THEN
+                                       MIN(MAX(realized_profit_eth / expected_profit_eth, 0.0), 1.25)
+                                   ELSE 0.0
+                               END
+                           ) AS realized_capture
+                    FROM execution_outcomes
+                    WHERE network = ?1
+                    GROUP BY hour_utc, pair, router
+                    HAVING COUNT(*) >= 1
+                    ORDER BY
+                        (
+                            (1.0 - AVG(CASE WHEN outcome = 'included_success' THEN 1.0 ELSE 0.0 END)) * 0.30
+                            + AVG(CASE WHEN outcome = 'accepted_not_included' THEN 1.0 ELSE 0.0 END) * 0.30
+                            + AVG(CASE WHEN outcome = 'included_revert' THEN 1.0 ELSE 0.0 END) * 0.25
+                            + (1.0 - AVG(
+                               CASE
+                                   WHEN expected_profit_eth > 0 THEN
+                                       MIN(MAX(realized_profit_eth / expected_profit_eth, 0.0), 1.25)
+                                   ELSE 0.0
+                               END
+                            )) * 0.15
+                        ) DESC,
+                        samples DESC
+                    LIMIT ?2
+                    "#,
+                )?;
+                let rows = stmt.query_map(params![self.network, limit as i64], |row| {
+                    let success_rate = row.get::<_, f64>(4)?;
+                    let miss_rate = row.get::<_, f64>(5)?;
+                    let revert_rate = row.get::<_, f64>(6)?;
+                    let realized_capture = row.get::<_, f64>(7)?;
+                    let toxicity_score = ((1.0 - success_rate).clamp(0.0, 1.0) * 0.30
+                        + miss_rate.clamp(0.0, 1.0) * 0.30
+                        + revert_rate.clamp(0.0, 1.0) * 0.25
+                        + (1.0 - realized_capture).clamp(0.0, 1.0) * 0.15)
+                        .clamp(0.0, 1.0);
+                    Ok(ToxicitySnapshot {
+                        hour_utc: row.get::<_, i64>(0)? as u8,
+                        pair: row.get(1)?,
+                        router: row.get(2)?,
+                        samples: row.get::<_, i64>(3)? as u64,
+                        success_rate,
+                        miss_rate,
+                        revert_rate,
+                        realized_capture,
+                        toxicity_score,
+                    })
+                })?;
 
-        let mut items = Vec::new();
-        for row in rows {
-            items.push(row?);
+                let mut items = Vec::new();
+                for row in rows {
+                    items.push(row?);
+                }
+                Ok(items)
+            }
+            StorageBackend::Postgres(pool) => {
+                let rows = Self::wait(
+                    sqlx::query(
+                        r#"
+                        SELECT CAST(substr(at, 12, 2) AS INTEGER) AS hour_utc,
+                               pair,
+                               router,
+                               COUNT(*) AS samples,
+                               AVG(CASE WHEN outcome = 'included_success' THEN 1.0 ELSE 0.0 END) AS success_rate,
+                               AVG(CASE WHEN outcome = 'accepted_not_included' THEN 1.0 ELSE 0.0 END) AS miss_rate,
+                               AVG(CASE WHEN outcome = 'included_revert' THEN 1.0 ELSE 0.0 END) AS revert_rate,
+                               AVG(
+                                   CASE
+                                       WHEN expected_profit_eth > 0 THEN
+                                           LEAST(GREATEST(realized_profit_eth / expected_profit_eth, 0.0), 1.25)
+                                       ELSE 0.0
+                                   END
+                               ) AS realized_capture
+                        FROM execution_outcomes
+                        WHERE network = $1
+                        GROUP BY hour_utc, pair, router
+                        HAVING COUNT(*) >= 1
+                        ORDER BY samples DESC
+                        LIMIT $2
+                        "#,
+                    )
+                    .bind(self.network.clone())
+                    .bind(limit as i64)
+                    .fetch_all(pool),
+                )?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| {
+                        let success_rate = row.get::<f64, _>("success_rate");
+                        let miss_rate = row.get::<f64, _>("miss_rate");
+                        let revert_rate = row.get::<f64, _>("revert_rate");
+                        let realized_capture = row.get::<f64, _>("realized_capture");
+                        let toxicity_score = ((1.0 - success_rate).clamp(0.0, 1.0) * 0.30
+                            + miss_rate.clamp(0.0, 1.0) * 0.30
+                            + revert_rate.clamp(0.0, 1.0) * 0.25
+                            + (1.0 - realized_capture).clamp(0.0, 1.0) * 0.15)
+                            .clamp(0.0, 1.0);
+                        ToxicitySnapshot {
+                            hour_utc: row.get::<i32, _>("hour_utc") as u8,
+                            pair: row.get("pair"),
+                            router: row.get("router"),
+                            samples: row.get::<i64, _>("samples") as u64,
+                            success_rate,
+                            miss_rate,
+                            revert_rate,
+                            realized_capture,
+                            toxicity_score,
+                        }
+                    })
+                    .collect())
+            }
         }
-        Ok(items)
     }
 
     pub fn export_evidence_artifacts(
@@ -1482,6 +1542,7 @@ fn csv_field(value: &str) -> String {
 mod tests {
     use super::*;
     use ethers::types::Address;
+    use std::path::Path;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1495,11 +1556,24 @@ mod tests {
         std::env::temp_dir().join(format!("flash_bot_{label}_{nonce}.sqlite"))
     }
 
+    fn test_storage(path: &Path, network: &str) -> Storage {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("DATABASE_URL");
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Storage::new(path, network))
+            .unwrap()
+    }
+
     #[test]
     fn relay_and_outcomes_are_network_scoped() {
         let path = temp_path("scoped");
-        let bsc = Storage::new(&path, "bsc").unwrap();
-        let polygon = Storage::new(&path, "polygon").unwrap();
+        let bsc = test_storage(&path, "bsc");
+        let polygon = test_storage(&path, "polygon");
 
         bsc.record_relay_outcome(
             "relay-a",
@@ -1539,7 +1613,7 @@ mod tests {
     #[test]
     fn outcome_profiles_aggregate_pair_router_hour() {
         let path = temp_path("profiles");
-        let storage = Storage::new(&path, "bsc").unwrap();
+        let storage = test_storage(&path, "bsc");
         let pair = format!("{:?}", Address::from_low_u64_be(100));
         let router = format!("{:?}", Address::from_low_u64_be(200));
         let token_in = format!("{:?}", Address::from_low_u64_be(300));
@@ -1584,7 +1658,7 @@ mod tests {
     #[test]
     fn toxicity_profiles_rank_bad_contexts() {
         let path = temp_path("toxicity");
-        let storage = Storage::new(&path, "polygon").unwrap();
+        let storage = test_storage(&path, "polygon");
         let pair = format!("{:?}", Address::from_low_u64_be(101));
         let router = format!("{:?}", Address::from_low_u64_be(201));
         let token_in = format!("{:?}", Address::from_low_u64_be(301));
@@ -1627,7 +1701,7 @@ mod tests {
     #[test]
     fn evidence_exports_write_expected_files() {
         let path = temp_path("exports");
-        let storage = Storage::new(&path, "polygon").unwrap();
+        let storage = test_storage(&path, "polygon");
         let pair = format!("{:?}", Address::from_low_u64_be(111));
         let router = format!("{:?}", Address::from_low_u64_be(211));
         let token_in = format!("{:?}", Address::from_low_u64_be(311));
