@@ -107,8 +107,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Dashboard: http://{}", config.dashboard_addr);
     info!("Fee extraction enabled: {}", config.mev.enabled);
     info!(
-        "Impact gate: min_large_swap={:.3} ETH min_profit={:.6} ETH min_roi={}bps",
-        config.mev.min_large_swap_eth, config.mev.min_net_profit_eth, config.mev.min_roi_bps
+        "Impact gate: min_large_swap={:.3} {} min_profit={:.6} {} min_roi={}bps",
+        config.mev.min_large_swap_eth,
+        config.native_asset_symbol(),
+        config.mev.min_net_profit_eth,
+        config.native_asset_symbol(),
+        config.mev.min_roi_bps
     );
     info!(
         "Gas guardrails: max_gas_per_tx={} max_gas_price={} gwei",
@@ -128,17 +132,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.mev.pool_state_cache_ttl_ms
     );
     info!(
-        "Executor buffer: min={:.4} ETH target={:.4} ETH max={:.4} ETH",
+        "Executor buffer: min={:.4} {} target={:.4} {} max={:.4} {}",
         config.mev.executor_min_buffer_eth,
+        config.native_asset_symbol(),
         config.mev.executor_target_buffer_eth,
-        config.mev.executor_max_buffer_eth
+        config.native_asset_symbol(),
+        config.mev.executor_max_buffer_eth,
+        config.native_asset_symbol()
     );
     info!(
-        "Capital budget: window={}s total={:.4} ETH cluster={:.4} ETH pair={:.4} ETH",
+        "Capital budget: window={}s total={:.4} {} cluster={:.4} {} pair={:.4} {}",
         config.mev.capital_window_secs,
         config.mev.max_window_exposure_eth,
+        config.native_asset_symbol(),
         config.mev.max_cluster_window_exposure_eth,
-        config.mev.max_pair_window_exposure_eth
+        config.native_asset_symbol(),
+        config.mev.max_pair_window_exposure_eth,
+        config.native_asset_symbol()
     );
 
     if maybe_run_network_benchmark(config.clone(), rpc_fleet.clone(), &wallets).await? {

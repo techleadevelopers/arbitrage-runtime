@@ -187,6 +187,7 @@ pub struct DashboardState {
     pub market_regime: String,
     pub allow_send: bool,
     pub network: String,
+    pub native_asset_symbol: String,
     pub control_address: String,
     pub vault_address: String,
     pub executor_address: String,
@@ -313,6 +314,7 @@ impl DashboardHandle {
                 market_regime: "normal".to_string(),
                 allow_send: config.allow_send,
                 network: config.network.clone(),
+                native_asset_symbol: config.native_asset_symbol().to_string(),
                 control_address: format!("{:?}", config.control_address),
                 vault_address: format!("{:?}", config.vault_address),
                 executor_address: format!("{:?}", config.executor_address),
@@ -1208,19 +1210,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
       document.getElementById('executor-address').textContent = data.executor_address;
       document.getElementById('profit-address').textContent = data.profit_address;
       document.getElementById('controller-address').textContent = data.control_address;
-      document.getElementById('min-balance').textContent = `Min candidate ${data.min_candidate_eth} ETH`;
-      document.getElementById('policy-min-balance').textContent = `${data.min_candidate_eth} ETH`;
-      document.getElementById('policy-min-profit').textContent = `${data.min_net_profit_eth} ETH`;
-      document.getElementById('executor-balance').textContent = data.executor_balance_eth ? `${data.executor_balance_eth} ETH` : '-';
+      const asset = data.native_asset_symbol || 'NATIVE';
+      document.getElementById('min-balance').textContent = `Min candidate ${data.min_candidate_eth} ${asset}`;
+      document.getElementById('policy-min-balance').textContent = `${data.min_candidate_eth} ${asset}`;
+      document.getElementById('policy-min-profit').textContent = `${data.min_net_profit_eth} ${asset}`;
+      document.getElementById('executor-balance').textContent = data.executor_balance_eth ? `${data.executor_balance_eth} ${asset}` : '-';
       document.getElementById('executor-status').textContent = data.executor_buffer_status;
-      document.getElementById('executor-min-buffer').textContent = `${data.executor_min_buffer_eth} ETH`;
-      document.getElementById('executor-target-buffer').textContent = `${data.executor_target_buffer_eth} ETH`;
-      document.getElementById('executor-max-buffer').textContent = `${data.executor_max_buffer_eth} ETH`;
+      document.getElementById('executor-min-buffer').textContent = `${data.executor_min_buffer_eth} ${asset}`;
+      document.getElementById('executor-target-buffer').textContent = `${data.executor_target_buffer_eth} ${asset}`;
+      document.getElementById('executor-max-buffer').textContent = `${data.executor_max_buffer_eth} ${asset}`;
       document.getElementById('executor-treasury-action').textContent = data.treasury_action;
-      document.getElementById('executor-treasury-amount').textContent = `${data.treasury_recommended_amount_eth} ETH`;
+      document.getElementById('executor-treasury-amount').textContent = `${data.treasury_recommended_amount_eth} ${asset}`;
       document.getElementById('treasury-current-action').textContent = data.treasury_action;
       document.getElementById('treasury-current-status').textContent = data.treasury_status;
-      document.getElementById('treasury-current-amount').textContent = `${data.treasury_recommended_amount_eth} ETH`;
+      document.getElementById('treasury-current-amount').textContent = `${data.treasury_recommended_amount_eth} ${asset}`;
       document.getElementById('treasury-current-note').textContent = data.treasury_note;
       document.getElementById('policy-fallback').textContent = data.private_relay_only ? 'private-only' : 'mixed';
       document.getElementById('policy-regime').textContent = data.market_regime;
@@ -1272,8 +1275,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
             <td>${item.asset_class}</td>
             <td>${item.detections}</td>
             <td>${item.successful_sweeps}</td>
-            <td>${item.detected_profit_eth} ETH</td>
-            <td>${item.realized_profit_eth} ETH</td>
+            <td>${item.detected_profit_eth} ${asset}</td>
+            <td>${item.realized_profit_eth} ${asset}</td>
             <td>${item.residual_score}</td>
           </tr>
         `).join('')
@@ -1333,8 +1336,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
             <td>${item.at}</td>
             <td>${item.action}</td>
             <td>${item.status}</td>
-            <td>${item.recommended_amount_eth.toFixed(6)} ETH</td>
-            <td>${item.balance_eth.toFixed(6)} ETH</td>
+            <td>${item.recommended_amount_eth.toFixed(6)} ${asset}</td>
+            <td>${item.balance_eth.toFixed(6)} ${asset}</td>
           </tr>
         `).join('')
         : '<tr><td colspan="5">No treasury signals yet</td></tr>';

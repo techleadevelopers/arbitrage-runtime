@@ -17,7 +17,7 @@ struct Cli {
     #[arg(short, long, default_value = "keys.txt")]
     wallets: PathBuf,
 
-    #[arg(long, default_value = "ethereum")]
+    #[arg(long, default_value = "bsc")]
     network: String,
 }
 
@@ -493,6 +493,16 @@ impl Config {
 
     pub fn uses_bundle_relays(&self) -> bool {
         self.network == "ethereum" && !self.builder_relays.is_empty()
+    }
+
+    pub fn native_asset_symbol(&self) -> &'static str {
+        match self.network.as_str() {
+            "bsc" | "bnb" => "BNB",
+            "polygon" => "POL",
+            "ethereum" => "ETH",
+            "arbitrum" | "optimism" | "base" => "ETH",
+            _ => "NATIVE",
+        }
     }
 
     pub fn fork_rpc_url(&self) -> Option<String> {

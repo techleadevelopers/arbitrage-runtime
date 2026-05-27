@@ -268,10 +268,12 @@ impl ExecutionEngine {
             self.dashboard.event(
                 "warn",
                 format!(
-                    "fee extraction blocked victim={:?}: executor wallet underfunded balance={:.6} ETH min_buffer={:.6} ETH",
+                    "fee extraction blocked victim={:?}: executor wallet underfunded balance={:.6} {} min_buffer={:.6} {}",
                     opportunity.victim_tx,
                     hot_balance_eth,
-                    self.config.mev.executor_min_buffer_eth
+                    self.config.native_asset_symbol(),
+                    self.config.mev.executor_min_buffer_eth,
+                    self.config.native_asset_symbol()
                 ),
             );
             return Ok(());
@@ -280,10 +282,12 @@ impl ExecutionEngine {
             self.dashboard.event(
                 "warn",
                 format!(
-                    "fee extraction blocked victim={:?}: executor wallet overfunded balance={:.6} ETH max_buffer={:.6} ETH",
+                    "fee extraction blocked victim={:?}: executor wallet overfunded balance={:.6} {} max_buffer={:.6} {}",
                     opportunity.victim_tx,
                     hot_balance_eth,
-                    self.config.mev.executor_max_buffer_eth
+                    self.config.native_asset_symbol(),
+                    self.config.mev.executor_max_buffer_eth,
+                    self.config.native_asset_symbol()
                 ),
             );
             return Ok(());
@@ -395,16 +399,20 @@ impl ExecutionEngine {
             self.dashboard.event(
                 "warn",
                 format!(
-                    "fee extraction budget blocked victim={:?}: reason={} capital={:.6} ETH total_window={:.6}/{:.6} cluster_window={:.6}/{:.6} pair_window={:.6}/{:.6}",
+                    "fee extraction budget blocked victim={:?}: reason={} capital={:.6} {} total_window={:.6}/{:.6} {} cluster_window={:.6}/{:.6} {} pair_window={:.6}/{:.6} {}",
                     opportunity.victim_tx,
                     budget_gate.reject_reason,
                     budget_gate.capital_eth,
+                    self.config.native_asset_symbol(),
                     budget_gate.total_window_eth,
                     self.config.mev.max_window_exposure_eth,
+                    self.config.native_asset_symbol(),
                     budget_gate.cluster_window_eth,
                     self.config.mev.max_cluster_window_exposure_eth,
+                    self.config.native_asset_symbol(),
                     budget_gate.pair_window_eth,
-                    self.config.mev.max_pair_window_exposure_eth
+                    self.config.mev.max_pair_window_exposure_eth,
+                    self.config.native_asset_symbol()
                 ),
             );
             return Ok(());
@@ -536,11 +544,12 @@ impl ExecutionEngine {
                         self.dashboard.event(
                             "success",
                             format!(
-                                "fee extraction tx submitted victim={:?} path={} tx={:?} expected_profit={:.6} ETH",
+                                "fee extraction tx submitted victim={:?} path={} tx={:?} expected_profit={:.6} {}",
                                 opportunity.victim_tx,
                                 format_submit_path(&payload.amm_kind, &relay_label),
                                 tx_hash,
-                                wei_to_eth_f64(payload.expected_profit_wei)
+                                wei_to_eth_f64(payload.expected_profit_wei),
+                                self.config.native_asset_symbol()
                             ),
                         );
                         submit_set.abort_all();
@@ -575,10 +584,11 @@ impl ExecutionEngine {
                             self.dashboard.event(
                                 "error",
                                 format!(
-                                    "execution failed victim={:?}: insufficient funds for gas/value via {} required_estimated_cost={:.6} ETH gas_price={:.2} gwei gas_limit={}",
+                                    "execution failed victim={:?}: insufficient funds for gas/value via {} required_estimated_cost={:.6} {} gas_price={:.2} gwei gas_limit={}",
                                     opportunity.victim_tx,
                                     endpoint_name,
                                     wei_to_eth_f64(estimated_cost_wei),
+                                    self.config.native_asset_symbol(),
                                     wei_to_gwei_f64(send_context.gas_price),
                                     payload.gas_limit
                                 ),
@@ -686,12 +696,13 @@ impl ExecutionEngine {
                     self.dashboard.event(
                         "success",
                         format!(
-                            "fee extraction bundle submitted victim={:?} relay={} bundle={:?} tx={:?} expected_profit={:.6} ETH",
+                            "fee extraction bundle submitted victim={:?} relay={} bundle={:?} tx={:?} expected_profit={:.6} {}",
                             opportunity.victim_tx,
                             format_submit_path(&payload.amm_kind, &relay.relay),
                             bundle_hash,
                             tx_hash,
-                            wei_to_eth_f64(payload.expected_profit_wei)
+                            wei_to_eth_f64(payload.expected_profit_wei),
+                            self.config.native_asset_symbol()
                         ),
                     );
                     relay_submit_set.abort_all();
@@ -878,8 +889,13 @@ impl ExecutionEngine {
                 self.dashboard.event(
                     if success { "success" } else { "warn" },
                     format!(
-                        "fee extraction finalized relay={} tx={:?} success={} realized_pnl={:.6} ETH gas_used={}",
-                        relay, tx_hash, success, result.realized_profit, result.gas_used
+                        "fee extraction finalized relay={} tx={:?} success={} realized_pnl={:.6} {} gas_used={}",
+                        relay,
+                        tx_hash,
+                        success,
+                        result.realized_profit,
+                        self.config.native_asset_symbol(),
+                        result.gas_used
                     ),
                 );
                 self.record_execution_outcome(
@@ -1138,12 +1154,15 @@ impl ExecutionEngine {
             self.dashboard.event(
                 "info",
                 format!(
-                    "realized pnl update executions={} failures={} daily_pnl={:.6} ETH realized_profit={:.6} ETH realized_loss={:.6} ETH",
+                    "realized pnl update executions={} failures={} daily_pnl={:.6} {} realized_profit={:.6} {} realized_loss={:.6} {}",
                     pnl.executions,
                     pnl.failures,
                     pnl.daily_pnl_eth,
+                    self.config.native_asset_symbol(),
                     pnl.realized_profit_eth,
-                    pnl.realized_loss_eth
+                    self.config.native_asset_symbol(),
+                    pnl.realized_loss_eth,
+                    self.config.native_asset_symbol()
                 ),
             );
         }
@@ -1573,11 +1592,14 @@ impl ExecutionEngine {
                 "info"
             },
             format!(
-                "treasury {} executor_balance={:.6} ETH target={:.6} ETH amount={:.6} ETH note={}",
+                "treasury {} executor_balance={:.6} {} target={:.6} {} amount={:.6} {} note={}",
                 signal.action,
                 balance_eth,
+                self.config.native_asset_symbol(),
                 self.config.mev.executor_target_buffer_eth,
+                self.config.native_asset_symbol(),
                 signal.recommended_amount_eth,
+                self.config.native_asset_symbol(),
                 signal.note
             ),
         );

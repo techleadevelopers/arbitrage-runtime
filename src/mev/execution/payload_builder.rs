@@ -138,9 +138,11 @@ impl PayloadBuilder {
 
         if simulated_profit_wei < min_profit_wei {
             return Err(format!(
-                "simulated profit {:.6} ETH below minimum {:.6} ETH",
+                "simulated profit {:.6} {} below minimum {:.6} {}",
                 wei_to_eth_f64(simulated_profit_wei),
-                config.mev.min_net_profit_eth
+                config.native_asset_symbol(),
+                config.mev.min_net_profit_eth,
+                config.native_asset_symbol()
             ));
         }
 
@@ -265,9 +267,11 @@ impl PayloadBuilder {
 
         if simulated_profit_wei < min_profit_wei {
             return Err(format!(
-                "simulated v3 profit {:.6} ETH below minimum {:.6} ETH",
+                "simulated v3 profit {:.6} {} below minimum {:.6} {}",
                 wei_to_eth_f64(simulated_profit_wei),
-                config.mev.min_net_profit_eth
+                config.native_asset_symbol(),
+                config.mev.min_net_profit_eth,
+                config.native_asset_symbol()
             ));
         }
 

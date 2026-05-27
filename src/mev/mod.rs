@@ -24,11 +24,15 @@ pub async fn run(
     dashboard.event(
         "info",
         format!(
-            "fee extraction engine started capital={:.6} ETH min_profit={:.6} ETH max_gas={} min_liquidity={:.3} ETH",
+            "fee extraction engine started network={} capital={:.6} {} min_profit={:.6} {} max_gas={} min_liquidity={:.3} {}",
+            config.network,
             config.mev.capital_eth,
+            config.native_asset_symbol(),
             config.mev.min_net_profit_eth,
+            config.native_asset_symbol(),
             config.mev.max_gas_per_tx,
             config.mev.min_liquidity_eth,
+            config.native_asset_symbol(),
         ),
     );
 

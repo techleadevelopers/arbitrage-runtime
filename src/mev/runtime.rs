@@ -324,10 +324,12 @@ pub async fn run(
     dashboard.event(
         "info",
         format!(
-            "fee extraction runtime connected to {} min_large_swap={:.3} ETH min_profit={:.6} ETH lookup_workers={} eval_workers={}",
+            "fee extraction runtime connected to {} min_large_swap={:.3} {} min_profit={:.6} {} lookup_workers={} eval_workers={}",
             ws_urls.join(" | "),
             config.mev.min_large_swap_eth,
+            config.native_asset_symbol(),
             config.mev.min_net_profit_eth,
+            config.native_asset_symbol(),
             lookup_decode_workers,
             eval_workers
         ),
