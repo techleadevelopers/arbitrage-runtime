@@ -6,6 +6,7 @@ This directory stores measured runtime load-test outputs used as operational evi
 
 - `runtime_baseline_report.json`: clean synthetic flow through the hot-gate path.
 - `runtime_adversarial_report.json`: hostile synthetic flow with malformed calldata, unknown selectors, small-notional spam, toxic gas, long paths, cluster bursts, and valid opportunities.
+- `latency_projection.md`: separates measured hot-gate latency from estimated end-to-end MEV latency targets.
 
 ## Interpretation
 
@@ -20,6 +21,8 @@ Use these files to compare:
 - per-scenario rejection rates in the adversarial profile
 
 The load-test harness is intentionally narrower than a live runtime profile. It excludes RPC, payload lookup, relay submission, dashboard IO, persistence, and receipt observation. Treat these artifacts as hot-path evidence, not as end-to-end profitability evidence.
+
+For end-to-end latency projections, use `latency_projection.md`. Do not compare websocket/RPC estimates directly with `total_hot_gate` microbenchmarks.
 
 ## Regeneration
 
