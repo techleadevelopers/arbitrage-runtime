@@ -2,7 +2,9 @@ use crate::config::WalletEntry;
 use ethers::prelude::*;
 use std::collections::HashSet;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
+use tracing::warn;
 
 #[derive(Debug)]
 pub struct LoadedWallets {
@@ -27,7 +29,17 @@ fn load_from_keys_txt(
     path: &Path,
     chain_id: u64,
 ) -> Result<LoadedWallets, Box<dyn std::error::Error>> {
-    let content = fs::read_to_string(path)?;
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            warn!(
+                "wallet file {} not found; continuing with zero monitored wallets",
+                path.display()
+            );
+            return Ok(empty_wallets());
+        }
+        Err(err) => return Err(err.into()),
+    };
     let mut seen = HashSet::new();
     let mut wallets = Vec::new();
     let mut total_read = 0usize;
@@ -71,7 +83,17 @@ fn load_from_keys_txt(
 }
 
 fn load_from_json(path: &Path, chain_id: u64) -> Result<LoadedWallets, Box<dyn std::error::Error>> {
-    let content = fs::read_to_string(path)?;
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            warn!(
+                "wallet file {} not found; continuing with zero monitored wallets",
+                path.display()
+            );
+            return Ok(empty_wallets());
+        }
+        Err(err) => return Err(err.into()),
+    };
     let entries: Vec<WalletEntry> = serde_json::from_str(&content)?;
     let mut seen = HashSet::new();
     let mut wallets = Vec::new();
@@ -106,6 +128,16 @@ fn load_from_json(path: &Path, chain_id: u64) -> Result<LoadedWallets, Box<dyn s
         duplicates,
         invalid,
     })
+}
+
+fn empty_wallets() -> LoadedWallets {
+    LoadedWallets {
+        wallets: Vec::new(),
+        total_read: 0,
+        unique: 0,
+        duplicates: 0,
+        invalid: 0,
+    }
 }
 
 fn normalize_private_key(value: &str) -> Option<String> {
