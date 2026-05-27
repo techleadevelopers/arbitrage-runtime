@@ -1,29 +1,28 @@
 #![allow(dead_code)]
 
-use tokio::sync::mpsc;
-
 #[derive(Debug)]
 pub struct XdpIngest {
-    rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    _private: (),
 }
 
 impl XdpIngest {
-    pub fn new(_interface: &str, _queue_id: u32) -> Result<Self, Box<dyn std::error::Error>> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        Ok(Self { rx, tx })
-    }
-
-    pub fn sender(&self) -> mpsc::UnboundedSender<Vec<u8>> {
-        self.tx.clone()
+    pub fn new(interface: &str, queue_id: u32) -> Result<Self, Box<dyn std::error::Error>> {
+        Err(format!(
+            "AF_XDP ingest is not implemented for interface={interface} queue_id={queue_id}; use websocket mempool ingestion or add a real AF_XDP backend before enabling xdp-ingest"
+        )
+        .into())
     }
 
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
-        self.rx.recv().await
+        None
     }
 
-    pub async fn run(&mut self) {
-        while self.rx.recv().await.is_some() {}
+    pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        Err("AF_XDP ingest backend is not implemented".into())
+    }
+
+    pub fn backend_status() -> &'static str {
+        "unimplemented"
     }
 }
 
