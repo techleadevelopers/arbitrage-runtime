@@ -21,7 +21,20 @@ pub fn find_selector(data: &[u8]) -> Option<usize> {
         return find_selector_simd(data);
     }
 
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     find_selector_scalar(data)
+}
+
+pub fn selector_backend() -> &'static str {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        "avx2"
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        "scalar"
+    }
 }
 
 pub fn find_selector_scalar(data: &[u8]) -> Option<usize> {
