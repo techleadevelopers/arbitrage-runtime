@@ -1162,16 +1162,16 @@ impl Storage {
                                pair,
                                router,
                                COUNT(*) AS samples,
-                               AVG(CASE WHEN outcome = 'included_success' THEN 1.0 ELSE 0.0 END) AS success_rate,
-                               AVG(CASE WHEN outcome = 'accepted_not_included' THEN 1.0 ELSE 0.0 END) AS miss_rate,
-                               AVG(CASE WHEN outcome = 'included_revert' THEN 1.0 ELSE 0.0 END) AS revert_rate,
+                               AVG(CASE WHEN outcome = 'included_success' THEN 1.0 ELSE 0.0 END)::double precision AS success_rate,
+                               AVG(CASE WHEN outcome = 'accepted_not_included' THEN 1.0 ELSE 0.0 END)::double precision AS miss_rate,
+                               AVG(CASE WHEN outcome = 'included_revert' THEN 1.0 ELSE 0.0 END)::double precision AS revert_rate,
                                AVG(
                                    CASE
                                        WHEN expected_profit_eth > 0 THEN
                                            LEAST(GREATEST(realized_profit_eth / expected_profit_eth, 0.0), 1.25)
                                        ELSE 0.0
                                    END
-                               ) AS realized_capture
+                               )::double precision AS realized_capture
                         FROM execution_outcomes
                         WHERE network = $1
                         GROUP BY hour_utc, pair, router
@@ -1295,16 +1295,16 @@ impl Storage {
                                pair,
                                router,
                                COUNT(*) AS samples,
-                               AVG(CASE WHEN outcome = 'included_success' THEN 1.0 ELSE 0.0 END) AS success_rate,
-                               AVG(CASE WHEN outcome = 'accepted_not_included' THEN 1.0 ELSE 0.0 END) AS miss_rate,
-                               AVG(CASE WHEN outcome = 'included_revert' THEN 1.0 ELSE 0.0 END) AS revert_rate,
+                               AVG(CASE WHEN outcome = 'included_success' THEN 1.0 ELSE 0.0 END)::double precision AS success_rate,
+                               AVG(CASE WHEN outcome = 'accepted_not_included' THEN 1.0 ELSE 0.0 END)::double precision AS miss_rate,
+                               AVG(CASE WHEN outcome = 'included_revert' THEN 1.0 ELSE 0.0 END)::double precision AS revert_rate,
                                AVG(
                                    CASE
                                        WHEN expected_profit_eth > 0 THEN
                                            LEAST(GREATEST(realized_profit_eth / expected_profit_eth, 0.0), 1.25)
                                        ELSE 0.0
                                    END
-                               ) AS realized_capture
+                               )::double precision AS realized_capture
                         FROM execution_outcomes
                         WHERE network = $1
                         GROUP BY hour_utc, pair, router
