@@ -243,8 +243,9 @@ impl Config {
         let storage_path = env::var("STORAGE_PATH")
             .unwrap_or_else(|_| "bot_state.sqlite".to_string())
             .into();
-        let dashboard_addr = env::var("DASHBOARD_ADDR")
-            .or_else(|_| env::var("PORT").map(|port| format!("0.0.0.0:{port}")))
+        let dashboard_addr = env::var("PORT")
+            .map(|port| format!("0.0.0.0:{port}"))
+            .or_else(|_| env::var("DASHBOARD_ADDR"))
             .unwrap_or_else(|_| "127.0.0.1:8787".to_string())
             .parse::<SocketAddr>()?;
         let explicit_rpc_urls = parse_rpc_urls(&network);

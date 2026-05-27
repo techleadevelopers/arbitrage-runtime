@@ -16,7 +16,6 @@ pub enum RpcKind {
     Alchemy,
     Infura,
 }
-
 impl RpcKind {
     fn as_str(self) -> &'static str {
         match self {

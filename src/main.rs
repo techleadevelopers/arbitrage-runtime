@@ -222,13 +222,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !config.mev.enabled {
         let message = "fee extraction engine is disabled: set MEV_ENGINE_ENABLED=true".to_string();
         dashboard.event("warn", message.clone());
-        return Err(message.into());
+        error!("{}", message);
+        std::future::pending::<()>().await;
+        return Ok(());
     }
 
     if let Err(err) = mev::run(config, rpc_fleet, dashboard, storage).await {
         error!("Fee extraction engine failed: {}", err);
     }
 
+    std::future::pending::<()>().await;
     Ok(())
 }
 
