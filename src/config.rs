@@ -45,7 +45,7 @@ pub struct Config {
     pub rpc_send_preference: RpcPreference,
     pub storage_path: PathBuf,
     pub dashboard_addr: SocketAddr,
-    pub explicit_rpc_urls: Vec<String>,
+    pub explicit_rpc_urls: Vec<(String, String)>,
     pub mempool_ws_urls: Vec<String>,
     pub mev: MevConfig,
 }
@@ -141,15 +141,7 @@ impl Config {
             .unwrap_or_else(|_| "false".to_string())
             .trim()
             .eq_ignore_ascii_case("true");
-        let alchemy_keys = if tenderly_rpc_only {
-            parse_alchemy_keys()
-        } else {
-            let keys = parse_alchemy_keys();
-            if keys.is_empty() && !runtime_load_test_mode {
-                return Err("environment variable ALCHEMY_KEY is not configured".into());
-            }
-            keys
-        };
+        let alchemy_keys = parse_alchemy_keys();
         let flashbots_relay = if network == "ethereum" {
             required_env("FLASHBOTS_RELAY")?
         } else {
@@ -208,7 +200,7 @@ impl Config {
                     );
                     executor_address
                 }
-                Err(err) => return Err(err.into()),
+                Err(err) => return Err(format!("invalid CONTROL_ADDRESS: {err}").into()),
             },
             Err(_) if runtime_load_test_mode => executor_address,
             Err(_) => {
@@ -252,6 +244,7 @@ impl Config {
             .unwrap_or_else(|_| "bot_state.sqlite".to_string())
             .into();
         let dashboard_addr = env::var("DASHBOARD_ADDR")
+            .or_else(|_| env::var("PORT").map(|port| format!("0.0.0.0:{port}")))
             .unwrap_or_else(|_| "127.0.0.1:8787".to_string())
             .parse::<SocketAddr>()?;
         let explicit_rpc_urls = parse_rpc_urls(&network);
@@ -461,8 +454,8 @@ impl Config {
         let mut urls = Vec::with_capacity(
             self.explicit_rpc_urls.len() + self.infura_ids.len() + self.alchemy_keys.len(),
         );
-        for (idx, rpc_url) in self.explicit_rpc_urls.iter().enumerate() {
-            urls.push((format!("rpc-{}", idx + 1), rpc_url.clone()));
+        for (name, rpc_url) in &self.explicit_rpc_urls {
+            urls.push((name.clone(), rpc_url.clone()));
         }
         for (idx, alchemy_key) in self.alchemy_keys.iter().enumerate() {
             if let Some(alchemy_url) = alchemy_url_for_network(&self.network, alchemy_key) {
@@ -668,10 +661,11 @@ fn parse_mempool_ws_urls(
     urls
 }
 
-fn parse_rpc_urls(network: &str) -> Vec<String> {
+fn parse_rpc_urls(network: &str) -> Vec<(String, String)> {
     let mut urls = Vec::new();
-    for key in prioritized_network_keys(
+    push_rpc_url_entries(
         network,
+        "rpc",
         &[
             "RPC_URL",
             "RPC_URL_2",
@@ -680,8 +674,45 @@ fn parse_rpc_urls(network: &str) -> Vec<String> {
             "RPC_URL_BSC",
             "RPC_URL_BNB",
             "RPC_URL_POLYGON",
+            "RPC_URL_ETHEREUM",
+            "RPC_URL_ARBITRUM",
         ],
-    ) {
+        &mut urls,
+    );
+    push_rpc_url_entries(
+        network,
+        "getblock",
+        &[
+            "GETBLOCK_RPC_URL",
+            "GETBLOCK_RPC_URL_2",
+            "GETBLOCK_RPC_URL_3",
+            "GETBLOCK_RPC_URL_BSC",
+            "GETBLOCK_RPC_URL_BNB",
+            "GETBLOCK_RPC_URL_POLYGON",
+            "GETBLOCK_RPC_URL_ETHEREUM",
+            "GETBLOCK_RPC_URL_ARBITRUM",
+            "GETBLOCK_BSC",
+            "GETBLOCK_BNB",
+            "GETBLOCK_POLYGON",
+            "GETBLOCK_ETHEREUM",
+            "GETBLOCK_ARBITRUM",
+        ],
+        &mut urls,
+    );
+    urls
+}
+
+fn push_rpc_url_entries(
+    network: &str,
+    label: &str,
+    keys: &[&str],
+    urls: &mut Vec<(String, String)>,
+) {
+    let mut label_index = urls
+        .iter()
+        .filter(|(name, _)| name.starts_with(label))
+        .count();
+    for key in prioritized_network_keys(network, keys) {
         if let Ok(value) = env::var(key) {
             for item in value
                 .split(',')
@@ -690,14 +721,14 @@ fn parse_rpc_urls(network: &str) -> Vec<String> {
             {
                 if !urls
                     .iter()
-                    .any(|existing: &String| existing.eq_ignore_ascii_case(item))
+                    .any(|(_, existing)| existing.eq_ignore_ascii_case(item))
                 {
-                    urls.push(item.to_string());
+                    label_index += 1;
+                    urls.push((format!("{label}-{label_index}"), item.to_string()));
                 }
             }
         }
     }
-    urls
 }
 
 fn parse_optional_address_env(
@@ -717,14 +748,22 @@ fn parse_optional_address_env(
             warn!("ignoring invalid {name} for runtime load test: {}", err);
             Ok(None)
         }
-        Err(err) => Err(err.into()),
+        Err(err) => Err(format!("invalid {name}: {err}").into()),
     }
 }
 
 fn is_placeholder(value: &str) -> bool {
-    value.trim().is_empty()
-        || value.trim() == "SUA_CHAVE_HEX_AQUI"
-        || value.trim() == "0xSeuContratoAlvo"
+    let trimmed = value.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    trimmed.is_empty()
+        || lower == "sua_chave_hex_aqui"
+        || lower == "0xseucontratoalvo"
+        || lower.starts_with("sua_")
+        || lower.starts_with("seu_")
+        || lower.starts_with("your_")
+        || lower.starts_with("change_me")
+        || lower.starts_with("replace_me")
+        || lower.contains("placeholder")
 }
 
 fn env_flag(name: &str) -> bool {
@@ -800,6 +839,8 @@ fn prioritized_network_keys<'a>(network: &str, keys: &'a [&'a str]) -> Vec<&'a s
     let suffixes: &[&str] = match network {
         "bsc" => &["_BSC", "_BNB"],
         "polygon" => &["_POLYGON"],
+        "ethereum" => &["_ETHEREUM"],
+        "arbitrum" => &["_ARBITRUM"],
         _ => &[],
     };
 
@@ -812,11 +853,12 @@ fn prioritized_network_keys<'a>(network: &str, keys: &'a [&'a str]) -> Vec<&'a s
     }
 
     for key in keys {
-        if !key.contains("_BSC")
-            && !key.contains("_BNB")
-            && !key.contains("_POLYGON")
-            && !prioritized.contains(key)
-        {
+        let is_network_specific = key.contains("_BSC")
+            || key.contains("_BNB")
+            || key.contains("_POLYGON")
+            || key.contains("_ETHEREUM")
+            || key.contains("_ARBITRUM");
+        if !is_network_specific && !prioritized.contains(key) {
             prioritized.push(*key);
         }
     }
@@ -855,17 +897,23 @@ fn parse_monitored_tokens(
         let parts: Vec<&str> = trimmed.split(':').map(str::trim).collect();
         let token = match parts.as_slice() {
             [address, decimals, price_eth] => MonitoredTokenConfig {
-                address: (*address).parse::<Address>()?,
+                address: (*address)
+                    .parse::<Address>()
+                    .map_err(|err| format!("invalid address in {env_name}: {address}: {err}"))?,
                 decimals: (*decimals).parse::<u8>()?,
                 price_eth: (*price_eth).parse::<f64>()?,
             },
             [_symbol, address, decimals, price_eth] => MonitoredTokenConfig {
-                address: (*address).parse::<Address>()?,
+                address: (*address)
+                    .parse::<Address>()
+                    .map_err(|err| format!("invalid address in {env_name}: {address}: {err}"))?,
                 decimals: (*decimals).parse::<u8>()?,
                 price_eth: (*price_eth).parse::<f64>()?,
             },
             [_symbol, _class, address, decimals, price_eth] => MonitoredTokenConfig {
-                address: (*address).parse::<Address>()?,
+                address: (*address)
+                    .parse::<Address>()
+                    .map_err(|err| format!("invalid address in {env_name}: {address}: {err}"))?,
                 decimals: (*decimals).parse::<u8>()?,
                 price_eth: (*price_eth).parse::<f64>()?,
             },
