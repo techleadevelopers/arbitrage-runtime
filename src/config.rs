@@ -485,6 +485,9 @@ impl Config {
         if !self.mempool_ws_urls.is_empty() {
             return self.mempool_ws_urls.clone();
         }
+        if !supports_default_alchemy_mempool_ws(&self.network) {
+            return Vec::new();
+        }
         self.alchemy_keys
             .iter()
             .filter_map(|key| alchemy_ws_url_for_network(&self.network, key))
@@ -650,6 +653,7 @@ fn parse_mempool_ws_urls(
                 .split(',')
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
+                .filter(|value| is_allowed_mempool_ws_url(network, value))
             {
                 if !urls
                     .iter()
@@ -661,7 +665,7 @@ fn parse_mempool_ws_urls(
         }
     }
 
-    if urls.is_empty() && !tenderly_rpc_only {
+    if urls.is_empty() && !tenderly_rpc_only && supports_default_alchemy_mempool_ws(network) {
         for key in alchemy_keys {
             if let Some(ws_url) = alchemy_ws_url_for_network(network, key) {
                 urls.push(ws_url);
@@ -806,12 +810,22 @@ fn alchemy_url_for_network(network: &str, key: &str) -> Option<String> {
 
 fn alchemy_ws_url_for_network(network: &str, key: &str) -> Option<String> {
     match network {
-        "bsc" | "bnb" => Some(format!("wss://bnb-mainnet.g.alchemy.com/v2/{key}")),
         "ethereum" => Some(format!("wss://eth-mainnet.g.alchemy.com/v2/{key}")),
         "arbitrum" => Some(format!("wss://arb-mainnet.g.alchemy.com/v2/{key}")),
         "polygon" => Some(format!("wss://polygon-mainnet.g.alchemy.com/v2/{key}")),
         _ => None,
     }
+}
+
+fn supports_default_alchemy_mempool_ws(network: &str) -> bool {
+    matches!(network, "ethereum" | "arbitrum" | "polygon")
+}
+
+fn is_allowed_mempool_ws_url(network: &str, url: &str) -> bool {
+    !matches!(network, "bsc" | "bnb")
+        || !url
+            .to_ascii_lowercase()
+            .contains("bnb-mainnet.g.alchemy.com")
 }
 
 fn infura_url_for_network(network: &str, key: &str) -> Option<String> {
