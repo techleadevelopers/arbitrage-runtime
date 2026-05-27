@@ -5,20 +5,44 @@ use crate::mev::adaptive::HistoricalOutcomeProfile;
 use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde::Serialize;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 use std::env;
+use std::future::Future;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 pub struct Storage {
-    conn: Arc<Mutex<Connection>>,
+    backend: StorageBackend,
     network: String,
 }
 
+#[derive(Clone)]
+enum StorageBackend {
+    Sqlite(Arc<Mutex<Connection>>),
+    Postgres(PgPool),
+}
+
 impl Storage {
-    pub fn new(path: &Path, network: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(path: &Path, network: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        if let Ok(database_url) = env::var("DATABASE_URL") {
+            let database_url = database_url.trim();
+            if !database_url.is_empty() {
+                let pool = PgPoolOptions::new()
+                    .max_connections(5)
+                    .connect(database_url)
+                    .await?;
+                Self::migrate_postgres(&pool).await?;
+                return Ok(Self {
+                    backend: StorageBackend::Postgres(pool),
+                    network: network.to_string(),
+                });
+            }
+        }
+
         let conn = Connection::open(path)?;
         conn.execute_batch(
             r#"
@@ -127,18 +151,139 @@ impl Storage {
         );
 
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            backend: StorageBackend::Sqlite(Arc::new(Mutex::new(conn))),
             network: network.to_string(),
         })
     }
 
+    async fn migrate_postgres(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS events (
+                id BIGSERIAL PRIMARY KEY,
+                at TEXT NOT NULL,
+                level TEXT NOT NULL,
+                message TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sweeps (
+                id BIGSERIAL PRIMARY KEY,
+                at TEXT NOT NULL,
+                wallet TEXT NOT NULL,
+                rpc TEXT,
+                status TEXT NOT NULL,
+                detail TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS telemetry (
+                id BIGSERIAL PRIMARY KEY,
+                at TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                duration_ms BIGINT NOT NULL,
+                wallet TEXT,
+                note TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS wallet_residual_stats (
+                wallet TEXT PRIMARY KEY,
+                last_seen_at TEXT NOT NULL,
+                asset_class TEXT NOT NULL,
+                detections BIGINT NOT NULL DEFAULT 0,
+                successful_sweeps BIGINT NOT NULL DEFAULT 0,
+                small_positive_detections BIGINT NOT NULL DEFAULT 0,
+                total_residual_wei TEXT NOT NULL DEFAULT '0',
+                detected_profit_wei TEXT NOT NULL DEFAULT '0',
+                realized_profit_wei TEXT NOT NULL DEFAULT '0'
+            );
+
+            CREATE TABLE IF NOT EXISTS relay_metrics (
+                relay TEXT PRIMARY KEY,
+                network TEXT NOT NULL DEFAULT 'unknown',
+                last_seen_at TEXT NOT NULL,
+                accepted BIGINT NOT NULL DEFAULT 0,
+                submit_failed BIGINT NOT NULL DEFAULT 0,
+                included_success BIGINT NOT NULL DEFAULT 0,
+                included_revert BIGINT NOT NULL DEFAULT 0,
+                not_included_timeout BIGINT NOT NULL DEFAULT 0,
+                submit_latency_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
+                finalization_latency_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
+                score DOUBLE PRECISION NOT NULL DEFAULT 0,
+                pressure DOUBLE PRECISION NOT NULL DEFAULT 0,
+                accept_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
+                inclusion_rate DOUBLE PRECISION NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS treasury_rebalance (
+                id BIGSERIAL PRIMARY KEY,
+                network TEXT NOT NULL DEFAULT 'unknown',
+                at TEXT NOT NULL,
+                executor_address TEXT NOT NULL,
+                vault_address TEXT NOT NULL,
+                profit_address TEXT NOT NULL,
+                balance_eth DOUBLE PRECISION NOT NULL,
+                min_buffer_eth DOUBLE PRECISION NOT NULL,
+                target_buffer_eth DOUBLE PRECISION NOT NULL,
+                max_buffer_eth DOUBLE PRECISION NOT NULL,
+                action TEXT NOT NULL,
+                recommended_amount_eth DOUBLE PRECISION NOT NULL,
+                status TEXT NOT NULL,
+                note TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS execution_outcomes (
+                id BIGSERIAL PRIMARY KEY,
+                network TEXT NOT NULL DEFAULT 'unknown',
+                at TEXT NOT NULL,
+                relay TEXT NOT NULL,
+                target_block BIGINT NOT NULL,
+                pair TEXT NOT NULL,
+                router TEXT NOT NULL,
+                token_in TEXT NOT NULL,
+                token_out TEXT NOT NULL,
+                victim_tx TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                expected_profit_eth DOUBLE PRECISION NOT NULL,
+                realized_profit_eth DOUBLE PRECISION NOT NULL,
+                gas_used BIGINT NOT NULL DEFAULT 0,
+                submit_latency_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
+                finalization_latency_ms DOUBLE PRECISION NOT NULL DEFAULT 0
+            );
+            "#,
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    fn wait<F, T>(future: F) -> Result<T, Box<dyn std::error::Error>>
+    where
+        F: Future<Output = Result<T, sqlx::Error>> + Send,
+        T: Send,
+    {
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::block_in_place(|| handle.block_on(future)).map_err(|err| err.into())
+    }
+
     pub fn log_event(&self, level: &str, message: &str) {
         let now = Utc::now().to_rfc3339();
-        if let Ok(conn) = self.conn.lock() {
-            let _ = conn.execute(
-                "INSERT INTO events (at, level, message) VALUES (?1, ?2, ?3)",
-                params![now, level, message],
-            );
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                if let Ok(conn) = conn.lock() {
+                    let _ = conn.execute(
+                        "INSERT INTO events (at, level, message) VALUES (?1, ?2, ?3)",
+                        params![now, level, message],
+                    );
+                }
+            }
+            StorageBackend::Postgres(pool) => {
+                let _ = Self::wait(
+                    sqlx::query("INSERT INTO events (at, level, message) VALUES ($1, $2, $3)")
+                        .bind(now)
+                        .bind(level.to_string())
+                        .bind(message.to_string())
+                        .execute(pool),
+                );
+            }
         }
     }
 
@@ -150,11 +295,28 @@ impl Storage {
         note: Option<&str>,
     ) {
         let now = Utc::now().to_rfc3339();
-        if let Ok(conn) = self.conn.lock() {
-            let _ = conn.execute(
-                "INSERT INTO telemetry (at, stage, duration_ms, wallet, note) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![now, stage, duration_ms as i64, wallet, note],
-            );
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                if let Ok(conn) = conn.lock() {
+                    let _ = conn.execute(
+                        "INSERT INTO telemetry (at, stage, duration_ms, wallet, note) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![now, stage, duration_ms as i64, wallet, note],
+                    );
+                }
+            }
+            StorageBackend::Postgres(pool) => {
+                let _ = Self::wait(
+                    sqlx::query(
+                        "INSERT INTO telemetry (at, stage, duration_ms, wallet, note) VALUES ($1, $2, $3, $4, $5)",
+                    )
+                    .bind(now)
+                    .bind(stage.to_string())
+                    .bind(duration_ms as i64)
+                    .bind(wallet.map(str::to_string))
+                    .bind(note.map(str::to_string))
+                    .execute(pool),
+                );
+            }
         }
     }
 
@@ -162,88 +324,172 @@ impl Storage {
         &self,
         limit: usize,
     ) -> Result<Vec<DashboardEvent>, Box<dyn std::error::Error>> {
-        let conn = self.conn.lock().map_err(|_| "storage lock poisoned")?;
-        let mut stmt =
-            conn.prepare("SELECT at, level, message FROM events ORDER BY id DESC LIMIT ?1")?;
-        let rows = stmt.query_map([limit as i64], |row| {
-            Ok(DashboardEvent {
-                at: row.get(0)?,
-                level: row.get(1)?,
-                message: row.get(2)?,
-            })
-        })?;
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                let conn = conn.lock().map_err(|_| "storage lock poisoned")?;
+                let mut stmt =
+                    conn.prepare("SELECT at, level, message FROM events ORDER BY id DESC LIMIT ?1")?;
+                let rows = stmt.query_map([limit as i64], |row| {
+                    Ok(DashboardEvent {
+                        at: row.get(0)?,
+                        level: row.get(1)?,
+                        message: row.get(2)?,
+                    })
+                })?;
 
-        let mut events = Vec::new();
-        for row in rows {
-            events.push(row?);
+                let mut events = Vec::new();
+                for row in rows {
+                    events.push(row?);
+                }
+                Ok(events)
+            }
+            StorageBackend::Postgres(pool) => {
+                let rows = Self::wait(
+                    sqlx::query("SELECT at, level, message FROM events ORDER BY id DESC LIMIT $1")
+                        .bind(limit as i64)
+                        .fetch_all(pool),
+                )?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| DashboardEvent {
+                        at: row.get("at"),
+                        level: row.get("level"),
+                        message: row.get("message"),
+                    })
+                    .collect())
+            }
         }
-        Ok(events)
     }
 
     pub fn sweep_counts(&self) -> Result<(u64, u64, u64), Box<dyn std::error::Error>> {
-        let conn = self.conn.lock().map_err(|_| "storage lock poisoned")?;
-        let attempted: u64 = conn.query_row("SELECT COUNT(*) FROM sweeps", [], |row| {
-            row.get::<_, u64>(0)
-        })?;
-        let succeeded: u64 = conn.query_row(
-            "SELECT COUNT(*) FROM sweeps WHERE status = 'success'",
-            [],
-            |row| row.get::<_, u64>(0),
-        )?;
-        let failed: u64 = conn.query_row(
-            "SELECT COUNT(*) FROM sweeps WHERE status = 'failed'",
-            [],
-            |row| row.get::<_, u64>(0),
-        )?;
-        Ok((attempted, succeeded, failed))
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                let conn = conn.lock().map_err(|_| "storage lock poisoned")?;
+                let attempted: u64 = conn.query_row("SELECT COUNT(*) FROM sweeps", [], |row| {
+                    row.get::<_, u64>(0)
+                })?;
+                let succeeded: u64 = conn.query_row(
+                    "SELECT COUNT(*) FROM sweeps WHERE status = 'success'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )?;
+                let failed: u64 = conn.query_row(
+                    "SELECT COUNT(*) FROM sweeps WHERE status = 'failed'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )?;
+                Ok((attempted, succeeded, failed))
+            }
+            StorageBackend::Postgres(pool) => {
+                let row = Self::wait(
+                    sqlx::query(
+                        r#"
+                        SELECT
+                            COUNT(*) AS attempted,
+                            COUNT(*) FILTER (WHERE status = 'success') AS succeeded,
+                            COUNT(*) FILTER (WHERE status = 'failed') AS failed
+                        FROM sweeps
+                        "#,
+                    )
+                    .fetch_one(pool),
+                )?;
+                Ok((
+                    row.get::<i64, _>("attempted") as u64,
+                    row.get::<i64, _>("succeeded") as u64,
+                    row.get::<i64, _>("failed") as u64,
+                ))
+            }
+        }
     }
 
     pub fn telemetry_summary(
         &self,
     ) -> Result<HashMap<String, (u64, u128, u128, u128)>, Box<dyn std::error::Error>> {
-        let conn = self.conn.lock().map_err(|_| "storage lock poisoned")?;
-        let mut summary = HashMap::new();
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                let conn = conn.lock().map_err(|_| "storage lock poisoned")?;
+                let mut summary = HashMap::new();
 
-        let mut stmt = conn.prepare(
-            "SELECT stage, COUNT(*), AVG(duration_ms), MAX(duration_ms)
-             FROM telemetry
-             GROUP BY stage",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, u64>(1)?,
-                row.get::<_, f64>(2)? as u128,
-                row.get::<_, i64>(3)? as u128,
-            ))
-        })?;
+                let mut stmt = conn.prepare(
+                    "SELECT stage, COUNT(*), AVG(duration_ms), MAX(duration_ms)
+                     FROM telemetry
+                     GROUP BY stage",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, f64>(2)? as u128,
+                        row.get::<_, i64>(3)? as u128,
+                    ))
+                })?;
 
-        for row in rows {
-            let (stage, samples, avg_ms, max_ms) = row?;
-            summary.insert(stage, (samples, 0, avg_ms, max_ms));
-        }
+                for row in rows {
+                    let (stage, samples, avg_ms, max_ms) = row?;
+                    summary.insert(stage, (samples, 0, avg_ms, max_ms));
+                }
 
-        let mut stmt = conn.prepare(
-            "SELECT t.stage, t.duration_ms
-             FROM telemetry t
-             INNER JOIN (
-                SELECT stage, MAX(id) AS last_id
-                FROM telemetry
-                GROUP BY stage
-             ) latest ON latest.stage = t.stage AND latest.last_id = t.id",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u128))
-        })?;
+                let mut stmt = conn.prepare(
+                    "SELECT t.stage, t.duration_ms
+                     FROM telemetry t
+                     INNER JOIN (
+                        SELECT stage, MAX(id) AS last_id
+                        FROM telemetry
+                        GROUP BY stage
+                     ) latest ON latest.stage = t.stage AND latest.last_id = t.id",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u128))
+                })?;
 
-        for row in rows {
-            let (stage, last_ms) = row?;
-            if let Some(entry) = summary.get_mut(&stage) {
-                entry.1 = last_ms;
+                for row in rows {
+                    let (stage, last_ms) = row?;
+                    if let Some(entry) = summary.get_mut(&stage) {
+                        entry.1 = last_ms;
+                    }
+                }
+
+                Ok(summary)
+            }
+            StorageBackend::Postgres(pool) => {
+                let mut summary = HashMap::new();
+                let rows = Self::wait(
+                    sqlx::query(
+                        "SELECT stage, COUNT(*) AS samples, AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms
+                         FROM telemetry
+                         GROUP BY stage",
+                    )
+                    .fetch_all(pool),
+                )?;
+                for row in rows {
+                    summary.insert(
+                        row.get::<String, _>("stage"),
+                        (
+                            row.get::<i64, _>("samples") as u64,
+                            0,
+                            row.get::<Option<f64>, _>("avg_ms").unwrap_or(0.0) as u128,
+                            row.get::<i64, _>("max_ms") as u128,
+                        ),
+                    );
+                }
+
+                let rows = Self::wait(
+                    sqlx::query(
+                        "SELECT DISTINCT ON (stage) stage, duration_ms
+                         FROM telemetry
+                         ORDER BY stage, id DESC",
+                    )
+                    .fetch_all(pool),
+                )?;
+                for row in rows {
+                    let stage = row.get::<String, _>("stage");
+                    if let Some(entry) = summary.get_mut(&stage) {
+                        entry.1 = row.get::<i64, _>("duration_ms") as u128;
+                    }
+                }
+                Ok(summary)
             }
         }
-
-        Ok(summary)
     }
 
     pub fn top_wallet_residuals(
@@ -251,33 +497,66 @@ impl Storage {
         limit: usize,
     ) -> Result<Vec<(String, String, u64, u64, String, String, String)>, Box<dyn std::error::Error>>
     {
-        let conn = self.conn.lock().map_err(|_| "storage lock poisoned")?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT wallet, asset_class, detections, successful_sweeps,
-                   detected_profit_wei, realized_profit_wei, last_seen_at
-            FROM wallet_residual_stats
-            ORDER BY CAST(detected_profit_wei AS INTEGER) DESC, detections DESC
-            LIMIT ?1
-            "#,
-        )?;
-        let rows = stmt.query_map([limit as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, u64>(2)?,
-                row.get::<_, u64>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-            ))
-        })?;
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                let conn = conn.lock().map_err(|_| "storage lock poisoned")?;
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT wallet, asset_class, detections, successful_sweeps,
+                           detected_profit_wei, realized_profit_wei, last_seen_at
+                    FROM wallet_residual_stats
+                    ORDER BY CAST(detected_profit_wei AS INTEGER) DESC, detections DESC
+                    LIMIT ?1
+                    "#,
+                )?;
+                let rows = stmt.query_map([limit as i64], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, u64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                })?;
 
-        let mut stats = Vec::new();
-        for row in rows {
-            stats.push(row?);
+                let mut stats = Vec::new();
+                for row in rows {
+                    stats.push(row?);
+                }
+                Ok(stats)
+            }
+            StorageBackend::Postgres(pool) => {
+                let rows = Self::wait(
+                    sqlx::query(
+                        r#"
+                        SELECT wallet, asset_class, detections, successful_sweeps,
+                               detected_profit_wei, realized_profit_wei, last_seen_at
+                        FROM wallet_residual_stats
+                        ORDER BY detected_profit_wei::numeric DESC, detections DESC
+                        LIMIT $1
+                        "#,
+                    )
+                    .bind(limit as i64)
+                    .fetch_all(pool),
+                )?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| {
+                        (
+                            row.get("wallet"),
+                            row.get("asset_class"),
+                            row.get::<i64, _>("detections") as u64,
+                            row.get::<i64, _>("successful_sweeps") as u64,
+                            row.get("detected_profit_wei"),
+                            row.get("realized_profit_wei"),
+                            row.get("last_seen_at"),
+                        )
+                    })
+                    .collect())
+            }
         }
-        Ok(stats)
     }
 
     pub fn record_relay_outcome(
@@ -296,57 +575,113 @@ impl Storage {
         inclusion_rate: Option<f64>,
     ) {
         let now = Utc::now().to_rfc3339();
-        if let Ok(conn) = self.conn.lock() {
-            let relay_key = self.scoped_relay(relay);
-            let _ = conn.execute(
-                r#"
-                INSERT INTO relay_metrics (
-                    relay, network, last_seen_at, accepted, submit_failed, included_success,
-                    included_revert, not_included_timeout, submit_latency_ms,
-                    finalization_latency_ms, score, pressure, accept_rate, inclusion_rate
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-                ON CONFLICT(relay) DO UPDATE SET
-                    network = excluded.network,
-                    last_seen_at = excluded.last_seen_at,
-                    accepted = relay_metrics.accepted + excluded.accepted,
-                    submit_failed = relay_metrics.submit_failed + excluded.submit_failed,
-                    included_success = relay_metrics.included_success + excluded.included_success,
-                    included_revert = relay_metrics.included_revert + excluded.included_revert,
-                    not_included_timeout = relay_metrics.not_included_timeout + excluded.not_included_timeout,
-                    submit_latency_ms = CASE
-                        WHEN excluded.submit_latency_ms > 0 AND relay_metrics.submit_latency_ms > 0
-                            THEN relay_metrics.submit_latency_ms * 0.8 + excluded.submit_latency_ms * 0.2
-                        WHEN excluded.submit_latency_ms > 0 THEN excluded.submit_latency_ms
-                        ELSE relay_metrics.submit_latency_ms
-                    END,
-                    finalization_latency_ms = CASE
-                        WHEN excluded.finalization_latency_ms > 0 AND relay_metrics.finalization_latency_ms > 0
-                            THEN relay_metrics.finalization_latency_ms * 0.8 + excluded.finalization_latency_ms * 0.2
-                        WHEN excluded.finalization_latency_ms > 0 THEN excluded.finalization_latency_ms
-                        ELSE relay_metrics.finalization_latency_ms
-                    END,
-                    score = CASE WHEN excluded.score > 0 THEN excluded.score ELSE relay_metrics.score END,
-                    pressure = CASE WHEN excluded.pressure > 0 THEN excluded.pressure ELSE relay_metrics.pressure END,
-                    accept_rate = CASE WHEN excluded.accept_rate > 0 THEN excluded.accept_rate ELSE relay_metrics.accept_rate END,
-                    inclusion_rate = CASE WHEN excluded.inclusion_rate > 0 THEN excluded.inclusion_rate ELSE relay_metrics.inclusion_rate END
-                "#,
-                params![
-                    relay_key,
-                    self.network,
-                    now,
-                    accepted as i64,
-                    submit_failed as i64,
-                    included_success as i64,
-                    included_revert as i64,
-                    not_included_timeout as i64,
-                    submit_latency_ms.unwrap_or(0.0),
-                    finalization_latency_ms.unwrap_or(0.0),
-                    score.unwrap_or(0.0),
-                    pressure.unwrap_or(0.0),
-                    accept_rate.unwrap_or(0.0),
-                    inclusion_rate.unwrap_or(0.0),
-                ],
-            );
+        let relay_key = self.scoped_relay(relay);
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                if let Ok(conn) = conn.lock() {
+                    let _ = conn.execute(
+                        r#"
+                        INSERT INTO relay_metrics (
+                            relay, network, last_seen_at, accepted, submit_failed, included_success,
+                            included_revert, not_included_timeout, submit_latency_ms,
+                            finalization_latency_ms, score, pressure, accept_rate, inclusion_rate
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                        ON CONFLICT(relay) DO UPDATE SET
+                            network = excluded.network,
+                            last_seen_at = excluded.last_seen_at,
+                            accepted = relay_metrics.accepted + excluded.accepted,
+                            submit_failed = relay_metrics.submit_failed + excluded.submit_failed,
+                            included_success = relay_metrics.included_success + excluded.included_success,
+                            included_revert = relay_metrics.included_revert + excluded.included_revert,
+                            not_included_timeout = relay_metrics.not_included_timeout + excluded.not_included_timeout,
+                            submit_latency_ms = CASE
+                                WHEN excluded.submit_latency_ms > 0 AND relay_metrics.submit_latency_ms > 0
+                                    THEN relay_metrics.submit_latency_ms * 0.8 + excluded.submit_latency_ms * 0.2
+                                WHEN excluded.submit_latency_ms > 0 THEN excluded.submit_latency_ms
+                                ELSE relay_metrics.submit_latency_ms
+                            END,
+                            finalization_latency_ms = CASE
+                                WHEN excluded.finalization_latency_ms > 0 AND relay_metrics.finalization_latency_ms > 0
+                                    THEN relay_metrics.finalization_latency_ms * 0.8 + excluded.finalization_latency_ms * 0.2
+                                WHEN excluded.finalization_latency_ms > 0 THEN excluded.finalization_latency_ms
+                                ELSE relay_metrics.finalization_latency_ms
+                            END,
+                            score = CASE WHEN excluded.score > 0 THEN excluded.score ELSE relay_metrics.score END,
+                            pressure = CASE WHEN excluded.pressure > 0 THEN excluded.pressure ELSE relay_metrics.pressure END,
+                            accept_rate = CASE WHEN excluded.accept_rate > 0 THEN excluded.accept_rate ELSE relay_metrics.accept_rate END,
+                            inclusion_rate = CASE WHEN excluded.inclusion_rate > 0 THEN excluded.inclusion_rate ELSE relay_metrics.inclusion_rate END
+                        "#,
+                        params![
+                            relay_key,
+                            self.network,
+                            now,
+                            accepted as i64,
+                            submit_failed as i64,
+                            included_success as i64,
+                            included_revert as i64,
+                            not_included_timeout as i64,
+                            submit_latency_ms.unwrap_or(0.0),
+                            finalization_latency_ms.unwrap_or(0.0),
+                            score.unwrap_or(0.0),
+                            pressure.unwrap_or(0.0),
+                            accept_rate.unwrap_or(0.0),
+                            inclusion_rate.unwrap_or(0.0),
+                        ],
+                    );
+                }
+            }
+            StorageBackend::Postgres(pool) => {
+                let _ = Self::wait(
+                    sqlx::query(
+                        r#"
+                        INSERT INTO relay_metrics (
+                            relay, network, last_seen_at, accepted, submit_failed, included_success,
+                            included_revert, not_included_timeout, submit_latency_ms,
+                            finalization_latency_ms, score, pressure, accept_rate, inclusion_rate
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                        ON CONFLICT(relay) DO UPDATE SET
+                            network = excluded.network,
+                            last_seen_at = excluded.last_seen_at,
+                            accepted = relay_metrics.accepted + excluded.accepted,
+                            submit_failed = relay_metrics.submit_failed + excluded.submit_failed,
+                            included_success = relay_metrics.included_success + excluded.included_success,
+                            included_revert = relay_metrics.included_revert + excluded.included_revert,
+                            not_included_timeout = relay_metrics.not_included_timeout + excluded.not_included_timeout,
+                            submit_latency_ms = CASE
+                                WHEN excluded.submit_latency_ms > 0 AND relay_metrics.submit_latency_ms > 0
+                                    THEN relay_metrics.submit_latency_ms * 0.8 + excluded.submit_latency_ms * 0.2
+                                WHEN excluded.submit_latency_ms > 0 THEN excluded.submit_latency_ms
+                                ELSE relay_metrics.submit_latency_ms
+                            END,
+                            finalization_latency_ms = CASE
+                                WHEN excluded.finalization_latency_ms > 0 AND relay_metrics.finalization_latency_ms > 0
+                                    THEN relay_metrics.finalization_latency_ms * 0.8 + excluded.finalization_latency_ms * 0.2
+                                WHEN excluded.finalization_latency_ms > 0 THEN excluded.finalization_latency_ms
+                                ELSE relay_metrics.finalization_latency_ms
+                            END,
+                            score = CASE WHEN excluded.score > 0 THEN excluded.score ELSE relay_metrics.score END,
+                            pressure = CASE WHEN excluded.pressure > 0 THEN excluded.pressure ELSE relay_metrics.pressure END,
+                            accept_rate = CASE WHEN excluded.accept_rate > 0 THEN excluded.accept_rate ELSE relay_metrics.accept_rate END,
+                            inclusion_rate = CASE WHEN excluded.inclusion_rate > 0 THEN excluded.inclusion_rate ELSE relay_metrics.inclusion_rate END
+                        "#,
+                    )
+                    .bind(relay_key)
+                    .bind(self.network.clone())
+                    .bind(now)
+                    .bind(accepted as i64)
+                    .bind(submit_failed as i64)
+                    .bind(included_success as i64)
+                    .bind(included_revert as i64)
+                    .bind(not_included_timeout as i64)
+                    .bind(submit_latency_ms.unwrap_or(0.0))
+                    .bind(finalization_latency_ms.unwrap_or(0.0))
+                    .bind(score.unwrap_or(0.0))
+                    .bind(pressure.unwrap_or(0.0))
+                    .bind(accept_rate.unwrap_or(0.0))
+                    .bind(inclusion_rate.unwrap_or(0.0))
+                    .execute(pool),
+                );
+            }
         }
     }
 
