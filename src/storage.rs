@@ -157,15 +157,16 @@ impl Storage {
     }
 
     async fn migrate_postgres(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> {
-        sqlx::query(
+        let statements = [
             r#"
             CREATE TABLE IF NOT EXISTS events (
                 id BIGSERIAL PRIMARY KEY,
                 at TEXT NOT NULL,
                 level TEXT NOT NULL,
                 message TEXT NOT NULL
-            );
-
+            )
+            "#,
+            r#"
             CREATE TABLE IF NOT EXISTS sweeps (
                 id BIGSERIAL PRIMARY KEY,
                 at TEXT NOT NULL,
@@ -173,8 +174,9 @@ impl Storage {
                 rpc TEXT,
                 status TEXT NOT NULL,
                 detail TEXT
-            );
-
+            )
+            "#,
+            r#"
             CREATE TABLE IF NOT EXISTS telemetry (
                 id BIGSERIAL PRIMARY KEY,
                 at TEXT NOT NULL,
@@ -182,8 +184,9 @@ impl Storage {
                 duration_ms BIGINT NOT NULL,
                 wallet TEXT,
                 note TEXT
-            );
-
+            )
+            "#,
+            r#"
             CREATE TABLE IF NOT EXISTS wallet_residual_stats (
                 wallet TEXT PRIMARY KEY,
                 last_seen_at TEXT NOT NULL,
@@ -194,8 +197,9 @@ impl Storage {
                 total_residual_wei TEXT NOT NULL DEFAULT '0',
                 detected_profit_wei TEXT NOT NULL DEFAULT '0',
                 realized_profit_wei TEXT NOT NULL DEFAULT '0'
-            );
-
+            )
+            "#,
+            r#"
             CREATE TABLE IF NOT EXISTS relay_metrics (
                 relay TEXT PRIMARY KEY,
                 network TEXT NOT NULL DEFAULT 'unknown',
@@ -211,8 +215,9 @@ impl Storage {
                 pressure DOUBLE PRECISION NOT NULL DEFAULT 0,
                 accept_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
                 inclusion_rate DOUBLE PRECISION NOT NULL DEFAULT 0
-            );
-
+            )
+            "#,
+            r#"
             CREATE TABLE IF NOT EXISTS treasury_rebalance (
                 id BIGSERIAL PRIMARY KEY,
                 network TEXT NOT NULL DEFAULT 'unknown',
@@ -228,8 +233,9 @@ impl Storage {
                 recommended_amount_eth DOUBLE PRECISION NOT NULL,
                 status TEXT NOT NULL,
                 note TEXT
-            );
-
+            )
+            "#,
+            r#"
             CREATE TABLE IF NOT EXISTS execution_outcomes (
                 id BIGSERIAL PRIMARY KEY,
                 network TEXT NOT NULL DEFAULT 'unknown',
@@ -247,11 +253,13 @@ impl Storage {
                 gas_used BIGINT NOT NULL DEFAULT 0,
                 submit_latency_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
                 finalization_latency_ms DOUBLE PRECISION NOT NULL DEFAULT 0
-            );
+            )
             "#,
-        )
-        .execute(pool)
-        .await?;
+        ];
+
+        for statement in statements {
+            sqlx::query(statement).execute(pool).await?;
+        }
         Ok(())
     }
 
