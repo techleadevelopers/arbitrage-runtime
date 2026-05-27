@@ -796,6 +796,7 @@ fn default_chain_id(network: &str) -> u64 {
 
 fn alchemy_url_for_network(network: &str, key: &str) -> Option<String> {
     match network {
+        "bsc" | "bnb" => Some(format!("https://bnb-mainnet.g.alchemy.com/v2/{key}")),
         "ethereum" => Some(format!("https://eth-mainnet.g.alchemy.com/v2/{key}")),
         "arbitrum" => Some(format!("https://arb-mainnet.g.alchemy.com/v2/{key}")),
         "polygon" => Some(format!("https://polygon-mainnet.g.alchemy.com/v2/{key}")),
@@ -805,6 +806,7 @@ fn alchemy_url_for_network(network: &str, key: &str) -> Option<String> {
 
 fn alchemy_ws_url_for_network(network: &str, key: &str) -> Option<String> {
     match network {
+        "bsc" | "bnb" => Some(format!("wss://bnb-mainnet.g.alchemy.com/v2/{key}")),
         "ethereum" => Some(format!("wss://eth-mainnet.g.alchemy.com/v2/{key}")),
         "arbitrum" => Some(format!("wss://arb-mainnet.g.alchemy.com/v2/{key}")),
         "polygon" => Some(format!("wss://polygon-mainnet.g.alchemy.com/v2/{key}")),
@@ -814,6 +816,7 @@ fn alchemy_ws_url_for_network(network: &str, key: &str) -> Option<String> {
 
 fn infura_url_for_network(network: &str, key: &str) -> Option<String> {
     match network {
+        "bsc" | "bnb" => Some(format!("https://bsc-mainnet.infura.io/v3/{key}")),
         "ethereum" => Some(format!("https://mainnet.infura.io/v3/{key}")),
         "arbitrum" => Some(format!("https://arbitrum-mainnet.infura.io/v3/{key}")),
         "polygon" => Some(format!("https://polygon-mainnet.infura.io/v3/{key}")),
