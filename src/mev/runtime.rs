@@ -465,6 +465,14 @@ fn connect_mempool_fan_in(
 ) -> mpsc::UnboundedReceiver<H256> {
     let (tx, rx) = mpsc::unbounded_channel();
     for ws_url in ws_urls.iter().cloned() {
+        if is_blocked_bnb_alchemy_ws(&ws_url) {
+            dashboard.event(
+                "warn",
+                "blocked bnb alchemy mempool ws; using configured non-alchemy feeds only"
+                    .to_string(),
+            );
+            continue;
+        }
         let tx = tx.clone();
         let dashboard = dashboard.clone();
         tokio::spawn(async move {
@@ -504,6 +512,12 @@ fn connect_mempool_fan_in(
         });
     }
     rx
+}
+
+fn is_blocked_bnb_alchemy_ws(url: &str) -> bool {
+    let normalized = url.to_ascii_lowercase();
+    normalized.starts_with("wss://bnb-mainnet.g.alchemy.com/")
+        || normalized.starts_with("wss://bnb-mainnet.g.alchemy.com:")
 }
 
 fn mark_seen_tx(
