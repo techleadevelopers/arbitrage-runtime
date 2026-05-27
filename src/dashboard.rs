@@ -11,6 +11,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, RwLock};
+use tower_http::cors::CorsLayer;
 
 #[derive(Clone)]
 pub struct DashboardHandle {
@@ -715,7 +716,8 @@ pub async fn run_server(
         .route("/js/radar.js", get(js_radar))
         .route("/api/status", get(status))
         .route("/api/export", get(status))
-        .with_state(dashboard);
+        .with_state(dashboard)
+        .layer(CorsLayer::permissive());
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     axum::serve(listener, app).await?;

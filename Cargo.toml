@@ -39,6 +39,7 @@ hex = "0.4"
 rand = "0.8"
 dotenvy = "0.15"
 axum = "0.7"
+tower-http = { version = "0.6", features = ["cors"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono"] }
 revm = { version = "3.5.0", default-features = false, features = ["std"] }
