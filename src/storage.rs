@@ -463,7 +463,11 @@ impl Storage {
                 let mut summary = HashMap::new();
                 let rows = Self::wait(
                     sqlx::query(
-                        "SELECT stage, COUNT(*) AS samples, AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms
+                        "SELECT
+                            stage,
+                            COUNT(*)::bigint AS samples,
+                            AVG(duration_ms)::double precision AS avg_ms,
+                            MAX(duration_ms)::bigint AS max_ms
                          FROM telemetry
                          GROUP BY stage",
                     )
@@ -471,11 +475,11 @@ impl Storage {
                 )?;
                 for row in rows {
                     summary.insert(
-                        row.get::<String, _>("stage"),
-                        (
-                            row.get::<i64, _>("samples") as u64,
-                            0,
-                            row.get::<Option<f64>, _>("avg_ms").unwrap_or(0.0) as u128,
+                            row.get::<String, _>("stage"),
+                            (
+                                row.get::<i64, _>("samples") as u64,
+                                0,
+                            row.try_get::<Option<f64>, _>("avg_ms")?.unwrap_or(0.0) as u128,
                             row.get::<i64, _>("max_ms") as u128,
                         ),
                     );
