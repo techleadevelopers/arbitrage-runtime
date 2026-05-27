@@ -865,8 +865,7 @@ async fn execute_payload_on_fork(
     let balance_delta = post_balance.saturating_sub(pre_balance);
     let gross_eth = if let Some(token_meta) = token_meta {
         let token_units = 10f64.powi(i32::from(token_meta.decimals));
-        balance_delta.to_string().parse::<f64>().unwrap_or(0.0) / token_units
-            * token_meta.price_eth
+        balance_delta.to_string().parse::<f64>().unwrap_or(0.0) / token_units * token_meta.price_eth
     } else {
         wei_to_eth_f64(balance_delta)
     };
