@@ -607,6 +607,7 @@ fn connect_mempool_fan_in(
         let tx = tx.clone();
         let dashboard = dashboard.clone();
         tokio::spawn(async move {
+            let mut reconnect_failures = 0u32;
             loop {
                 if dashboard.runtime_paused() {
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -614,6 +615,7 @@ fn connect_mempool_fan_in(
                 }
                 match Ws::connect(ws_url.clone()).await {
                     Ok(ws) => {
+                        reconnect_failures = 0;
                         dashboard.event("info", format!("mempool ws connected {}", ws_url));
                         let provider = Provider::new(ws);
                         let subscribe_result = provider.subscribe_pending_txs().await;
@@ -631,6 +633,7 @@ fn connect_mempool_fan_in(
                                     .event("warn", format!("mempool ws stream ended {}", ws_url));
                             }
                             Err(err) => {
+                                reconnect_failures = reconnect_failures.saturating_add(1);
                                 dashboard.event(
                                     "warn",
                                     format!("mempool ws subscribe failed {}: {}", ws_url, err),
@@ -639,17 +642,50 @@ fn connect_mempool_fan_in(
                         }
                     }
                     Err(err) => {
+                        reconnect_failures = reconnect_failures.saturating_add(1);
                         dashboard.event(
                             "warn",
                             format!("mempool ws connect failed {}: {}", ws_url, err),
                         );
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(900)).await;
+                let delay = mempool_ws_reconnect_delay(&ws_url, reconnect_failures);
+                if delay >= Duration::from_secs(10) {
+                    dashboard.event(
+                        "warn",
+                        format!(
+                            "mempool ws backoff {}s after {} failures {}",
+                            delay.as_secs(),
+                            reconnect_failures,
+                            ws_url
+                        ),
+                    );
+                }
+                tokio::time::sleep(delay).await;
             }
         });
     }
     rx
+}
+
+fn mempool_ws_reconnect_delay(ws_url: &str, failures: u32) -> Duration {
+    let base_ms = std::env::var("MEMPOOL_WS_RECONNECT_BASE_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(1_500);
+    let max_secs = std::env::var("MEMPOOL_WS_RECONNECT_MAX_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            if ws_url.to_ascii_lowercase().contains("alchemy.com") {
+                300
+            } else {
+                60
+            }
+        });
+    let exponent = failures.saturating_sub(1).min(7);
+    let delay_ms = base_ms.saturating_mul(2u64.saturating_pow(exponent));
+    Duration::from_millis(delay_ms).min(Duration::from_secs(max_secs))
 }
 
 fn is_blocked_bnb_alchemy_ws(url: &str) -> bool {
