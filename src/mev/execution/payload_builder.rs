@@ -362,6 +362,41 @@ impl PayloadBuilder {
         };
 
         let scavenger = config.mev.opportunity_mode() == OpportunityMode::Scavenger;
+        if scavenger {
+            let sample = EdgeMetadata {
+                victim_tx: String::new(),
+                selector: String::new(),
+                status: "blocked".to_string(),
+                reason: "v3 repayment model not unit-safe yet".to_string(),
+                route_kind: "v3".to_string(),
+                path: vec![format!("{:?}", input.token_out), format!("{:?}", input.token_in)],
+                hops: 1,
+                impacted_pools: vec![format!("{:?}", input.pair)],
+                slippage_window_score: 0.0,
+                pool_imbalance_score: 0.0,
+                cross_dex_deviation_bps: 0,
+                gas_estimate: 0,
+                simulated_extraction_native: 0.0,
+                best_size_bps: 0,
+                amount_in_wei: "0".to_string(),
+                amount_out_wei: "0".to_string(),
+                gross_edge_wei: "0".to_string(),
+                gross_edge_native: 0.0,
+                repayment_wei: "0".to_string(),
+                repayment_native: 0.0,
+                price_impact_bps: post_victim.slippage_impact_bps,
+                self_slippage_bps: 0,
+                pool: format!("{:?}", input.pair),
+                factory: format_optional_address(input.factory),
+                router: format!("{:?}", input.router),
+                token_in: format!("{:?}", input.token_in),
+                token_out: format!("{:?}", input.token_out),
+            };
+            return Err(payload_error_with_edge_sample(
+                "v3 scavenger payload disabled until repayment model is unit-safe",
+                Some(sample),
+            ));
+        }
         if post_victim.slippage_impact_bps > effective_payload_price_impact_cap_bps(config) {
             return Err(format!(
                 "victim price impact too high: {}bps",
