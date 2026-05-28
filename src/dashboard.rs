@@ -192,6 +192,7 @@ pub struct OpportunityFunnelSnapshot {
     pub pending_hashes_received: u64,
     pub tx_lookup_success: u64,
     pub tx_lookup_miss: u64,
+    pub tx_lookup_throttled: u64,
     pub decode_pass: u64,
     pub decode_reject: u64,
     pub block_lookup_success: u64,
@@ -670,6 +671,9 @@ impl DashboardHandle {
                 funnel.tx_lookup_success = funnel.tx_lookup_success.saturating_add(1)
             }
             "tx_lookup_miss" => funnel.tx_lookup_miss = funnel.tx_lookup_miss.saturating_add(1),
+            "tx_lookup_throttled" => {
+                funnel.tx_lookup_throttled = funnel.tx_lookup_throttled.saturating_add(1)
+            }
             "decode_pass" => funnel.decode_pass = funnel.decode_pass.saturating_add(1),
             "decode_reject" => funnel.decode_reject = funnel.decode_reject.saturating_add(1),
             "block_lookup_success" => {

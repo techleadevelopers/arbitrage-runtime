@@ -249,6 +249,97 @@ struct PendingHashTask {
     candidate_started: Instant,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RpcLookupPressure {
+    available_readers: usize,
+    rate_limited_readers: usize,
+    failing_readers: usize,
+}
+
+impl Default for RpcLookupPressure {
+    fn default() -> Self {
+        Self {
+            available_readers: 1,
+            rate_limited_readers: 0,
+            failing_readers: 0,
+        }
+    }
+}
+
+struct PendingLookupBackpressure {
+    window_started: Instant,
+    accepted_in_window: u64,
+    pressure_refreshed_at: Instant,
+    pressure: RpcLookupPressure,
+    dropped_since_event: u64,
+    last_event_at: Instant,
+}
+
+impl PendingLookupBackpressure {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            window_started: now,
+            accepted_in_window: 0,
+            pressure_refreshed_at: now - Duration::from_secs(2),
+            pressure: RpcLookupPressure::default(),
+            dropped_since_event: 0,
+            last_event_at: now,
+        }
+    }
+
+    fn should_enqueue(
+        &mut self,
+        config: &Config,
+        rpc_fleet: &RpcFleet,
+        queue_remaining: usize,
+        dashboard: &DashboardHandle,
+    ) -> bool {
+        let now = Instant::now();
+        if now.saturating_duration_since(self.window_started) >= Duration::from_secs(1) {
+            self.window_started = now;
+            self.accepted_in_window = 0;
+        }
+        if now.saturating_duration_since(self.pressure_refreshed_at) >= Duration::from_millis(900)
+        {
+            self.pressure = rpc_lookup_pressure(rpc_fleet);
+            self.pressure_refreshed_at = now;
+        }
+
+        let max_per_sec = effective_pending_lookup_budget(config, self.pressure);
+        let queue_soft_full = queue_remaining <= LOOKUP_DECODE_QUEUE_CAPACITY / 8;
+        let allowed = self.accepted_in_window < max_per_sec && !queue_soft_full;
+        if allowed {
+            self.accepted_in_window = self.accepted_in_window.saturating_add(1);
+            return true;
+        }
+
+        self.dropped_since_event = self.dropped_since_event.saturating_add(1);
+        dashboard.record_opportunity_funnel("tx_lookup_throttled");
+        dashboard.record_reject_reason(
+            "pending_lookup",
+            if queue_soft_full { "queue_backpressure" } else { "rpc_budget" },
+        );
+        if now.saturating_duration_since(self.last_event_at) >= Duration::from_secs(5) {
+            dashboard.event(
+                "warn",
+                format!(
+                    "pending lookup backpressure shed={} budget_per_sec={} available_rpc={} rate_limited_rpc={} failing_rpc={} queue_remaining={}",
+                    self.dropped_since_event,
+                    max_per_sec,
+                    self.pressure.available_readers,
+                    self.pressure.rate_limited_readers,
+                    self.pressure.failing_readers,
+                    queue_remaining,
+                ),
+            );
+            self.dropped_since_event = 0;
+            self.last_event_at = now;
+        }
+        false
+    }
+}
+
 struct LookupDecodedCandidate {
     tx: Transaction,
     signal: SwapSignal,
@@ -428,6 +519,7 @@ pub async fn run(
 
     let mut seen_hashes = HashSet::new();
     let mut seen_order = VecDeque::new();
+    let mut pending_lookup_backpressure = PendingLookupBackpressure::new();
 
     loop {
         tokio::select! {
@@ -441,6 +533,14 @@ pub async fn run(
                 }
                 if mark_seen_tx(&mut seen_hashes, &mut seen_order, tx_hash) {
                     dashboard.record_opportunity_funnel("pending_hashes_received");
+                    if !pending_lookup_backpressure.should_enqueue(
+                        &config,
+                        &rpc_fleet,
+                        lookup_decode_tx.capacity(),
+                        &dashboard,
+                    ) {
+                        continue;
+                    }
                     let _ = lookup_decode_tx
                         .send(PendingHashTask {
                             tx_hash,
@@ -739,6 +839,49 @@ fn pending_lookup_fanout() -> usize {
 }
 
 // NOVA FUNÇÃO auxiliar
+fn rpc_lookup_pressure(rpc_fleet: &RpcFleet) -> RpcLookupPressure {
+    let mut pressure = RpcLookupPressure::default();
+    pressure.available_readers = 0;
+    for endpoint in rpc_fleet.snapshot() {
+        if endpoint.disabled {
+            continue;
+        }
+        if endpoint.rate_limit_failures > 0 {
+            pressure.rate_limited_readers = pressure.rate_limited_readers.saturating_add(1);
+        }
+        if endpoint.failures > 0 || endpoint.timeout_failures > 0 || endpoint.stale_failures > 0 {
+            pressure.failing_readers = pressure.failing_readers.saturating_add(1);
+        }
+        if endpoint.cooldown_remaining_secs == 0 && endpoint.rate_limit_failures == 0 {
+            pressure.available_readers = pressure.available_readers.saturating_add(1);
+        }
+    }
+    pressure
+}
+
+fn effective_pending_lookup_budget(config: &Config, pressure: RpcLookupPressure) -> u64 {
+    let configured = std::env::var("MEV_PENDING_LOOKUP_MAX_PER_SEC")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let base = configured.unwrap_or_else(|| match config.mev.opportunity_mode() {
+        OpportunityMode::Conservative => 90,
+        OpportunityMode::Aggressive => 150,
+        OpportunityMode::Scavenger => 180,
+    });
+
+    let pressure_multiplier = if pressure.available_readers == 0 {
+        0.08
+    } else if pressure.available_readers <= 1 || pressure.rate_limited_readers > 0 {
+        0.35
+    } else if pressure.failing_readers > pressure.available_readers {
+        0.55
+    } else {
+        1.0
+    };
+
+    ((base as f64) * pressure_multiplier).round().max(10.0) as u64
+}
+
 async fn get_current_block_parallel(rpc_fleet: Arc<RpcFleet>) -> Option<u64> {
     let mut join_set = JoinSet::new();
     for handle in rpc_fleet.read_candidates(block_lookup_fanout()) {
