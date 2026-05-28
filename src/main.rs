@@ -251,6 +251,7 @@ async fn wallet_monitor_loop(
     dashboard: DashboardHandle,
 ) {
     let mut failure_streak = 0u32;
+    let mut next_sleep = std::time::Duration::from_secs(5);
 
     loop {
         let Some(endpoint) = rpc_fleet.read_candidates(1).into_iter().next() else {
@@ -301,6 +302,11 @@ async fn wallet_monitor_loop(
         if let Ok(balance) = executor_balance {
             let balance_eth = wei_to_eth_f64(balance);
             let status = executor_buffer_status(&config, balance_eth);
+            next_sleep = if status == "underfunded" {
+                std::time::Duration::from_secs(30)
+            } else {
+                std::time::Duration::from_secs(5)
+            };
             dashboard.set_executor_balance(balance_eth, status);
             snapshots.push(WalletSnapshot {
                 role: "executor".to_string(),
@@ -360,7 +366,7 @@ async fn wallet_monitor_loop(
             );
         }
         failure_streak = 0;
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(next_sleep).await;
     }
 }
 

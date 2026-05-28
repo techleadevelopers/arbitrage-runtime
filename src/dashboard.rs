@@ -184,6 +184,31 @@ pub struct ToxicitySnapshot {
     pub toxicity_score: f64,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OpportunityFunnelSnapshot {
+    pub pending_hashes_received: u64,
+    pub tx_lookup_success: u64,
+    pub tx_lookup_miss: u64,
+    pub decode_pass: u64,
+    pub decode_reject: u64,
+    pub block_lookup_success: u64,
+    pub block_lookup_fail: u64,
+    pub fast_preflight_pass: u64,
+    pub fast_preflight_reject: u64,
+    pub adaptive_preflight_pass: u64,
+    pub adaptive_preflight_reject: u64,
+    pub payload_built: u64,
+    pub payload_reject: u64,
+    pub ev_gate_pass: u64,
+    pub ev_gate_reject: u64,
+    pub adaptive_quote_pass: u64,
+    pub adaptive_quote_reject: u64,
+    pub execution_ready: u64,
+    pub submit_attempted: u64,
+    pub submit_succeeded: u64,
+    pub submit_failed: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DashboardState {
     pub runtime_mode: String,
@@ -226,6 +251,7 @@ pub struct DashboardState {
     pub recent_events: VecDeque<DashboardEvent>,
     pub latency_metrics: Vec<LatencyMetric>,
     pub latency_risk: LatencyRiskSnapshot,
+    pub opportunity_funnel: OpportunityFunnelSnapshot,
     pub reject_reasons: Vec<RejectReasonSnapshot>,
     pub relay_rankings: Vec<RelaySnapshot>,
     pub toxicity_profiles: Vec<ToxicitySnapshot>,
@@ -416,6 +442,7 @@ impl DashboardHandle {
                 recent_events,
                 latency_metrics,
                 latency_risk,
+                opportunity_funnel: OpportunityFunnelSnapshot::default(),
                 reject_reasons: Vec::new(),
                 relay_rankings,
                 toxicity_profiles,
@@ -558,6 +585,59 @@ impl DashboardHandle {
             .reject_reasons
             .sort_by(|left, right| right.count.cmp(&left.count));
         state.reject_reasons.truncate(8);
+    }
+
+    pub fn record_opportunity_funnel(&self, stage: &str) {
+        let mut state = self.inner.write().expect("dashboard state lock");
+        let funnel = &mut state.opportunity_funnel;
+        match stage {
+            "pending_hashes_received" => {
+                funnel.pending_hashes_received = funnel.pending_hashes_received.saturating_add(1)
+            }
+            "tx_lookup_success" => {
+                funnel.tx_lookup_success = funnel.tx_lookup_success.saturating_add(1)
+            }
+            "tx_lookup_miss" => funnel.tx_lookup_miss = funnel.tx_lookup_miss.saturating_add(1),
+            "decode_pass" => funnel.decode_pass = funnel.decode_pass.saturating_add(1),
+            "decode_reject" => funnel.decode_reject = funnel.decode_reject.saturating_add(1),
+            "block_lookup_success" => {
+                funnel.block_lookup_success = funnel.block_lookup_success.saturating_add(1)
+            }
+            "block_lookup_fail" => {
+                funnel.block_lookup_fail = funnel.block_lookup_fail.saturating_add(1)
+            }
+            "fast_preflight_pass" => {
+                funnel.fast_preflight_pass = funnel.fast_preflight_pass.saturating_add(1)
+            }
+            "fast_preflight_reject" => {
+                funnel.fast_preflight_reject = funnel.fast_preflight_reject.saturating_add(1)
+            }
+            "adaptive_preflight_pass" => {
+                funnel.adaptive_preflight_pass = funnel.adaptive_preflight_pass.saturating_add(1)
+            }
+            "adaptive_preflight_reject" => {
+                funnel.adaptive_preflight_reject = funnel.adaptive_preflight_reject.saturating_add(1)
+            }
+            "payload_built" => funnel.payload_built = funnel.payload_built.saturating_add(1),
+            "payload_reject" => funnel.payload_reject = funnel.payload_reject.saturating_add(1),
+            "ev_gate_pass" => funnel.ev_gate_pass = funnel.ev_gate_pass.saturating_add(1),
+            "ev_gate_reject" => funnel.ev_gate_reject = funnel.ev_gate_reject.saturating_add(1),
+            "adaptive_quote_pass" => {
+                funnel.adaptive_quote_pass = funnel.adaptive_quote_pass.saturating_add(1)
+            }
+            "adaptive_quote_reject" => {
+                funnel.adaptive_quote_reject = funnel.adaptive_quote_reject.saturating_add(1)
+            }
+            "execution_ready" => funnel.execution_ready = funnel.execution_ready.saturating_add(1),
+            "submit_attempted" => {
+                funnel.submit_attempted = funnel.submit_attempted.saturating_add(1)
+            }
+            "submit_succeeded" => {
+                funnel.submit_succeeded = funnel.submit_succeeded.saturating_add(1)
+            }
+            "submit_failed" => funnel.submit_failed = funnel.submit_failed.saturating_add(1),
+            _ => {}
+        }
     }
 
     pub fn set_relay_rankings(&self, relays: Vec<RelaySnapshot>) {

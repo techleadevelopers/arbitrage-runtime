@@ -413,6 +413,7 @@ pub async fn run(
                     last_profile_refresh = Instant::now();
                 }
                 if mark_seen_tx(&mut seen_hashes, &mut seen_order, tx_hash) {
+                    dashboard.record_opportunity_funnel("pending_hashes_received");
                     let _ = lookup_decode_tx
                         .send(PendingHashTask {
                             tx_hash,
@@ -597,9 +598,12 @@ async fn process_lookup_decode_task(
 ) -> Option<LookupDecodedCandidate> {
     let mut latency_trace = CandidateLatencyTrace::default();
     let lookup_started = Instant::now();
-    let tx = lookup_pending_tx_parallel(rpc_fleet.clone(), task.tx_hash).await?;
+    let Some(tx) = lookup_pending_tx_parallel(rpc_fleet.clone(), task.tx_hash).await else {
+        dashboard.record_opportunity_funnel("tx_lookup_miss");
+        return None;
+    };
+    dashboard.record_opportunity_funnel("tx_lookup_success");
     latency_trace.lookup_pending_tx_us = Some(elapsed_us(lookup_started));
-    let block_number = get_current_block_parallel(rpc_fleet.clone()).await?;
 
     dashboard.record_latency(
         "fee_pending_lookup",
@@ -619,10 +623,12 @@ async fn process_lookup_decode_task(
     ) else {
         latency_trace.decode_swap_us = Some(elapsed_us(decode_started));
         latency_trace.total_internal_us = Some(elapsed_us(task.candidate_started));
+        dashboard.record_opportunity_funnel("decode_reject");
         dashboard.record_reject_reason("decode", "not_relevant_or_below_min");
         latency_trace.emit(&config, &dashboard, task.tx_hash, "reject", "decode_no_signal");
         return None;
     };
+    dashboard.record_opportunity_funnel("decode_pass");
     latency_trace.decode_swap_us = Some(elapsed_us(decode_started));
 
     let hour_utc = chrono::Utc::now().hour() as u8;
@@ -640,11 +646,20 @@ async fn process_lookup_decode_task(
 
     let gas_price = tx.max_fee_per_gas.or(tx.gas_price).unwrap_or_default();
     if gas_price.is_zero() {
+        dashboard.record_opportunity_funnel("decode_reject");
         dashboard.record_reject_reason("decode", "zero_gas_price");
         latency_trace.total_internal_us = Some(elapsed_us(task.candidate_started));
         latency_trace.emit(&config, &dashboard, task.tx_hash, "reject", "zero_gas_price");
         return None;
     }
+
+    let Some(block_number) = get_current_block_parallel(rpc_fleet.clone()).await else {
+        dashboard.record_opportunity_funnel("block_lookup_fail");
+        latency_trace.total_internal_us = Some(elapsed_us(task.candidate_started));
+        latency_trace.emit(&config, &dashboard, task.tx_hash, "reject", "block_lookup");
+        return None;
+    };
+    dashboard.record_opportunity_funnel("block_lookup_success");
 
     let cluster = ClusterKey {
         router: signal.router,
@@ -678,7 +693,7 @@ fn pending_lookup_fanout() -> usize {
 // NOVA FUNÇÃO auxiliar
 async fn get_current_block_parallel(rpc_fleet: Arc<RpcFleet>) -> Option<u64> {
     let mut join_set = JoinSet::new();
-    for handle in rpc_fleet.read_candidates(3) {
+    for handle in rpc_fleet.read_candidates(block_lookup_fanout()) {
         let provider = handle.provider.clone();
         join_set.spawn(async move { provider.get_block_number().await.ok().map(|b| b.as_u64()) });
     }
@@ -690,6 +705,14 @@ async fn get_current_block_parallel(rpc_fleet: Arc<RpcFleet>) -> Option<u64> {
         }
     }
     None
+}
+
+fn block_lookup_fanout() -> usize {
+    std::env::var("MEV_BLOCK_LOOKUP_FANOUT")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, 3)
 }
 
 /// Valida uma oportunidade MEV usando um fork do estado atual da blockchain
@@ -812,6 +835,7 @@ async fn process_evaluation_task(
 
     if !fast_gate.should_continue {
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        dashboard.record_opportunity_funnel("fast_preflight_reject");
         if let Some(reason) = fast_gate.reject_reason {
             dashboard.record_reject_reason("fast_preflight", reason);
         }
@@ -824,6 +848,7 @@ async fn process_evaluation_task(
         );
         return None;
     }
+    dashboard.record_opportunity_funnel("fast_preflight_pass");
 
     if let Ok(mut model) = adaptive.lock() {
         model.observe_candidate_flow(
@@ -850,6 +875,7 @@ async fn process_evaluation_task(
     let preflight_override = should_override_preflight_reject(&config, &preflight);
     if !preflight.should_continue && !preflight_override {
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        dashboard.record_opportunity_funnel("adaptive_preflight_reject");
         if let Some(reason) = preflight.reject_reason {
             dashboard.record_reject_reason("preflight", reason);
         }
@@ -862,6 +888,7 @@ async fn process_evaluation_task(
         );
         return None;
     }
+    dashboard.record_opportunity_funnel("adaptive_preflight_pass");
     if !preflight.should_continue && preflight_override {
         dashboard.event(
             "warn",
@@ -878,7 +905,7 @@ async fn process_evaluation_task(
     }
 
     let payload_started = Instant::now();
-    let payload = build_payload_with_fallback_parallel(
+    let Some(payload) = build_payload_with_fallback_parallel(
         rpc_fleet.clone(),
         config.clone(),
         candidate.signal.clone(),
@@ -887,7 +914,15 @@ async fn process_evaluation_task(
         pool_cache.clone(),
         candidate.block_number,
     )
-    .await?;
+    .await
+    else {
+        dashboard.record_opportunity_funnel("payload_reject");
+        candidate.latency_trace.payload_build_us = Some(elapsed_us(payload_started));
+        candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        candidate.latency_trace.emit(&config, &dashboard, tx_hash, "reject", "payload_build");
+        return None;
+    };
+    dashboard.record_opportunity_funnel("payload_built");
     candidate.latency_trace.payload_build_us = Some(elapsed_us(payload_started));
 
     // WAR LEVEL: EVM preflight validation (opcional, ativado por env)
@@ -979,11 +1014,13 @@ async fn process_evaluation_task(
     ) {
         candidate.latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        dashboard.record_opportunity_funnel("ev_gate_reject");
         candidate
             .latency_trace
             .emit(&config, &dashboard, tx_hash, "reject", "ev_gate");
         return None;
     }
+    dashboard.record_opportunity_funnel("ev_gate_pass");
     candidate.latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
 
     let execution_cost_wei = candidate
@@ -1031,6 +1068,7 @@ async fn process_evaluation_task(
     let mode_override = should_override_adaptive_reject(&config, &quote);
     if !quote.should_execute && !mode_override {
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        dashboard.record_opportunity_funnel("adaptive_quote_reject");
         if let Some(reason) = quote.reject_reason {
             dashboard.record_reject_reason("adaptive", reason);
         }
@@ -1043,6 +1081,7 @@ async fn process_evaluation_task(
         );
         return None;
     }
+    dashboard.record_opportunity_funnel("adaptive_quote_pass");
     if !quote.should_execute && mode_override {
         dashboard.event(
             "warn",
@@ -1107,6 +1146,7 @@ async fn process_evaluation_task(
         "execution_ready",
         "adaptive_passed",
     );
+    dashboard.record_opportunity_funnel("execution_ready");
 
     Some(PendingExecutionCandidate {
         opportunity,

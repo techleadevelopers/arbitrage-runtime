@@ -1156,6 +1156,16 @@ The active runtime also emits operational events directly through the dashboard 
 - RPC submit failed
 - insufficient funds for gas/value during direct-RPC execution attempts
 
+The React operator panel can also call runtime control endpoints exposed by the backend:
+
+- `POST /api/events/clear` clears historical dashboard events.
+- `POST /api/opportunity-mode/:mode` switches the in-memory opportunity mode without changing `.env`.
+- `POST /api/opportunity-thresholds` updates the in-memory opportunity threshold floor values.
+- `POST /api/rpc/:id/enabled` enables or disables a single RPC endpoint.
+- `POST /api/rpc/only-getblock` disables all non-GetBlock endpoints for BNB operation.
+
+Runtime controls are not persistent. On restart or redeploy the process reads `.env` again. Use the panel for live tuning and the environment for boot defaults.
+
 The dashboard is intended for operational inspection, not public hosting.
 
 The static operational frontend lives under:
@@ -1200,6 +1210,15 @@ For BNB Chain configuration, use the `_BSC` suffix as the canonical operator-fac
 - `BUILDER_RELAYS`
 - `RPC_READ_PREFERENCE`
 - `RPC_SEND_PREFERENCE`
+- `MEV_PENDING_LOOKUP_FANOUT`
+
+`MEV_PENDING_LOOKUP_FANOUT` controls how many read RPC endpoints are queried for each pending transaction hash before decode. The default is `1`. Raising it to `2` or `3` can improve pending transaction hit rate, but it multiplies paid RPC usage and can trigger provider rate limits.
+
+The runtime tracks burst reservations per endpoint and decays failure counters over time. Short cooldowns or old provider errors should not permanently mark an endpoint as unusable. The operator panel reports:
+
+- `HEALTHY` for usable endpoints
+- `DEGRADED` for temporary cooldown, stale block age, or light failure pressure
+- `PENALIZED` for disabled endpoints or sustained rate-limit pressure
 
 ### Wallets
 
@@ -1211,6 +1230,7 @@ For BNB Chain configuration, use the `_BSC` suffix as the canonical operator-fac
 ### Engine thresholds
 
 - `MEV_ENGINE_ENABLED`
+- `MEV_OPPORTUNITY_MODE`
 - `MEV_CAPITAL_ETH`
 - `MEV_MIN_NET_PROFIT_ETH`
 - `MEV_MIN_PROFIT_USD`
@@ -1225,6 +1245,26 @@ For BNB Chain configuration, use the `_BSC` suffix as the canonical operator-fac
 - `MEV_SLIPPAGE_PROTECTION_BPS`
 - `MEV_ETH_USD_PRICE`
 - `MEV_MIN_LIQUIDITY_ETH`
+
+`MEV_OPPORTUNITY_MODE` controls the boot-time opportunity filter profile. Accepted values are:
+
+- `conservative`: current strict profile, lowest noise.
+- `balanced`: lower notional/profit/ROI floors and wider pending-age/impact tolerance.
+- `sangrento`: aggressive live profile with controlled preflight/adaptive overrides for apparently positive opportunities.
+
+The backend also accepts the aliases `safe`/`atual`, `medium`/`medio`, and `aggressive`/`bloody`. Quoted values such as `"conservative"` are accepted.
+
+The threshold variables ending in `_ETH` are legacy names for the native chain unit. On Polygon they are interpreted as `POL`; on BNB Chain they are interpreted as `BNB`.
+
+The panel's Settings page exposes live controls for:
+
+- opportunity mode
+- minimum swap size
+- minimum net profit
+- minimum USD EV floor
+- minimum liquidity
+
+These controls update runtime memory only. To keep a value after restart, set the corresponding environment variable.
 
 ### Expensive execution guardrails
 

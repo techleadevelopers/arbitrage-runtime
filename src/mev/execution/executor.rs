@@ -496,6 +496,7 @@ impl ExecutionEngine {
             let mut last_submit_error: Option<String> = None;
             let mut submit_set = JoinSet::new();
             for endpoint in submit_endpoints {
+                self.dashboard.record_opportunity_funnel("submit_attempted");
                 let tx = payload.tx.clone();
                 let endpoint_id = endpoint.id;
                 let endpoint_name = endpoint.name.clone();
@@ -552,6 +553,7 @@ impl ExecutionEngine {
                                 self.config.native_asset_symbol()
                             ),
                         );
+                        self.dashboard.record_opportunity_funnel("submit_succeeded");
                         submit_set.abort_all();
                         let realized = self
                             .observe_realized_pnl(
@@ -604,6 +606,7 @@ impl ExecutionEngine {
                         }
                         self.rpc_fleet
                             .record_failure(endpoint_id, RpcFleet::classify_failure(&err_text));
+                        self.dashboard.record_opportunity_funnel("submit_failed");
                         last_submit_error = Some(err_text);
                     }
                 }
@@ -644,6 +647,7 @@ impl ExecutionEngine {
                 }
             };
             let relay_signer = wallet.clone();
+            self.dashboard.record_opportunity_funnel("submit_attempted");
             let flashbots_client =
                 SignerMiddleware::new(send_context.endpoint.provider.clone(), wallet.clone());
             let flashbots = FlashbotsMiddleware::new(flashbots_client, relay_url, relay_signer);
@@ -684,6 +688,7 @@ impl ExecutionEngine {
                         accept_rate: Some(relay.accept_rate),
                         inclusion_rate: Some(relay.inclusion_rate),
                     });
+                    self.dashboard.record_opportunity_funnel("submit_succeeded");
                     self.dashboard.record_latency(
                         "fee_bundle_submit",
                         submit_latency_ms as u128,
@@ -728,6 +733,7 @@ impl ExecutionEngine {
                     return Ok(());
                 }
                 Err((relay, submit_latency_ms, err_text)) => {
+                    self.dashboard.record_opportunity_funnel("submit_failed");
                     warn!(
                         "fee extraction bundle failed via {}: {}",
                         relay.relay, err_text
