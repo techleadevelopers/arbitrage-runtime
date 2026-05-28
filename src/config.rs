@@ -232,16 +232,8 @@ impl Config {
         let max_infura_endpoints = env::var("MAX_INFURA_ENDPOINTS")
             .unwrap_or_else(|_| "2".to_string())
             .parse::<usize>()?;
-        let rpc_read_preference = parse_rpc_preference(
-            env::var("RPC_READ_PREFERENCE")
-                .unwrap_or_else(|_| "auto".to_string())
-                .trim(),
-        )?;
-        let rpc_send_preference = parse_rpc_preference(
-            env::var("RPC_SEND_PREFERENCE")
-                .unwrap_or_else(|_| "auto".to_string())
-                .trim(),
-        )?;
+        let rpc_read_preference = parse_network_rpc_preference(&network, "RPC_READ_PREFERENCE")?;
+        let rpc_send_preference = parse_network_rpc_preference(&network, "RPC_SEND_PREFERENCE")?;
         let storage_path = env::var("STORAGE_PATH")
             .unwrap_or_else(|_| "bot_state.sqlite".to_string())
             .into();
@@ -477,9 +469,10 @@ impl Config {
             }
         }
 
-        if let Some(filter) = rpc_provider_filter() {
+        if let Some(filter) = rpc_provider_filter(&self.network) {
             urls.retain(|(name, _)| rpc_name_matches_filter(name, &filter));
         }
+        urls.retain(|(name, _)| rpc_name_allowed_for_network(&self.network, name));
 
         urls
     }
@@ -854,10 +847,28 @@ fn parse_rpc_preference(value: &str) -> Result<RpcPreference, Box<dyn std::error
     }
 }
 
-fn rpc_provider_filter() -> Option<Vec<String>> {
-    let raw = env::var("RPC_PROVIDER_FILTER")
-        .or_else(|_| env::var("RPC_ENABLED_PROVIDERS"))
-        .ok()?;
+fn parse_network_rpc_preference(
+    network: &str,
+    base_name: &str,
+) -> Result<RpcPreference, Box<dyn std::error::Error>> {
+    let keys = network_env_keys(base_name);
+    for key in prioritized_network_key_names(network, &keys) {
+        if let Ok(value) = env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return parse_rpc_preference(trimmed);
+            }
+        }
+    }
+    Ok(RpcPreference::Auto)
+}
+
+fn rpc_provider_filter(network: &str) -> Option<Vec<String>> {
+    let mut keys = network_env_keys("RPC_PROVIDER_FILTER");
+    keys.extend(network_env_keys("RPC_ENABLED_PROVIDERS"));
+    let raw = prioritized_network_key_names(network, &keys)
+        .into_iter()
+        .find_map(|key| env::var(key).ok().filter(|value| !value.trim().is_empty()))?;
     let providers: Vec<String> = raw
         .split(',')
         .map(|value| value.trim().to_ascii_lowercase())
@@ -871,6 +882,60 @@ fn rpc_name_matches_filter(name: &str, providers: &[String]) -> bool {
     providers.iter().any(|provider| {
         lower == *provider || lower.starts_with(&format!("{provider}-"))
     })
+}
+
+fn rpc_name_allowed_for_network(network: &str, name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    match network {
+        "bsc" | "bnb" => lower.starts_with("getblock-"),
+        "polygon" => lower.starts_with("alchemy-") || lower.starts_with("infura-"),
+        _ => true,
+    }
+}
+
+fn network_env_keys(base_name: &str) -> Vec<String> {
+    [
+        format!("{base_name}_BSC"),
+        format!("{base_name}_BNB"),
+        format!("{base_name}_POLYGON"),
+        format!("{base_name}_ETHEREUM"),
+        format!("{base_name}_ARBITRUM"),
+        base_name.to_string(),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn prioritized_network_key_names(network: &str, keys: &[String]) -> Vec<String> {
+    let mut prioritized = Vec::new();
+    let suffixes: &[&str] = match network {
+        "bsc" => &["_BSC", "_BNB"],
+        "polygon" => &["_POLYGON"],
+        "ethereum" => &["_ETHEREUM"],
+        "arbitrum" => &["_ARBITRUM"],
+        _ => &[],
+    };
+
+    for suffix in suffixes {
+        for key in keys {
+            if key.ends_with(suffix) && !prioritized.contains(key) {
+                prioritized.push(key.clone());
+            }
+        }
+    }
+
+    for key in keys {
+        let is_network_specific = key.contains("_BSC")
+            || key.contains("_BNB")
+            || key.contains("_POLYGON")
+            || key.contains("_ETHEREUM")
+            || key.contains("_ARBITRUM");
+        if !is_network_specific && !prioritized.contains(key) {
+            prioritized.push(key.clone());
+        }
+    }
+
+    prioritized
 }
 
 fn parse_network_optional_u64(
