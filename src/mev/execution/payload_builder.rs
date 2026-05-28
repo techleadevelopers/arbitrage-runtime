@@ -4,7 +4,7 @@
 
 use crate::config::{Config, OpportunityMode};
 use crate::mev::amm::uniswap_v2::{
-    amount_out_exact_in, select_best_size_candidate, size_candidates, SizeCandidate,
+    amount_out_exact_in, select_best_size_candidate, SizeCandidate,
 };
 use crate::mev::amm::uniswap_v3::{
     select_best_v3_size_candidate, size_candidates_v3, V3PoolState, V3SizeCandidate,
@@ -115,23 +115,19 @@ impl PayloadBuilder {
             .saturating_mul(U256::from(config.mev.gas_safety_margin_bps))
             / U256::from(10_000u64);
 
-        let scavenger_zero_gas = U256::zero();
         let sizing_fractions: &[u64] = if scavenger {
             &[25, 50, 100, 200, 350, 500, 750, 1_000, 1_500]
         } else {
             &[1_000, 2_000, 3_500, 5_000, 7_500]
         };
-        let candidates = size_candidates(
+        let candidates = fee_extraction_v2_size_candidates(
             reserve_in,
             reserve_out,
             input.capital_available_wei,
-            if scavenger {
-                scavenger_zero_gas
-            } else {
-                gas_cost
-            },
+            gas_cost,
             pool_after.fee_bps,
             sizing_fractions,
+            scavenger,
         );
         let selected = if scavenger {
             select_scavenger_v2_candidate(&candidates)
@@ -386,6 +382,94 @@ fn select_scavenger_v2_candidate(candidates: &[SizeCandidate]) -> Option<SizeCan
                 && candidate.self_slippage_bps <= 2_500
         })
         .min_by_key(|candidate| candidate.amount_in)
+}
+
+fn fee_extraction_v2_size_candidates(
+    borrow_reserve: U256,
+    profit_reserve: U256,
+    capital_cap: U256,
+    gas_cost_wei: U256,
+    fee_bps: u64,
+    fractions_bps: &[u64],
+    scavenger: bool,
+) -> Vec<SizeCandidate> {
+    if capital_cap.is_zero() || borrow_reserve.is_zero() || profit_reserve.is_zero() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::with_capacity(fractions_bps.len());
+    for &bps in fractions_bps {
+        let amount_in = capital_cap.saturating_mul(U256::from(bps)) / U256::from(10_000u64);
+        if amount_in.is_zero() || amount_in >= borrow_reserve {
+            continue;
+        }
+        let Some(amount_out) = amount_out_exact_in(amount_in, borrow_reserve, profit_reserve, fee_bps)
+        else {
+            continue;
+        };
+        let Some(repayment_in_profit_token) =
+            v2_repayment_amount_in_profit_token(borrow_reserve, profit_reserve, amount_in)
+        else {
+            continue;
+        };
+        let gross = amount_out.saturating_sub(repayment_in_profit_token);
+        let net = if scavenger {
+            gross
+        } else {
+            gross.saturating_sub(gas_cost_wei)
+        };
+        if net.is_zero() {
+            continue;
+        }
+        let roi_bps = if repayment_in_profit_token.is_zero() {
+            0
+        } else {
+            (net.saturating_mul(U256::from(10_000u64)) / repayment_in_profit_token)
+                .min(U256::from(u64::MAX))
+                .as_u64()
+        };
+        candidates.push(SizeCandidate {
+            capital_fraction_bps: bps,
+            amount_in,
+            amount_out,
+            gross_profit_wei: gross,
+            net_profit_wei: net,
+            roi_bps,
+            self_slippage_bps: crate::mev::amm::uniswap_v2::price_impact_bps(
+                amount_in,
+                amount_out,
+                borrow_reserve,
+                profit_reserve,
+            ),
+        });
+    }
+    candidates
+}
+
+fn v2_repayment_amount_in_profit_token(
+    borrow_reserve: U256,
+    profit_reserve: U256,
+    borrowed_amount: U256,
+) -> Option<U256> {
+    if borrowed_amount.is_zero()
+        || borrow_reserve.is_zero()
+        || profit_reserve.is_zero()
+        || borrowed_amount >= borrow_reserve
+    {
+        return None;
+    }
+
+    let numerator = profit_reserve
+        .saturating_mul(borrowed_amount)
+        .saturating_mul(U256::from(1_000u64));
+    let denominator = borrow_reserve
+        .saturating_sub(borrowed_amount)
+        .saturating_mul(U256::from(997u64));
+    if denominator.is_zero() {
+        None
+    } else {
+        Some(numerator / denominator + U256::from(1u64))
+    }
 }
 
 fn select_scavenger_v3_candidate(candidates: &[V3SizeCandidate]) -> Option<V3SizeCandidate> {

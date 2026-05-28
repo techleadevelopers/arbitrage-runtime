@@ -1586,6 +1586,8 @@ fn human_payload_error(error: &str) -> String {
         "pool not found"
     } else if lower.contains("failed to fetch pool state") {
         "pool state unavailable"
+    } else if lower.contains("no positive gross") {
+        "no exploitable micro edge"
     } else if lower.contains("no roi-positive") {
         "no profitable size after gas"
     } else if lower.contains("below minimum") {
