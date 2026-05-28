@@ -133,15 +133,16 @@ impl PayloadBuilder {
             10_000u64.saturating_sub(config.mev.slippage_protection_bps),
         )) / U256::from(10_000u64);
         let price_impact_bps = post_victim.slippage_impact_bps;
-        let min_profit_wei = ethers::utils::parse_ether(config.mev.min_net_profit_eth.to_string())
-            .map_err(|err| err.to_string())?;
+        let min_profit_eth = config.mev.effective_min_net_profit_eth();
+        let min_profit_wei =
+            ethers::utils::parse_ether(min_profit_eth.to_string()).map_err(|err| err.to_string())?;
 
         if simulated_profit_wei < min_profit_wei {
             return Err(format!(
                 "simulated profit {:.6} {} below minimum {:.6} {}",
                 wei_to_eth_f64(simulated_profit_wei),
                 config.native_asset_symbol(),
-                config.mev.min_net_profit_eth,
+                min_profit_eth,
                 config.native_asset_symbol()
             ));
         }
@@ -262,15 +263,16 @@ impl PayloadBuilder {
             10_000u64.saturating_sub(config.mev.slippage_protection_bps),
         )) / U256::from(10_000u64);
         let price_impact_bps = post_victim.slippage_impact_bps;
-        let min_profit_wei = ethers::utils::parse_ether(config.mev.min_net_profit_eth.to_string())
-            .map_err(|err| err.to_string())?;
+        let min_profit_eth = config.mev.effective_min_net_profit_eth();
+        let min_profit_wei =
+            ethers::utils::parse_ether(min_profit_eth.to_string()).map_err(|err| err.to_string())?;
 
         if simulated_profit_wei < min_profit_wei {
             return Err(format!(
                 "simulated v3 profit {:.6} {} below minimum {:.6} {}",
                 wei_to_eth_f64(simulated_profit_wei),
                 config.native_asset_symbol(),
-                config.mev.min_net_profit_eth,
+                min_profit_eth,
                 config.native_asset_symbol()
             ));
         }

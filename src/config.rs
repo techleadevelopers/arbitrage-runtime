@@ -610,6 +610,24 @@ fn apply_replay_tuned_runtime_env() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 impl MevConfig {
+    pub fn runtime_thresholds(&self) -> OpportunityThresholds {
+        self.runtime_thresholds
+            .read()
+            .map(|guard| *guard)
+            .unwrap_or(OpportunityThresholds {
+                min_large_swap_eth: self.min_large_swap_eth,
+                min_net_profit_eth: self.min_net_profit_eth,
+                min_profit_usd: self.min_profit_usd,
+                min_liquidity_eth: self.min_liquidity_eth,
+            })
+    }
+
+    pub fn set_runtime_thresholds(&self, thresholds: OpportunityThresholds) {
+        if let Ok(mut guard) = self.runtime_thresholds.write() {
+            *guard = thresholds;
+        }
+    }
+
     pub fn opportunity_mode(&self) -> OpportunityMode {
         self.opportunity_mode
             .read()
@@ -618,30 +636,37 @@ impl MevConfig {
     }
 
     pub fn effective_min_large_swap_eth(&self) -> f64 {
+        let base = self.runtime_thresholds().min_large_swap_eth;
         match self.opportunity_mode() {
-            OpportunityMode::Conservative => self.min_large_swap_eth,
-            OpportunityMode::Balanced => self.min_large_swap_eth * 0.35,
-            OpportunityMode::Aggressive => self.min_large_swap_eth * 0.12,
+            OpportunityMode::Conservative => base,
+            OpportunityMode::Balanced => base * 0.35,
+            OpportunityMode::Aggressive => base * 0.12,
         }
         .max(0.000_001)
     }
 
     pub fn effective_min_net_profit_eth(&self) -> f64 {
+        let base = self.runtime_thresholds().min_net_profit_eth;
         match self.opportunity_mode() {
-            OpportunityMode::Conservative => self.min_net_profit_eth,
-            OpportunityMode::Balanced => self.min_net_profit_eth * 0.40,
-            OpportunityMode::Aggressive => self.min_net_profit_eth * 0.15,
+            OpportunityMode::Conservative => base,
+            OpportunityMode::Balanced => base * 0.40,
+            OpportunityMode::Aggressive => base * 0.15,
         }
         .max(0.000_000_1)
     }
 
     pub fn effective_min_profit_usd(&self) -> f64 {
+        let base = self.runtime_thresholds().min_profit_usd;
         match self.opportunity_mode() {
-            OpportunityMode::Conservative => self.min_profit_usd,
-            OpportunityMode::Balanced => self.min_profit_usd * 0.35,
-            OpportunityMode::Aggressive => self.min_profit_usd * 0.10,
+            OpportunityMode::Conservative => base,
+            OpportunityMode::Balanced => base * 0.35,
+            OpportunityMode::Aggressive => base * 0.10,
         }
         .max(0.000_001)
+    }
+
+    pub fn effective_min_liquidity_eth(&self) -> f64 {
+        self.runtime_thresholds().min_liquidity_eth.max(0.000_001)
     }
 
     pub fn effective_min_roi_bps(&self) -> u64 {

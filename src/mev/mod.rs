@@ -28,10 +28,10 @@ pub async fn run(
             config.network,
             config.mev.capital_eth,
             config.native_asset_symbol(),
-            config.mev.min_net_profit_eth,
+            config.mev.effective_min_net_profit_eth(),
             config.native_asset_symbol(),
             config.mev.max_gas_per_tx,
-            config.mev.min_liquidity_eth,
+            config.mev.effective_min_liquidity_eth(),
             config.native_asset_symbol(),
         ),
     );

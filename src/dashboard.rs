@@ -1,4 +1,4 @@
-use crate::config::{parse_opportunity_mode, Config, OpportunityMode};
+use crate::config::{parse_opportunity_mode, Config, OpportunityMode, OpportunityThresholds};
 use crate::rpc::{RpcEndpointSnapshot, RpcFleet};
 use crate::storage::Storage;
 use axum::extract::{Path, State};
@@ -20,6 +20,7 @@ pub struct DashboardHandle {
     storage: Storage,
     rpc_fleet: Arc<RpcFleet>,
     opportunity_mode: Arc<RwLock<OpportunityMode>>,
+    runtime_thresholds: Arc<RwLock<OpportunityThresholds>>,
     pending: Arc<Mutex<PendingStorageWrites>>,
 }
 
@@ -196,6 +197,8 @@ pub struct DashboardState {
     pub profit_address: String,
     pub min_candidate_eth: String,
     pub min_net_profit_eth: String,
+    pub min_profit_usd: String,
+    pub min_liquidity_eth: String,
     pub executor_min_buffer_eth: String,
     pub executor_target_buffer_eth: String,
     pub executor_max_buffer_eth: String,
@@ -277,6 +280,21 @@ struct OpportunityModeResponse {
     ok: bool,
     mode: String,
     message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpportunityThresholdRequest {
+    min_large_swap_eth: Option<f64>,
+    min_net_profit_eth: Option<f64>,
+    min_profit_usd: Option<f64>,
+    min_liquidity_eth: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpportunityThresholdResponse {
+    ok: bool,
+    message: String,
+    thresholds: OpportunityThresholds,
 }
 
 impl DashboardHandle {
@@ -367,8 +385,10 @@ impl DashboardHandle {
                 vault_address: format!("{:?}", config.vault_address),
                 executor_address: format!("{:?}", config.executor_address),
                 profit_address: format!("{:?}", config.profit_address),
-                min_candidate_eth: config.mev.min_large_swap_eth.to_string(),
-                min_net_profit_eth: config.mev.min_net_profit_eth.to_string(),
+                min_candidate_eth: config.mev.runtime_thresholds().min_large_swap_eth.to_string(),
+                min_net_profit_eth: config.mev.runtime_thresholds().min_net_profit_eth.to_string(),
+                min_profit_usd: config.mev.runtime_thresholds().min_profit_usd.to_string(),
+                min_liquidity_eth: config.mev.runtime_thresholds().min_liquidity_eth.to_string(),
                 executor_min_buffer_eth: format!("{:.4}", config.mev.executor_min_buffer_eth),
                 executor_target_buffer_eth: format!("{:.4}", config.mev.executor_target_buffer_eth),
                 executor_max_buffer_eth: format!("{:.4}", config.mev.executor_max_buffer_eth),
@@ -405,6 +425,7 @@ impl DashboardHandle {
             storage,
             rpc_fleet,
             opportunity_mode: config.mev.opportunity_mode.clone(),
+            runtime_thresholds: config.mev.runtime_thresholds.clone(),
             pending: Arc::new(Mutex::new(PendingStorageWrites::default())),
         }
     }
@@ -462,6 +483,12 @@ impl DashboardHandle {
             .read()
             .map(|mode| mode.as_str().to_string())
             .unwrap_or_else(|_| "conservative".to_string());
+        if let Ok(thresholds) = self.runtime_thresholds.read() {
+            state.min_candidate_eth = thresholds.min_large_swap_eth.to_string();
+            state.min_net_profit_eth = thresholds.min_net_profit_eth.to_string();
+            state.min_profit_usd = thresholds.min_profit_usd.to_string();
+            state.min_liquidity_eth = thresholds.min_liquidity_eth.to_string();
+        }
         state.latency_risk = build_latency_risk(
             self.storage.telemetry_window_summary(300).unwrap_or_default(),
             &state.rpc_endpoints,
@@ -792,6 +819,7 @@ pub async fn run_server(
         .route("/api/rpc/only-getblock", post(only_getblock))
         .route("/api/events/clear", post(clear_events))
         .route("/api/opportunity-mode/{mode}", post(set_opportunity_mode))
+        .route("/api/opportunity-thresholds", post(set_opportunity_thresholds))
         .with_state(dashboard)
         .layer(CorsLayer::permissive());
 
@@ -957,6 +985,79 @@ async fn set_opportunity_mode(
             }),
         ),
     }
+}
+
+async fn set_opportunity_thresholds(
+    State(dashboard): State<DashboardHandle>,
+    Json(request): Json<OpportunityThresholdRequest>,
+) -> impl IntoResponse {
+    let current = dashboard
+        .runtime_thresholds
+        .read()
+        .map(|thresholds| *thresholds)
+        .unwrap_or(OpportunityThresholds {
+            min_large_swap_eth: 25.0,
+            min_net_profit_eth: 0.0025,
+            min_profit_usd: 2.0,
+            min_liquidity_eth: 25.0,
+        });
+    let next = OpportunityThresholds {
+        min_large_swap_eth: request
+            .min_large_swap_eth
+            .unwrap_or(current.min_large_swap_eth),
+        min_net_profit_eth: request
+            .min_net_profit_eth
+            .unwrap_or(current.min_net_profit_eth),
+        min_profit_usd: request.min_profit_usd.unwrap_or(current.min_profit_usd),
+        min_liquidity_eth: request
+            .min_liquidity_eth
+            .unwrap_or(current.min_liquidity_eth),
+    };
+
+    if next.min_large_swap_eth <= 0.0
+        || next.min_net_profit_eth <= 0.0
+        || next.min_profit_usd <= 0.0
+        || next.min_liquidity_eth <= 0.0
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(OpportunityThresholdResponse {
+                ok: false,
+                message: "threshold values must be positive".to_string(),
+                thresholds: current,
+            }),
+        );
+    }
+
+    if let Ok(mut guard) = dashboard.runtime_thresholds.write() {
+        *guard = next;
+    }
+    {
+        let mut state = dashboard.inner.write().expect("dashboard state lock");
+        state.min_candidate_eth = next.min_large_swap_eth.to_string();
+        state.min_net_profit_eth = next.min_net_profit_eth.to_string();
+        state.min_profit_usd = next.min_profit_usd.to_string();
+        state.min_liquidity_eth = next.min_liquidity_eth.to_string();
+    }
+    dashboard.event(
+        "warn",
+        format!(
+            "opportunity thresholds updated min_swap={:.6} min_profit={:.8} min_usd={:.4} min_liquidity={:.6}",
+            next.min_large_swap_eth,
+            next.min_net_profit_eth,
+            next.min_profit_usd,
+            next.min_liquidity_eth
+        ),
+    );
+
+    (
+        StatusCode::OK,
+        Json(OpportunityThresholdResponse {
+            ok: true,
+            message: "opportunity thresholds updated".to_string(),
+            thresholds: next,
+        }),
+    )
 }
 
 fn push_event(queue: &mut VecDeque<DashboardEvent>, level: &str, message: String) {
