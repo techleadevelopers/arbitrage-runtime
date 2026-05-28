@@ -1280,6 +1280,79 @@ async fn process_evaluation_task(
         }
     }
 
+    if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
+        let sanity_started = Instant::now();
+        if let Err(reason) = passes_scavenger_sanity_gate(&config, &payload, candidate.lookup_latency) {
+            candidate.latency_trace.ev_gate_us = Some(elapsed_us(sanity_started));
+            candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+            dashboard.record_opportunity_funnel("ev_gate_reject");
+            dashboard.record_reject_reason("scavenger_sanity", reason);
+            candidate
+                .latency_trace
+                .emit(&config, &dashboard, tx_hash, "reject", reason);
+            return None;
+        }
+        candidate.latency_trace.ev_gate_us = Some(elapsed_us(sanity_started));
+        candidate.latency_trace.quality_gate_us = Some(0);
+        candidate.latency_trace.adaptive_quote_us = Some(0);
+        dashboard.record_opportunity_funnel("ev_gate_pass");
+        dashboard.record_opportunity_funnel("adaptive_quote_pass");
+
+        let expected_profit_usd =
+            wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price;
+        let opportunity = build_opportunity(&candidate.tx, &candidate.signal, payload, None);
+        let capital_efficiency = opportunity
+            .execution_payload
+            .as_ref()
+            .map(|payload| {
+                let capital_eth = wei_to_eth_f64(payload.capital_committed_wei).max(1e-9);
+                (expected_profit_usd / capital_eth).max(0.0) / config.mev.eth_usd_price.max(1.0)
+            })
+            .unwrap_or_default()
+            .clamp(0.0, 1.0);
+
+        candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        candidate.latency_trace.emit(
+            &config,
+            &dashboard,
+            tx_hash,
+            "execution_ready",
+            "scavenger_sanity_fast_path",
+        );
+        dashboard.record_opportunity_funnel("execution_ready");
+        dashboard.event(
+            "info",
+            format!(
+                "scavenger execution ready tx={} try_score={:.2} gross={:.6}{} impact={}bps path_len={} gate=sanity",
+                short_hash(tx_hash),
+                fast_gate.scavenger_try_score,
+                wei_to_eth_f64(
+                    opportunity
+                        .execution_payload
+                        .as_ref()
+                        .map(|payload| payload.expected_profit_wei)
+                        .unwrap_or_default()
+                ),
+                config.native_asset_symbol(),
+                opportunity
+                    .execution_payload
+                    .as_ref()
+                    .map(|payload| payload.price_impact_bps)
+                    .unwrap_or_default(),
+                candidate.signal.path_len()
+            ),
+        );
+
+        return Some(PendingExecutionCandidate {
+            opportunity,
+            ev_real_usd: expected_profit_usd,
+            p_positive: (0.45 + fast_gate.scavenger_try_score * 0.50).clamp(0.05, 0.98),
+            capital_efficiency,
+            relay_score: fast_gate.gas_ratio.clamp(0.0, 1.0),
+            context_priority_score: candidate.context_signal.priority_score,
+        });
+    }
+
     let ev_gate_started = Instant::now();
     if !passes_ev_gate(
         &config,
@@ -1315,65 +1388,6 @@ async fn process_evaluation_task(
         return None;
     }
     candidate.latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
-
-    if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
-        candidate.latency_trace.adaptive_quote_us = Some(0);
-        dashboard.record_opportunity_funnel("adaptive_quote_pass");
-
-        let expected_profit_usd =
-            wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price;
-        let opportunity = build_opportunity(&candidate.tx, &candidate.signal, payload, None);
-        let capital_efficiency = opportunity
-            .execution_payload
-            .as_ref()
-            .map(|payload| {
-                let capital_eth = wei_to_eth_f64(payload.capital_committed_wei).max(1e-9);
-                (expected_profit_usd / capital_eth).max(0.0) / config.mev.eth_usd_price.max(1.0)
-            })
-            .unwrap_or_default()
-            .clamp(0.0, 1.0);
-
-        candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
-        candidate.latency_trace.emit(
-            &config,
-            &dashboard,
-            tx_hash,
-            "execution_ready",
-            "scavenger_fast_path",
-        );
-        dashboard.record_opportunity_funnel("execution_ready");
-        dashboard.event(
-            "info",
-            format!(
-                "scavenger execution ready tx={} try_score={:.2} gross={:.6}{} impact={}bps path_len={}",
-                short_hash(tx_hash),
-                fast_gate.scavenger_try_score,
-                wei_to_eth_f64(
-                    opportunity
-                        .execution_payload
-                        .as_ref()
-                        .map(|payload| payload.expected_profit_wei)
-                        .unwrap_or_default()
-                ),
-                config.native_asset_symbol(),
-                opportunity
-                    .execution_payload
-                    .as_ref()
-                    .map(|payload| payload.price_impact_bps)
-                    .unwrap_or_default(),
-                candidate.signal.path_len()
-            ),
-        );
-
-        return Some(PendingExecutionCandidate {
-            opportunity,
-            ev_real_usd: expected_profit_usd,
-            p_positive: (0.45 + fast_gate.scavenger_try_score * 0.50).clamp(0.05, 0.98),
-            capital_efficiency,
-            relay_score: fast_gate.gas_ratio.clamp(0.0, 1.0),
-            context_priority_score: candidate.context_signal.priority_score,
-        });
-    }
 
     let adaptive_quote_started = Instant::now();
     let quote = if let Ok(mut model) = adaptive.lock() {
@@ -1536,6 +1550,37 @@ pub(crate) fn passes_quality_gate(
         * 100.0)
         .clamp(0.0, 100.0) as u16;
     roi >= config.mev.effective_min_roi_bps() && impact_score <= 100
+}
+
+fn passes_scavenger_sanity_gate(
+    config: &Config,
+    payload: &crate::mev::execution::payload_builder::ExecutionPayload,
+    lookup_latency: std::time::Duration,
+) -> Result<(), &'static str> {
+    if payload.tx.is_empty() || payload.calldata.is_empty() {
+        return Err("scavenger_empty_payload");
+    }
+    if payload.target_contract == Address::zero() {
+        return Err("scavenger_missing_target");
+    }
+    if payload.capital_committed_wei.is_zero() {
+        return Err("scavenger_zero_capital");
+    }
+    if payload.expected_profit_wei.is_zero() {
+        return Err("scavenger_no_positive_gross_edge");
+    }
+    if payload.gas_limit > config.mev.max_gas_per_tx {
+        return Err("scavenger_gas_limit_above_cap");
+    }
+    if payload.price_impact_bps > scavenger_quality_price_impact_cap_bps(config) {
+        return Err("scavenger_price_impact_above_cap");
+    }
+    if lookup_latency.as_millis()
+        > u128::from(config.mev.effective_max_pending_age_ms().saturating_mul(3).max(1))
+    {
+        return Err("scavenger_lookup_stale");
+    }
+    Ok(())
 }
 
 fn scavenger_quality_price_impact_cap_bps(config: &Config) -> u64 {
