@@ -259,6 +259,13 @@ ethers::contract::abigen!(
 );
 
 ethers::contract::abigen!(
+    UniswapV2Router,
+    r#"[
+        function factory() external view returns (address factory)
+    ]"#,
+);
+
+ethers::contract::abigen!(
     UniswapV2Pair,
     r#"[
         function token0() external view returns (address)
@@ -907,18 +914,17 @@ async fn process_evaluation_task(
     }
     dashboard.record_opportunity_funnel("adaptive_preflight_pass");
     if !preflight.should_continue && preflight_override {
-        dashboard.event(
-            "warn",
-            format!(
-                "opportunity preflight override mode={} victim={:?} reason={} upper_ev={:.2}usd score={:.2} gas_pressure={:.2}",
-                config.mev.opportunity_mode().as_str(),
-                tx_hash,
-                preflight.reject_reason.unwrap_or("preflight"),
-                preflight.upper_bound_ev_usd,
-                preflight.preflight_score,
-                preflight.gas_pressure,
-            ),
-        );
+        if config.mev.opportunity_mode() != OpportunityMode::Scavenger {
+            dashboard.event(
+                "warn",
+                format!(
+                    "preflight bypassed mode={} tx={} reason={}",
+                    config.mev.opportunity_mode().as_str(),
+                    short_hash(tx_hash),
+                    preflight.reject_reason.unwrap_or("preflight"),
+                ),
+            );
+        }
     }
 
     let payload_started = Instant::now();
@@ -940,10 +946,10 @@ async fn process_evaluation_task(
             dashboard.event(
                 "warn",
                 format!(
-                    "payload build rejected mode={} victim={:?}: {}",
+                    "payload blocked mode={} tx={} reason={}",
                     config.mev.opportunity_mode().as_str(),
-                    tx_hash,
-                    err
+                    short_hash(tx_hash),
+                    human_payload_error(&err)
                 ),
             );
             candidate.latency_trace.payload_build_us = Some(elapsed_us(payload_started));
@@ -1117,18 +1123,17 @@ async fn process_evaluation_task(
     }
     dashboard.record_opportunity_funnel("adaptive_quote_pass");
     if !quote.should_execute && mode_override {
-        dashboard.event(
-            "warn",
-            format!(
-                "opportunity mode override mode={} victim={:?} reason={} ev_real={:.2}usd p={:.2} risk={:.2}",
-                config.mev.opportunity_mode().as_str(),
-                tx_hash,
-                quote.reject_reason.unwrap_or("adaptive"),
-                quote.ev_real_usd,
-                quote.p_positive,
-                quote.risk_score
-            ),
-        );
+        if config.mev.opportunity_mode() != OpportunityMode::Scavenger {
+            dashboard.event(
+                "warn",
+                format!(
+                    "adaptive bypassed mode={} tx={} reason={}",
+                    config.mev.opportunity_mode().as_str(),
+                    short_hash(tx_hash),
+                    quote.reject_reason.unwrap_or("adaptive"),
+                ),
+            );
+        }
     }
 
     dashboard.event(
@@ -1216,7 +1221,7 @@ fn should_override_adaptive_reject(config: &Config, quote: &crate::mev::adaptive
                 && quote.risk_score <= 0.95
                 && quote.gas_pressure <= 1.00
         }
-        crate::config::OpportunityMode::Scavenger => quote.gas_pressure <= 1.50,
+        crate::config::OpportunityMode::Scavenger => true,
     }
 }
 
@@ -1390,14 +1395,9 @@ pub(crate) fn passes_ev_gate_v2(
     if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
         let lookup_is_fresh = lookup_latency.as_millis()
             <= u128::from(config.mev.effective_max_pending_age_ms().max(1));
-        let profit_above_threshold = payload.expected_profit_wei >= min_profit_wei;
-        let net_ev_usd = wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price;
         let gas_budget_ok = payload.gas_limit <= config.mev.max_gas_per_tx;
 
-        return lookup_is_fresh
-            && profit_above_threshold
-            && net_ev_usd >= config.mev.effective_min_profit_usd()
-            && gas_budget_ok;
+        return lookup_is_fresh && !payload.expected_profit_wei.is_zero() && gas_budget_ok;
     }
 
     let lookup_is_fresh =
@@ -1428,14 +1428,9 @@ pub(crate) fn passes_ev_gate_v3(
     if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
         let lookup_is_fresh = lookup_latency.as_millis()
             <= u128::from(config.mev.effective_max_pending_age_ms().max(1));
-        let profit_above_threshold = payload.expected_profit_wei >= min_profit_wei;
-        let net_ev_usd = wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price;
         let gas_budget_ok = payload.gas_limit <= config.mev.max_gas_per_tx;
 
-        return lookup_is_fresh
-            && profit_above_threshold
-            && net_ev_usd >= config.mev.effective_min_profit_usd()
-            && gas_budget_ok;
+        return lookup_is_fresh && !payload.expected_profit_wei.is_zero() && gas_budget_ok;
     }
 
     let lookup_is_fresh =
@@ -1581,6 +1576,50 @@ fn compact_payload_errors(errors: Vec<String>) -> String {
     }
 }
 
+fn human_payload_error(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    let reason = if lower.contains("missing uniswap v2 factory")
+        || lower.contains("missing uniswap v3 factory")
+    {
+        "factory not configured"
+    } else if lower.contains("pair not found") || lower.contains("pool not found") {
+        "pool not found"
+    } else if lower.contains("failed to fetch pool state") {
+        "pool state unavailable"
+    } else if lower.contains("no roi-positive") {
+        "no profitable size after gas"
+    } else if lower.contains("below minimum") {
+        "profit below configured floor"
+    } else if lower.contains("reverse path") || lower.contains("does not support") {
+        "unsupported reverse path"
+    } else if lower.contains("executor_address") {
+        "executor contract not configured"
+    } else {
+        "payload build failed"
+    };
+
+    format!("{reason} ({})", compact_text(error, 96))
+}
+
+fn compact_text(value: &str, max_chars: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    let mut out: String = compact.chars().take(max_chars.saturating_sub(3)).collect();
+    out.push_str("...");
+    out
+}
+
+fn short_hash(hash: H256) -> String {
+    let full = format!("{hash:?}");
+    if full.len() <= 14 {
+        full
+    } else {
+        format!("{}...{}", &full[..8], &full[full.len() - 6..])
+    }
+}
+
 fn contextual_capital_available_wei(
     config: &Config,
     context_signal: ContextSignal,
@@ -1602,10 +1641,6 @@ pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
     pool_cache: &PoolCache, // NOVO PARÂMETRO
     block_number: u64,      // NOVO PARÂMETRO
 ) -> Result<ExecutionPayload, String> {
-    let factory = config
-        .mev
-        .uniswap_v2_factory
-        .ok_or_else(|| "missing uniswap v2 factory".to_string())?;
     let recipient = config.profit_address;
     let token_in = *signal
         .path
@@ -1616,12 +1651,8 @@ pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
         .get(1)
         .ok_or_else(|| "missing token_out".to_string())?;
 
-    let factory_contract = UniswapV2Factory::new(factory, provider.clone());
-    let pair = factory_contract
-        .get_pair(token_in, token_out)
-        .call()
-        .await
-        .map_err(|err| err.to_string())?;
+    let (_factory, pair) =
+        find_v2_pair(provider.clone(), config, signal.router, token_in, token_out).await?;
 
     if pair == Address::zero() {
         return Err("v2 pair not found".to_string());
@@ -1663,6 +1694,131 @@ pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
     )
 }
 
+async fn find_v2_pair<M: Middleware + 'static>(
+    provider: Arc<M>,
+    config: &Config,
+    router: Address,
+    token_in: Address,
+    token_out: Address,
+) -> Result<(Address, Address), String> {
+    let mut factories = Vec::new();
+
+    let router_contract = UniswapV2Router::new(router, provider.clone());
+    if let Ok(factory) = router_contract.factory().call().await {
+        push_unique_address(&mut factories, factory);
+    }
+
+    if let Some(factory) = config.mev.uniswap_v2_factory {
+        push_unique_address(&mut factories, factory);
+    }
+
+    for factory in default_v2_factories(config.network.as_str()) {
+        push_unique_address(&mut factories, factory);
+    }
+
+    if factories.is_empty() {
+        return Err("v2 factory unavailable for router".to_string());
+    }
+
+    let mut errors = Vec::new();
+    for factory in factories {
+        let factory_contract = UniswapV2Factory::new(factory, provider.clone());
+        match factory_contract.get_pair(token_in, token_out).call().await {
+            Ok(pair) if pair != Address::zero() => return Ok((factory, pair)),
+            Ok(_) => errors.push(format!("pair not found on factory {:?}", factory)),
+            Err(err) => errors.push(format!("factory {:?} lookup failed: {}", factory, err)),
+        }
+    }
+
+    Err(compact_payload_errors(errors))
+}
+
+fn push_unique_address(addresses: &mut Vec<Address>, address: Address) {
+    if address != Address::zero() && !addresses.contains(&address) {
+        addresses.push(address);
+    }
+}
+
+fn default_v2_factories(network: &str) -> Vec<Address> {
+    match network {
+        "polygon" => parse_default_addresses(&[
+            "0x5757371414417b8c6caad45baef941abc7d3ab32",
+            "0xc35dadb65012ec5796536bd9864ed8773abc74c4",
+        ]),
+        "bsc" | "bnb" => parse_default_addresses(&[
+            "0xca143ce32fe78f1f7019d7d551a6402fc5350c73",
+            "0xc35dadb65012ec5796536bd9864ed8773abc74c4",
+        ]),
+        "ethereum" => parse_default_addresses(&[
+            "0x5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f",
+            "0xc0aee478e3658e2610c5f7a4a2e1777ce9e4f2ac",
+        ]),
+        _ => Vec::new(),
+    }
+}
+
+fn parse_default_addresses(values: &[&str]) -> Vec<Address> {
+    values
+        .iter()
+        .filter_map(|value| value.parse::<Address>().ok())
+        .collect()
+}
+
+async fn find_v3_pool<M: Middleware + 'static>(
+    provider: Arc<M>,
+    config: &Config,
+    token_in: Address,
+    token_out: Address,
+    fee_tier: u32,
+) -> Result<(Address, Address), String> {
+    let mut factories = Vec::new();
+
+    if let Some(factory) = config.mev.uniswap_v3_factory {
+        push_unique_address(&mut factories, factory);
+    }
+
+    for factory in default_v3_factories(config.network.as_str()) {
+        push_unique_address(&mut factories, factory);
+    }
+
+    if factories.is_empty() {
+        return Err("v3 factory unavailable".to_string());
+    }
+
+    let mut errors = Vec::new();
+    for factory in factories {
+        let factory_contract = UniswapV3Factory::new(factory, provider.clone());
+        match factory_contract
+            .get_pool(token_in, token_out, fee_tier)
+            .call()
+            .await
+        {
+            Ok(pool) if pool != Address::zero() => return Ok((factory, pool)),
+            Ok(_) => errors.push(format!(
+                "v3 pool not found on factory {:?} fee={}",
+                factory, fee_tier
+            )),
+            Err(err) => errors.push(format!("v3 factory {:?} lookup failed: {}", factory, err)),
+        }
+    }
+
+    Err(compact_payload_errors(errors))
+}
+
+fn default_v3_factories(network: &str) -> Vec<Address> {
+    match network {
+        "polygon" | "ethereum" | "arbitrum" => parse_default_addresses(&[
+            // Uniswap V3
+            "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+        ]),
+        "bsc" | "bnb" => parse_default_addresses(&[
+            // PancakeSwap V3
+            "0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865",
+        ]),
+        _ => Vec::new(),
+    }
+}
+
 pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
     provider: Arc<M>,
     config: &Config,
@@ -1674,10 +1830,6 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
     pool_cache: &PoolCache, // NOVO PARÂMETRO
     block_number: u64,      // NOVO PARÂMETRO
 ) -> Result<ExecutionPayload, String> {
-    let factory = config
-        .mev
-        .uniswap_v3_factory
-        .ok_or_else(|| "missing uniswap v3 factory".to_string())?;
     let recipient = config.profit_address;
     let token_in = *signal
         .path
@@ -1688,12 +1840,8 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
         .get(1)
         .ok_or_else(|| "missing edge token_out".to_string())?;
 
-    let factory = UniswapV3Factory::new(factory, provider.clone());
-    let pool = factory
-        .get_pool(token_in, token_out, fee_tier)
-        .call()
-        .await
-        .map_err(|err| err.to_string())?;
+    let (_factory, pool) =
+        find_v3_pool(provider.clone(), config, token_in, token_out, fee_tier).await?;
 
     if pool == Address::zero() {
         return Err("v3 pool not found".to_string());

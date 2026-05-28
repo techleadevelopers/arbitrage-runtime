@@ -2,7 +2,7 @@
 
 // Arquivo: src/mev/execution/payload_builder.rs
 
-use crate::config::Config;
+use crate::config::{Config, OpportunityMode};
 use crate::mev::amm::uniswap_v2::{
     amount_out_exact_in, select_best_size_candidate, size_candidates, SizeCandidate,
 };
@@ -93,51 +93,80 @@ impl PayloadBuilder {
             .reserves_for(input.token_out, input.token_in)
             .ok_or_else(|| "pool after victim does not support reverse path".to_string())?;
 
-        let gas_estimate = config.mev.max_gas_per_tx.min(
-            config
-                .estimated_exec_gas
-                .saturating_add(config.estimated_bundle_overhead_gas)
-                .max(180_000),
-        );
+        let scavenger = config.mev.opportunity_mode() == OpportunityMode::Scavenger;
+        let gas_estimate = if scavenger {
+            config.mev.max_gas_per_tx.min(
+                config
+                    .estimated_exec_gas
+                    .saturating_add(config.estimated_bundle_overhead_gas)
+                    .max(140_000),
+            )
+        } else {
+            config.mev.max_gas_per_tx.min(
+                config
+                    .estimated_exec_gas
+                    .saturating_add(config.estimated_bundle_overhead_gas)
+                    .max(180_000),
+            )
+        };
         let gas_cost = input
             .gas_price_wei
             .saturating_mul(U256::from(gas_estimate))
             .saturating_mul(U256::from(config.mev.gas_safety_margin_bps))
             / U256::from(10_000u64);
 
-        let sizing_fractions = [1_000u64, 2_000, 3_500, 5_000, 7_500];
+        let scavenger_zero_gas = U256::zero();
+        let sizing_fractions: &[u64] = if scavenger {
+            &[25, 50, 100, 200, 350, 500, 750, 1_000, 1_500]
+        } else {
+            &[1_000, 2_000, 3_500, 5_000, 7_500]
+        };
         let candidates = size_candidates(
             reserve_in,
             reserve_out,
             input.capital_available_wei,
-            gas_cost,
+            if scavenger {
+                scavenger_zero_gas
+            } else {
+                gas_cost
+            },
             pool_after.fee_bps,
-            &sizing_fractions,
+            sizing_fractions,
         );
-        let selected = select_best_size_candidate(
-            &candidates,
-            input.context_priority_score,
-            input.context_toxicity_score,
-        )
-        .ok_or_else(|| "no ROI-positive trade size after gas".to_string())?;
+        let selected = if scavenger {
+            select_scavenger_v2_candidate(&candidates)
+                .ok_or_else(|| "no positive gross edge for scavenger payload".to_string())?
+        } else {
+            select_best_size_candidate(
+                &candidates,
+                input.context_priority_score,
+                input.context_toxicity_score,
+            )
+            .ok_or_else(|| "no ROI-positive trade size after gas".to_string())?
+        };
         let SizeCandidate {
             amount_in,
-            net_profit_wei: simulated_profit_wei,
+            gross_profit_wei,
+            net_profit_wei,
             ..
         } = selected;
+        let simulated_profit_wei = if scavenger {
+            gross_profit_wei
+        } else {
+            net_profit_wei
+        };
 
         let amount_out =
             amount_out_exact_in(amount_in, reserve_in, reserve_out, pool_after.fee_bps)
                 .ok_or_else(|| "fee extraction output quote failed".to_string())?;
         let min_amount_out = amount_out.saturating_mul(U256::from(
-            10_000u64.saturating_sub(config.mev.slippage_protection_bps),
+            10_000u64.saturating_sub(effective_payload_slippage_bps(config)),
         )) / U256::from(10_000u64);
         let price_impact_bps = post_victim.slippage_impact_bps;
-        let min_profit_eth = config.mev.effective_min_net_profit_eth();
-        let min_profit_wei =
-            ethers::utils::parse_ether(min_profit_eth.to_string()).map_err(|err| err.to_string())?;
+        let min_profit_wei = effective_payload_min_profit_wei(config)?;
+        let min_profit_eth = wei_to_eth_f64(min_profit_wei);
 
-        if simulated_profit_wei < min_profit_wei {
+        if !scavenger && simulated_profit_wei < min_profit_wei {
             return Err(format!(
                 "simulated profit {:.6} {} below minimum {:.6} {}",
                 wei_to_eth_f64(simulated_profit_wei),
@@ -227,47 +256,76 @@ impl PayloadBuilder {
             fee_bps: pool_after.fee_bps,
             initialized_ticks: pool_after.initialized_ticks.clone(),
         };
-        let gas_estimate = config.mev.max_gas_per_tx.min(
-            config
-                .estimated_exec_gas
-                .saturating_add(config.estimated_bundle_overhead_gas + 35_000)
-                .max(210_000),
-        );
+        let scavenger = config.mev.opportunity_mode() == OpportunityMode::Scavenger;
+        let gas_estimate = if scavenger {
+            config.mev.max_gas_per_tx.min(
+                config
+                    .estimated_exec_gas
+                    .saturating_add(config.estimated_bundle_overhead_gas + 20_000)
+                    .max(160_000),
+            )
+        } else {
+            config.mev.max_gas_per_tx.min(
+                config
+                    .estimated_exec_gas
+                    .saturating_add(config.estimated_bundle_overhead_gas + 35_000)
+                    .max(210_000),
+            )
+        };
         let gas_cost = input
             .gas_price_wei
             .saturating_mul(U256::from(gas_estimate))
             .saturating_mul(U256::from(config.mev.gas_safety_margin_bps))
             / U256::from(10_000u64);
-        let sizing_fractions = [1_000u64, 2_000, 3_500, 5_000, 7_500];
+        let scavenger_zero_gas = U256::zero();
+        let sizing_fractions: &[u64] = if scavenger {
+            &[25, 50, 100, 200, 350, 500, 750, 1_000, 1_500]
+        } else {
+            &[1_000, 2_000, 3_500, 5_000, 7_500]
+        };
         let candidates = size_candidates_v3(
             &reverse_pool,
             input.token_out,
             input.token_in,
             input.capital_available_wei,
-            gas_cost,
-            &sizing_fractions,
+            if scavenger {
+                scavenger_zero_gas
+            } else {
+                gas_cost
+            },
+            sizing_fractions,
         );
-        let selected = select_best_v3_size_candidate(
-            &candidates,
-            input.context_priority_score,
-            input.context_toxicity_score,
-        )
-        .ok_or_else(|| "no ROI-positive v3 trade size after gas".to_string())?;
+        let selected = if scavenger {
+            select_scavenger_v3_candidate(&candidates)
+                .ok_or_else(|| "no positive gross v3 edge for scavenger payload".to_string())?
+        } else {
+            select_best_v3_size_candidate(
+                &candidates,
+                input.context_priority_score,
+                input.context_toxicity_score,
+            )
+            .ok_or_else(|| "no ROI-positive v3 trade size after gas".to_string())?
+        };
         let V3SizeCandidate {
             amount_in,
             amount_out,
-            net_profit_wei: simulated_profit_wei,
+            gross_profit_wei,
+            net_profit_wei,
             ..
         } = selected;
+        let simulated_profit_wei = if scavenger {
+            gross_profit_wei
+        } else {
+            net_profit_wei
+        };
         let min_amount_out = amount_out.saturating_mul(U256::from(
-            10_000u64.saturating_sub(config.mev.slippage_protection_bps),
+            10_000u64.saturating_sub(effective_payload_slippage_bps(config)),
         )) / U256::from(10_000u64);
         let price_impact_bps = post_victim.slippage_impact_bps;
-        let min_profit_eth = config.mev.effective_min_net_profit_eth();
-        let min_profit_wei =
-            ethers::utils::parse_ether(min_profit_eth.to_string()).map_err(|err| err.to_string())?;
+        let min_profit_wei = effective_payload_min_profit_wei(config)?;
+        let min_profit_eth = wei_to_eth_f64(min_profit_wei);
 
-        if simulated_profit_wei < min_profit_wei {
+        if !scavenger && simulated_profit_wei < min_profit_wei {
             return Err(format!(
                 "simulated v3 profit {:.6} {} below minimum {:.6} {}",
                 wei_to_eth_f64(simulated_profit_wei),
@@ -315,5 +373,50 @@ impl PayloadBuilder {
             context_toxicity_score: input.context_toxicity_score,
             pool_state_before: input.state_before,
         })
+    }
+}
+
+fn select_scavenger_v2_candidate(candidates: &[SizeCandidate]) -> Option<SizeCandidate> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            !candidate.amount_in.is_zero()
+                && !candidate.gross_profit_wei.is_zero()
+                && candidate.self_slippage_bps <= 2_500
+        })
+        .min_by_key(|candidate| candidate.amount_in)
+}
+
+fn select_scavenger_v3_candidate(candidates: &[V3SizeCandidate]) -> Option<V3SizeCandidate> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            !candidate.amount_in.is_zero()
+                && !candidate.gross_profit_wei.is_zero()
+                && candidate.self_slippage_bps <= 2_500
+        })
+        .min_by_key(|candidate| candidate.amount_in)
+}
+
+fn effective_payload_min_profit_wei(config: &Config) -> Result<U256, String> {
+    if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
+        Ok(U256::from(1u64))
+    } else {
+        ethers::utils::parse_ether(config.mev.effective_min_net_profit_eth().to_string())
+            .map_err(|err| err.to_string())
+    }
+}
+
+fn effective_payload_slippage_bps(config: &Config) -> u64 {
+    if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
+        config
+            .mev
+            .slippage_protection_bps
+            .saturating_mul(8)
+            .clamp(100, 1_500)
+    } else {
+        config.mev.slippage_protection_bps
     }
 }
