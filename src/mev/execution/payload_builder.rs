@@ -106,7 +106,8 @@ impl PayloadBuilder {
             return Err("v2 payload requires UniswapV2 simulated state".to_string());
         };
 
-        if post_victim.slippage_impact_bps > config.mev.effective_max_price_impact_bps() {
+        let scavenger = config.mev.opportunity_mode() == OpportunityMode::Scavenger;
+        if post_victim.slippage_impact_bps > effective_payload_price_impact_cap_bps(config) {
             return Err(format!(
                 "victim price impact too high: {}bps",
                 post_victim.slippage_impact_bps
@@ -117,7 +118,6 @@ impl PayloadBuilder {
             .reserves_for(input.token_out, input.token_in)
             .ok_or_else(|| "pool after victim does not support reverse path".to_string())?;
 
-        let scavenger = config.mev.opportunity_mode() == OpportunityMode::Scavenger;
         let gas_estimate = if scavenger {
             config.mev.max_gas_per_tx.min(
                 config
@@ -166,9 +166,17 @@ impl PayloadBuilder {
         );
         let selected = if scavenger {
             select_scavenger_v2_candidate(&candidates).ok_or_else(|| {
+                let sample = blocked_sample.map(|sample| {
+                    scavenger_shadow_sample(
+                        config,
+                        sample,
+                        "shadow_candidate",
+                        "gross edge below live threshold",
+                    )
+                });
                 payload_error_with_edge_sample(
                     "no positive gross edge for scavenger payload",
-                    blocked_sample,
+                    sample,
                 )
             })?
         } else {
@@ -213,8 +221,36 @@ impl PayloadBuilder {
             ));
         }
 
+        let edge_metadata = EdgeMetadata {
+            status: "payload_built".to_string(),
+            reason: "selected positive gross edge".to_string(),
+            route_kind: "v2".to_string(),
+            best_size_bps: capital_fraction_bps,
+            amount_in_wei: amount_in.to_string(),
+            amount_out_wei: amount_out.to_string(),
+            gross_edge_wei: gross_profit_wei.to_string(),
+            gross_edge_native: wei_to_eth_f64(gross_profit_wei),
+            repayment_wei: repayment_wei.to_string(),
+            repayment_native: wei_to_eth_f64(repayment_wei),
+            price_impact_bps,
+            self_slippage_bps,
+            pool: format!("{:?}", input.pair),
+            factory: format_optional_address(input.factory),
+            router: format!("{:?}", input.router),
+            token_in: format!("{:?}", input.token_in),
+            token_out: format!("{:?}", input.token_out),
+        };
+
         let executor = config.mev.mev_executor.ok_or_else(|| {
-            "MEV_EXECUTOR_ADDRESS is required to build atomic payload".to_string()
+            payload_error_with_edge_sample(
+                "MEV_EXECUTOR_ADDRESS is required to build atomic payload",
+                Some(scavenger_shadow_sample(
+                    config,
+                    edge_metadata.clone(),
+                    "shadow_candidate",
+                    "executor contract not configured",
+                )),
+            )
         })?;
         let step = EncodedSwapStep {
             router: input.router,
@@ -248,25 +284,7 @@ impl PayloadBuilder {
             profit_recipient: input.recipient,
             context_priority_score: input.context_priority_score,
             context_toxicity_score: input.context_toxicity_score,
-            edge_metadata: Some(EdgeMetadata {
-                status: "payload_built".to_string(),
-                reason: "selected positive gross edge".to_string(),
-                route_kind: "v2".to_string(),
-                best_size_bps: capital_fraction_bps,
-                amount_in_wei: amount_in.to_string(),
-                amount_out_wei: amount_out.to_string(),
-                gross_edge_wei: gross_profit_wei.to_string(),
-                gross_edge_native: wei_to_eth_f64(gross_profit_wei),
-                repayment_wei: repayment_wei.to_string(),
-                repayment_native: wei_to_eth_f64(repayment_wei),
-                price_impact_bps,
-                self_slippage_bps,
-                pool: format!("{:?}", input.pair),
-                factory: format_optional_address(input.factory),
-                router: format!("{:?}", input.router),
-                token_in: format!("{:?}", input.token_in),
-                token_out: format!("{:?}", input.token_out),
-            }),
+            edge_metadata: Some(edge_metadata),
             pool_state_before: input.state_before,
         })
     }
@@ -295,7 +313,8 @@ impl PayloadBuilder {
             return Err("v3 payload requires UniswapV3 simulated state".to_string());
         };
 
-        if post_victim.slippage_impact_bps > config.mev.effective_max_price_impact_bps() {
+        let scavenger = config.mev.opportunity_mode() == OpportunityMode::Scavenger;
+        if post_victim.slippage_impact_bps > effective_payload_price_impact_cap_bps(config) {
             return Err(format!(
                 "victim price impact too high: {}bps",
                 post_victim.slippage_impact_bps
@@ -312,7 +331,6 @@ impl PayloadBuilder {
             fee_bps: pool_after.fee_bps,
             initialized_ticks: pool_after.initialized_ticks.clone(),
         };
-        let scavenger = config.mev.opportunity_mode() == OpportunityMode::Scavenger;
         let gas_estimate = if scavenger {
             config.mev.max_gas_per_tx.min(
                 config
@@ -353,15 +371,24 @@ impl PayloadBuilder {
         );
         let selected = if scavenger {
             select_scavenger_v3_candidate(&candidates).ok_or_else(|| {
+                let sample = best_v3_edge_metadata(
+                    &candidates,
+                    &input,
+                    post_victim.slippage_impact_bps,
+                    "blocked",
+                    "no positive gross v3 edge",
+                )
+                .map(|sample| {
+                    scavenger_shadow_sample(
+                        config,
+                        sample,
+                        "shadow_candidate",
+                        "gross v3 edge below live threshold",
+                    )
+                });
                 payload_error_with_edge_sample(
                     "no positive gross v3 edge for scavenger payload",
-                    best_v3_edge_metadata(
-                        &candidates,
-                        &input,
-                        post_victim.slippage_impact_bps,
-                        "blocked",
-                        "no positive gross v3 edge",
-                    ),
+                    sample,
                 )
             })?
         } else {
@@ -403,8 +430,36 @@ impl PayloadBuilder {
             ));
         }
 
+        let edge_metadata = EdgeMetadata {
+            status: "payload_built".to_string(),
+            reason: "selected positive v3 gross edge".to_string(),
+            route_kind: "v3".to_string(),
+            best_size_bps: capital_fraction_bps,
+            amount_in_wei: amount_in.to_string(),
+            amount_out_wei: amount_out.to_string(),
+            gross_edge_wei: gross_profit_wei.to_string(),
+            gross_edge_native: wei_to_eth_f64(gross_profit_wei),
+            repayment_wei: amount_in.to_string(),
+            repayment_native: wei_to_eth_f64(amount_in),
+            price_impact_bps,
+            self_slippage_bps,
+            pool: format!("{:?}", input.pair),
+            factory: format_optional_address(input.factory),
+            router: format!("{:?}", input.router),
+            token_in: format!("{:?}", input.token_in),
+            token_out: format!("{:?}", input.token_out),
+        };
+
         let executor = config.mev.mev_executor.ok_or_else(|| {
-            "MEV_EXECUTOR_ADDRESS is required to build atomic payload".to_string()
+            payload_error_with_edge_sample(
+                "MEV_EXECUTOR_ADDRESS is required to build atomic payload",
+                Some(scavenger_shadow_sample(
+                    config,
+                    edge_metadata.clone(),
+                    "shadow_candidate",
+                    "executor contract not configured",
+                )),
+            )
         })?;
         let step = EncodedV3SwapStep {
             router: input.router,
@@ -439,25 +494,7 @@ impl PayloadBuilder {
             profit_recipient: input.recipient,
             context_priority_score: input.context_priority_score,
             context_toxicity_score: input.context_toxicity_score,
-            edge_metadata: Some(EdgeMetadata {
-                status: "payload_built".to_string(),
-                reason: "selected positive v3 gross edge".to_string(),
-                route_kind: "v3".to_string(),
-                best_size_bps: capital_fraction_bps,
-                amount_in_wei: amount_in.to_string(),
-                amount_out_wei: amount_out.to_string(),
-                gross_edge_wei: gross_profit_wei.to_string(),
-                gross_edge_native: wei_to_eth_f64(gross_profit_wei),
-                repayment_wei: amount_in.to_string(),
-                repayment_native: wei_to_eth_f64(amount_in),
-                price_impact_bps,
-                self_slippage_bps,
-                pool: format!("{:?}", input.pair),
-                factory: format_optional_address(input.factory),
-                router: format!("{:?}", input.router),
-                token_in: format!("{:?}", input.token_in),
-                token_out: format!("{:?}", input.token_out),
-            }),
+            edge_metadata: Some(edge_metadata),
             pool_state_before: input.state_before,
         })
     }
@@ -471,6 +508,30 @@ fn payload_error_with_edge_sample(reason: &str, sample: Option<EdgeMetadata>) ->
         Ok(json) => format!("{reason} | edge_sample={json}"),
         Err(_) => reason.to_string(),
     }
+}
+
+fn scavenger_shadow_sample(
+    config: &Config,
+    mut sample: EdgeMetadata,
+    status: &str,
+    reason: &str,
+) -> EdgeMetadata {
+    if config.mev.opportunity_mode() == OpportunityMode::Scavenger
+        && sample.gross_edge_native >= -scavenger_shadow_negative_tolerance_native(config)
+    {
+        sample.status = status.to_string();
+        sample.reason = reason.to_string();
+    }
+    sample
+}
+
+fn scavenger_shadow_negative_tolerance_native(config: &Config) -> f64 {
+    let tolerance_usd = std::env::var("MEV_SCAVENGER_SHADOW_NEGATIVE_TOLERANCE_USD")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .unwrap_or(15.0)
+        .abs();
+    tolerance_usd / config.mev.eth_usd_price.max(1.0)
 }
 
 fn format_optional_address(address: Option<Address>) -> String {
@@ -717,5 +778,17 @@ fn effective_payload_slippage_bps(config: &Config) -> u64 {
             .clamp(100, 1_500)
     } else {
         config.mev.slippage_protection_bps
+    }
+}
+
+fn effective_payload_price_impact_cap_bps(config: &Config) -> u64 {
+    if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
+        config
+            .mev
+            .effective_max_price_impact_bps()
+            .saturating_mul(12)
+            .clamp(600, 3_000)
+    } else {
+        config.mev.effective_max_price_impact_bps()
     }
 }

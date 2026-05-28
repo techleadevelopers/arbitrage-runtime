@@ -45,6 +45,15 @@ const SWAP_EXACT_ETH_FOR_TOKENS_SUPPORTING_FEE: [u8; 4] = [0xb6, 0xf9, 0xde, 0x9
 const SWAP_EXACT_TOKENS_FOR_ETH_SUPPORTING_FEE: [u8; 4] = [0x79, 0x1a, 0xc9, 0x47];
 const V3_EXACT_INPUT_SINGLE: [u8; 4] = [0x41, 0x4b, 0xf3, 0x89];
 const V3_EXACT_INPUT: [u8; 4] = [0xc0, 0x4b, 0x8d, 0x59];
+const UNIVERSAL_ROUTER_EXECUTE: [u8; 4] = [0x35, 0x93, 0x56, 0x4c];
+const UNIVERSAL_ROUTER_EXECUTE_NO_DEADLINE: [u8; 4] = [0x24, 0x85, 0x6b, 0xc3];
+const ZERO_EX_TRANSFORM_ERC20: [u8; 4] = [0x41, 0x55, 0x65, 0xb0];
+const ZERO_EX_SELL_TO_UNISWAP: [u8; 4] = [0xd9, 0x62, 0x7a, 0xa4];
+const ONE_INCH_SWAP: [u8; 4] = [0x12, 0xaa, 0x3c, 0x6a];
+const ONE_INCH_UNOSWAP: [u8; 4] = [0x2e, 0x95, 0xb6, 0xc8];
+const PARASWAP_SIMPLE_SWAP: [u8; 4] = [0x54, 0xe3, 0xf3, 0x1b];
+const ODOS_SWAP_COMPACT: [u8; 4] = [0x83, 0xbd, 0x37, 0xf9];
+const KYBER_SWAP: [u8; 4] = [0x3f, 0x2d, 0x5c, 0xf5];
 
 #[derive(Debug, Clone)]
 pub(crate) enum SwapKind {
@@ -60,6 +69,7 @@ pub(crate) enum SwapKind {
 pub(crate) struct SwapSignal {
     pub(crate) selector: [u8; 4],
     pub(crate) amount_in: U256,
+    pub(crate) amount_out_min: Option<U256>,
     pub(crate) notional_wei: U256,
     pub(crate) path: Vec<Address>,
     pub(crate) router: Address,
@@ -83,6 +93,7 @@ pub(crate) struct FastPreflightDecision {
     pub(crate) estimated_gas_cost_usd: f64,
     pub(crate) competition_score_fast: f64,
     pub(crate) gas_ratio: f64,
+    pub(crate) scavenger_try_score: f64,
 }
 
 struct PendingExecutionCandidate {
@@ -648,8 +659,21 @@ async fn process_lookup_decode_task(
         latency_trace.decode_swap_us = Some(elapsed_us(decode_started));
         latency_trace.total_internal_us = Some(elapsed_us(task.candidate_started));
         dashboard.record_opportunity_funnel("decode_reject");
-        dashboard.record_reject_reason("decode", "not_relevant_or_below_min");
-        latency_trace.emit(&config, &dashboard, task.tx_hash, "reject", "decode_no_signal");
+        if let Some(name) = aggregator_name_from_tx(&tx) {
+            dashboard.record_reject_reason("aggregator_decode", name);
+            dashboard.event(
+                "warn",
+                format!(
+                    "aggregator flow not decoded tx={} source={}",
+                    short_hash(task.tx_hash),
+                    name
+                ),
+            );
+            latency_trace.emit(&config, &dashboard, task.tx_hash, "reject", "aggregator_decode_missing");
+        } else {
+            dashboard.record_reject_reason("decode", "not_relevant_or_below_min");
+            latency_trace.emit(&config, &dashboard, task.tx_hash, "reject", "decode_no_signal");
+        }
         return None;
     };
     dashboard.record_opportunity_funnel("decode_pass");
@@ -897,39 +921,43 @@ async fn process_evaluation_task(
         );
     }
 
-    let adaptive_preflight_started = Instant::now();
-    let preflight = if let Ok(mut model) = adaptive.lock() {
-        model.preflight_score(PreflightInput {
-            cluster: candidate.cluster,
-            notional_eth: wei_to_eth_f64(candidate.signal.notional_wei),
-            gas_price_wei: candidate.gas_price,
-            path_len: candidate.signal.path_len(),
-        })
+    if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
+        candidate.latency_trace.adaptive_preflight_us = Some(0);
+        dashboard.record_opportunity_funnel("adaptive_preflight_pass");
+        dashboard.set_market_regime("scavenger");
     } else {
-        return None;
-    };
-    candidate.latency_trace.adaptive_preflight_us = Some(elapsed_us(adaptive_preflight_started));
-    dashboard.set_market_regime(preflight.regime.as_str());
+        let adaptive_preflight_started = Instant::now();
+        let preflight = if let Ok(mut model) = adaptive.lock() {
+            model.preflight_score(PreflightInput {
+                cluster: candidate.cluster,
+                notional_eth: wei_to_eth_f64(candidate.signal.notional_wei),
+                gas_price_wei: candidate.gas_price,
+                path_len: candidate.signal.path_len(),
+            })
+        } else {
+            return None;
+        };
+        candidate.latency_trace.adaptive_preflight_us = Some(elapsed_us(adaptive_preflight_started));
+        dashboard.set_market_regime(preflight.regime.as_str());
 
-    let preflight_override = should_override_preflight_reject(&config, &preflight);
-    if !preflight.should_continue && !preflight_override {
-        candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
-        dashboard.record_opportunity_funnel("adaptive_preflight_reject");
-        if let Some(reason) = preflight.reject_reason {
-            dashboard.record_reject_reason("preflight", reason);
+        let preflight_override = should_override_preflight_reject(&config, &preflight);
+        if !preflight.should_continue && !preflight_override {
+            candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+            dashboard.record_opportunity_funnel("adaptive_preflight_reject");
+            if let Some(reason) = preflight.reject_reason {
+                dashboard.record_reject_reason("preflight", reason);
+            }
+            candidate.latency_trace.emit(
+                &config,
+                &dashboard,
+                tx_hash,
+                "reject",
+                preflight.reject_reason.unwrap_or("preflight"),
+            );
+            return None;
         }
-        candidate.latency_trace.emit(
-            &config,
-            &dashboard,
-            tx_hash,
-            "reject",
-            preflight.reject_reason.unwrap_or("preflight"),
-        );
-        return None;
-    }
-    dashboard.record_opportunity_funnel("adaptive_preflight_pass");
-    if !preflight.should_continue && preflight_override {
-        if config.mev.opportunity_mode() != OpportunityMode::Scavenger {
+        dashboard.record_opportunity_funnel("adaptive_preflight_pass");
+        if !preflight.should_continue && preflight_override {
             dashboard.event(
                 "warn",
                 format!(
@@ -1102,6 +1130,65 @@ async fn process_evaluation_task(
     }
     candidate.latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
 
+    if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
+        candidate.latency_trace.adaptive_quote_us = Some(0);
+        dashboard.record_opportunity_funnel("adaptive_quote_pass");
+
+        let expected_profit_usd =
+            wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price;
+        let opportunity = build_opportunity(&candidate.tx, &candidate.signal, payload, None);
+        let capital_efficiency = opportunity
+            .execution_payload
+            .as_ref()
+            .map(|payload| {
+                let capital_eth = wei_to_eth_f64(payload.capital_committed_wei).max(1e-9);
+                (expected_profit_usd / capital_eth).max(0.0) / config.mev.eth_usd_price.max(1.0)
+            })
+            .unwrap_or_default()
+            .clamp(0.0, 1.0);
+
+        candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        candidate.latency_trace.emit(
+            &config,
+            &dashboard,
+            tx_hash,
+            "execution_ready",
+            "scavenger_fast_path",
+        );
+        dashboard.record_opportunity_funnel("execution_ready");
+        dashboard.event(
+            "info",
+            format!(
+                "scavenger execution ready tx={} try_score={:.2} gross={:.6}{} impact={}bps path_len={}",
+                short_hash(tx_hash),
+                fast_gate.scavenger_try_score,
+                wei_to_eth_f64(
+                    opportunity
+                        .execution_payload
+                        .as_ref()
+                        .map(|payload| payload.expected_profit_wei)
+                        .unwrap_or_default()
+                ),
+                config.native_asset_symbol(),
+                opportunity
+                    .execution_payload
+                    .as_ref()
+                    .map(|payload| payload.price_impact_bps)
+                    .unwrap_or_default(),
+                candidate.signal.path_len()
+            ),
+        );
+
+        return Some(PendingExecutionCandidate {
+            opportunity,
+            ev_real_usd: expected_profit_usd,
+            p_positive: (0.45 + fast_gate.scavenger_try_score * 0.50).clamp(0.05, 0.98),
+            capital_efficiency,
+            relay_score: fast_gate.gas_ratio.clamp(0.0, 1.0),
+            context_priority_score: candidate.context_signal.priority_score,
+        });
+    }
+
     let adaptive_quote_started = Instant::now();
     let quote = if let Ok(mut model) = adaptive.lock() {
         model.quote_for_relays(
@@ -1254,7 +1341,7 @@ pub(crate) fn passes_quality_gate(
 ) -> bool {
     if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
         return !payload.expected_profit_wei.is_zero()
-            && payload.price_impact_bps <= config.mev.effective_max_price_impact_bps();
+            && payload.price_impact_bps <= scavenger_quality_price_impact_cap_bps(config);
     }
 
     let roi = roi_bps(payload.expected_profit_wei, execution_cost_wei);
@@ -1263,6 +1350,14 @@ pub(crate) fn passes_quality_gate(
         * 100.0)
         .clamp(0.0, 100.0) as u16;
     roi >= config.mev.effective_min_roi_bps() && impact_score <= 100
+}
+
+fn scavenger_quality_price_impact_cap_bps(config: &Config) -> u64 {
+    config
+        .mev
+        .effective_max_price_impact_bps()
+        .saturating_mul(12)
+        .clamp(600, 3_000)
 }
 
 pub(crate) fn fast_preflight_gate(
@@ -1280,6 +1375,7 @@ pub(crate) fn fast_preflight_gate(
             estimated_gas_cost_usd: 0.0,
             competition_score_fast: 1.0,
             gas_ratio: 0.0,
+            scavenger_try_score: 0.0,
         };
     }
     if signal.notional_wei < min_large_swap_wei {
@@ -1290,6 +1386,7 @@ pub(crate) fn fast_preflight_gate(
             estimated_gas_cost_usd: 0.0,
             competition_score_fast: 1.0,
             gas_ratio: 0.0,
+            scavenger_try_score: 0.0,
         };
     }
 
@@ -1324,13 +1421,21 @@ pub(crate) fn fast_preflight_gate(
     let ev_upper_bound_usd = notional_usd * heuristic_factor - estimated_gas_cost_usd;
 
     if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
+        let scavenger_try_score =
+            scavenger_fast_try_score(signal, gas_ratio, notional_eth, config, context_signal);
+        let reject_reason = if scavenger_try_score < 0.18 && gas_ratio > 1.45 {
+            Some("scavenger_score_below_cheap_threshold")
+        } else {
+            None
+        };
         return FastPreflightDecision {
-            should_continue: true,
-            reject_reason: None,
+            should_continue: reject_reason.is_none(),
+            reject_reason,
             ev_upper_bound_usd,
             estimated_gas_cost_usd,
-            competition_score_fast: 0.0,
+            competition_score_fast: 1.0 - scavenger_try_score,
             gas_ratio,
+            scavenger_try_score,
         };
     }
 
@@ -1366,6 +1471,7 @@ pub(crate) fn fast_preflight_gate(
         estimated_gas_cost_usd,
         competition_score_fast,
         gas_ratio,
+        scavenger_try_score: 0.0,
     }
 }
 
@@ -1967,6 +2073,7 @@ pub(crate) fn decode_relevant_swap(
             SwapSignal {
                 selector,
                 amount_in: tx.value,
+                amount_out_min: decoded.first().and_then(token_as_uint),
                 notional_wei: tx.value,
                 path: decoded.get(1).and_then(token_as_address_vec)?,
                 router,
@@ -1991,6 +2098,7 @@ pub(crate) fn decode_relevant_swap(
             SwapSignal {
                 selector,
                 amount_in: decoded.first().and_then(token_as_uint)?,
+                amount_out_min: decoded.get(1).and_then(token_as_uint),
                 notional_wei: U256::zero(),
                 path: decoded.get(2).and_then(token_as_address_vec)?,
                 router,
@@ -2023,6 +2131,7 @@ pub(crate) fn decode_relevant_swap(
             SwapSignal {
                 selector,
                 amount_in,
+                amount_out_min: values.get(6).and_then(token_as_uint),
                 notional_wei: U256::zero(),
                 path: vec![token_in, token_out],
                 router,
@@ -2058,6 +2167,7 @@ pub(crate) fn decode_relevant_swap(
             SwapSignal {
                 selector,
                 amount_in,
+                amount_out_min: values.get(4).and_then(token_as_uint),
                 notional_wei: U256::zero(),
                 path: vec![parsed.token_in, parsed.edge_token_out],
                 router,
@@ -2117,6 +2227,20 @@ fn selector(tx: &Transaction) -> Option<[u8; 4]> {
     (input.len() >= 4).then(|| [input[0], input[1], input[2], input[3]])
 }
 
+fn aggregator_name_from_tx(tx: &Transaction) -> Option<&'static str> {
+    match selector(tx)? {
+        UNIVERSAL_ROUTER_EXECUTE | UNIVERSAL_ROUTER_EXECUTE_NO_DEADLINE => {
+            Some("universal_router")
+        }
+        ZERO_EX_TRANSFORM_ERC20 | ZERO_EX_SELL_TO_UNISWAP => Some("0x_matcha"),
+        ONE_INCH_SWAP | ONE_INCH_UNOSWAP => Some("1inch"),
+        PARASWAP_SIMPLE_SWAP => Some("paraswap"),
+        ODOS_SWAP_COMPACT => Some("odos"),
+        KYBER_SWAP => Some("kyber"),
+        _ => None,
+    }
+}
+
 fn selector_heuristic_factor(selector: [u8; 4]) -> f64 {
     match selector {
         V3_EXACT_INPUT_SINGLE => 1.16,
@@ -2144,6 +2268,72 @@ fn fast_path_penalty(path_len: usize) -> f64 {
         3 => 0.18,
         4 => 0.30,
         _ => 0.42,
+    }
+}
+
+fn scavenger_fast_try_score(
+    signal: &SwapSignal,
+    gas_ratio: f64,
+    notional_eth: f64,
+    config: &Config,
+    context_signal: ContextSignal,
+) -> f64 {
+    let slippage_window = scavenger_slippage_window_hint(signal);
+    let pool_imbalance = scavenger_impact_imbalance_hint(
+        notional_eth,
+        config.mev.effective_min_large_swap_eth(),
+        signal.path_len(),
+    );
+    let low_competition = ((1.35 - gas_ratio) / 1.35).clamp(0.0, 1.0) * 0.55
+        + context_signal.priority_score.clamp(0.0, 1.0) * 0.25
+        + (1.0 - context_signal.toxicity_score.clamp(0.0, 1.0)) * 0.20;
+    let route_quality = scavenger_route_inefficiency_hint(signal);
+    let victim_size_factor =
+        (notional_eth / config.mev.effective_min_large_swap_eth().max(0.000_001) / 4.0)
+            .clamp(0.0, 1.0);
+
+    (slippage_window * 0.35
+        + pool_imbalance * 0.25
+        + low_competition * 0.20
+        + route_quality * 0.10
+        + victim_size_factor * 0.10)
+        .clamp(0.0, 1.0)
+}
+
+fn scavenger_slippage_window_hint(signal: &SwapSignal) -> f64 {
+    let supporting_fee_selector = matches!(
+        signal.selector,
+        SWAP_EXACT_TOKENS_FOR_TOKENS_SUPPORTING_FEE
+            | SWAP_EXACT_ETH_FOR_TOKENS_SUPPORTING_FEE
+            | SWAP_EXACT_TOKENS_FOR_ETH_SUPPORTING_FEE
+    );
+    if signal
+        .amount_out_min
+        .map(|value| value.is_zero())
+        .unwrap_or(false)
+    {
+        0.95
+    } else if supporting_fee_selector {
+        0.72
+    } else if signal.path_len() >= 3 {
+        0.52
+    } else {
+        0.30
+    }
+}
+
+fn scavenger_impact_imbalance_hint(notional_eth: f64, min_large_swap_eth: f64, path_len: usize) -> f64 {
+    let size_pressure = (notional_eth / min_large_swap_eth.max(0.000_001) / 3.0).clamp(0.0, 1.0);
+    let simple_pool_bonus = if path_len <= 2 { 0.22 } else { 0.08 };
+    (size_pressure * 0.78 + simple_pool_bonus).clamp(0.0, 1.0)
+}
+
+fn scavenger_route_inefficiency_hint(signal: &SwapSignal) -> f64 {
+    match &signal.kind {
+        SwapKind::V3 { hops, .. } if *hops >= 2 => 0.78,
+        SwapKind::V2 if signal.path_len() >= 3 => 0.72,
+        SwapKind::V3 { .. } => 0.46,
+        SwapKind::V2 => 0.38,
     }
 }
 
