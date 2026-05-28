@@ -120,6 +120,7 @@ pub enum OpportunityMode {
     Conservative,
     Balanced,
     Aggressive,
+    Scavenger,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -136,6 +137,7 @@ impl OpportunityMode {
             OpportunityMode::Conservative => "conservative",
             OpportunityMode::Balanced => "balanced",
             OpportunityMode::Aggressive => "sangrento",
+            OpportunityMode::Scavenger => "scavenger",
         }
     }
 }
@@ -635,6 +637,7 @@ impl MevConfig {
             OpportunityMode::Conservative => base,
             OpportunityMode::Balanced => base * 0.35,
             OpportunityMode::Aggressive => base * 0.12,
+            OpportunityMode::Scavenger => base * 0.02,
         }
         .max(0.000_001)
     }
@@ -645,6 +648,7 @@ impl MevConfig {
             OpportunityMode::Conservative => base,
             OpportunityMode::Balanced => base * 0.40,
             OpportunityMode::Aggressive => base * 0.15,
+            OpportunityMode::Scavenger => base * 0.03,
         }
         .max(0.000_000_1)
     }
@@ -655,12 +659,20 @@ impl MevConfig {
             OpportunityMode::Conservative => base,
             OpportunityMode::Balanced => base * 0.35,
             OpportunityMode::Aggressive => base * 0.10,
+            OpportunityMode::Scavenger => base * 0.02,
         }
         .max(0.000_001)
     }
 
     pub fn effective_min_liquidity_eth(&self) -> f64 {
-        self.runtime_thresholds().min_liquidity_eth.max(0.000_001)
+        let base = self.runtime_thresholds().min_liquidity_eth;
+        match self.opportunity_mode() {
+            OpportunityMode::Conservative => base,
+            OpportunityMode::Balanced => base * 0.50,
+            OpportunityMode::Aggressive => base * 0.25,
+            OpportunityMode::Scavenger => base * 0.08,
+        }
+        .max(0.000_001)
     }
 
     pub fn effective_min_roi_bps(&self) -> u64 {
@@ -668,6 +680,7 @@ impl MevConfig {
             OpportunityMode::Conservative => self.min_roi_bps as f64,
             OpportunityMode::Balanced => self.min_roi_bps as f64 * 0.55,
             OpportunityMode::Aggressive => self.min_roi_bps as f64 * 0.25,
+            OpportunityMode::Scavenger => self.min_roi_bps as f64 * 0.05,
         };
         value.round().max(1.0) as u64
     }
@@ -677,6 +690,7 @@ impl MevConfig {
             OpportunityMode::Conservative => self.max_price_impact_bps as f64,
             OpportunityMode::Balanced => self.max_price_impact_bps as f64 * 1.50,
             OpportunityMode::Aggressive => self.max_price_impact_bps as f64 * 2.20,
+            OpportunityMode::Scavenger => self.max_price_impact_bps as f64 * 4.00,
         };
         value.round().max(1.0) as u64
     }
@@ -686,6 +700,7 @@ impl MevConfig {
             OpportunityMode::Conservative => self.max_pending_age_ms as f64,
             OpportunityMode::Balanced => self.max_pending_age_ms as f64 * 1.40,
             OpportunityMode::Aggressive => self.max_pending_age_ms as f64 * 2.00,
+            OpportunityMode::Scavenger => self.max_pending_age_ms as f64 * 3.00,
         };
         value.round().max(1.0) as u64
     }
@@ -980,6 +995,9 @@ pub fn parse_opportunity_mode(value: &str) -> Result<OpportunityMode, Box<dyn st
         "conservative" | "safe" | "atual" => Ok(OpportunityMode::Conservative),
         "balanced" | "medium" | "medio" => Ok(OpportunityMode::Balanced),
         "aggressive" | "bloody" | "sangrento" => Ok(OpportunityMode::Aggressive),
+        "scavenger" | "bypass" | "farelo" | "farelo-extractor" | "crumbs" => {
+            Ok(OpportunityMode::Scavenger)
+        }
         other => Err(format!("unsupported opportunity mode: {other}").into()),
     }
 }

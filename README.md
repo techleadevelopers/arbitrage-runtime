@@ -1211,8 +1211,11 @@ For BNB Chain configuration, use the `_BSC` suffix as the canonical operator-fac
 - `RPC_READ_PREFERENCE`
 - `RPC_SEND_PREFERENCE`
 - `MEV_PENDING_LOOKUP_FANOUT`
+- `MEV_BLOCK_LOOKUP_FANOUT`
 
 `MEV_PENDING_LOOKUP_FANOUT` controls how many read RPC endpoints are queried for each pending transaction hash before decode. The default is `1`. Raising it to `2` or `3` can improve pending transaction hit rate, but it multiplies paid RPC usage and can trigger provider rate limits.
+
+`MEV_BLOCK_LOOKUP_FANOUT` controls how many read RPC endpoints are queried for the current block once a transaction already decoded into a relevant candidate. The default is `1`. Block lookup intentionally happens after decode so irrelevant transactions do not spend extra RPC.
 
 The runtime tracks burst reservations per endpoint and decays failure counters over time. Short cooldowns or old provider errors should not permanently mark an endpoint as unusable. The operator panel reports:
 
@@ -1226,6 +1229,13 @@ The runtime tracks burst reservations per endpoint and decays failure counters o
 - `CONTROL_ADDRESS`
 - `VAULT_ADDRESS`
 - `PROFIT_ADDRESS`
+
+Bootstrap production can run with a two-wallet layout:
+
+- executor hot wallet: derived from `EXECUTOR_PRIVATE_KEY`, funded with native gas for execution
+- cold wallet: one address reused for `CONTROL_ADDRESS`, `VAULT_ADDRESS`, and `PROFIT_ADDRESS`
+
+This avoids unnecessary internal wallet movement while capital is small. The runtime treats `CONTROL=VAULT=PROFIT` as an explicit initial layout and only warns when any cold wallet address matches the executor hot wallet. Split control, vault, and profit addresses before larger capital or multi-operator operation.
 
 ### Engine thresholds
 
@@ -1265,6 +1275,20 @@ The panel's Settings page exposes live controls for:
 - minimum liquidity
 
 These controls update runtime memory only. To keep a value after restart, set the corresponding environment variable.
+
+The MEV Engine panel also exposes an opportunity funnel:
+
+- pending hashes received
+- pending transaction lookup success/miss
+- decode pass/reject
+- block lookup success/fail
+- fast/adaptive preflight pass/reject
+- payload built/reject
+- EV/adaptive quote pass/reject
+- execution ready
+- submit attempted/succeeded/failed
+
+Use this funnel before loosening strategy logic. If `pending hashes` rises but `decode pass` stays at zero, the issue is router/token/notional coverage, not execution. If `payload built` stays at zero, the issue is state lookup, pool support, liquidity, or profit gates. If `submit attempted` stays at zero after `execution ready`, the issue is executor readiness or execution guardrails.
 
 ### Expensive execution guardrails
 

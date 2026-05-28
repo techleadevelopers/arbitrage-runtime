@@ -82,7 +82,7 @@ impl PayloadBuilder {
             return Err("v2 payload requires UniswapV2 simulated state".to_string());
         };
 
-        if post_victim.slippage_impact_bps > config.mev.max_price_impact_bps {
+        if post_victim.slippage_impact_bps > config.mev.effective_max_price_impact_bps() {
             return Err(format!(
                 "victim price impact too high: {}bps",
                 post_victim.slippage_impact_bps
@@ -210,7 +210,7 @@ impl PayloadBuilder {
             return Err("v3 payload requires UniswapV3 simulated state".to_string());
         };
 
-        if post_victim.slippage_impact_bps > config.mev.max_price_impact_bps {
+        if post_victim.slippage_impact_bps > config.mev.effective_max_price_impact_bps() {
             return Err(format!(
                 "victim price impact too high: {}bps",
                 post_victim.slippage_impact_bps

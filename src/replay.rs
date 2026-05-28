@@ -530,7 +530,12 @@ async fn run_replay_cases(
         report.total += 1;
         let tx = replay_transaction(case, index as u64)?;
         let decode_started = Instant::now();
-        let Some(signal) = decode_relevant_swap(&tx, &config.monitored_tokens, min_large_swap_wei)
+        let Some(signal) = decode_relevant_swap(
+            &tx,
+            &config.monitored_tokens,
+            min_large_swap_wei,
+            config.mev.opportunity_mode(),
+        )
         else {
             report.bump("decode_reject");
             latency_trace.total_internal_us = Some(elapsed_us(case_started));

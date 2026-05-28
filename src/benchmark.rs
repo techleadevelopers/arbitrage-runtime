@@ -490,7 +490,12 @@ fn runtime_load_worker(
 
         let total_started = Instant::now();
         let started = Instant::now();
-        let signal = decode_relevant_swap(&tx, &config.monitored_tokens, min_large_swap_wei);
+        let signal = decode_relevant_swap(
+            &tx,
+            &config.monitored_tokens,
+            min_large_swap_wei,
+            config.mev.opportunity_mode(),
+        );
         if record {
             report.samples.decode_us.push(elapsed_us(started));
             report.processed += 1;

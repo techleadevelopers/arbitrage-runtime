@@ -210,10 +210,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
         );
     }
+    let cold_wallets_collapsed = config.control_address == config.vault_address
+        && config.vault_address == config.profit_address;
+    if config.control_address == config.executor_address {
+        dashboard.event(
+            "warn",
+            "control wallet matches executor wallet; hot/cold segregation is compromised",
+        );
+    }
     if config.vault_address == config.executor_address {
         dashboard.event(
             "warn",
-            "vault wallet matches executor wallet; production segregation is compromised",
+            "vault wallet matches executor wallet; hot/cold segregation is compromised",
         );
     }
     if config.profit_address == config.executor_address {
@@ -222,10 +230,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "profit wallet matches executor wallet; hot-wallet profit isolation is compromised",
         );
     }
-    if config.vault_address == config.profit_address {
+    if cold_wallets_collapsed {
+        dashboard.event(
+            "info",
+            "initial two-wallet layout active: executor hot wallet is separated; control/vault/profit share one cold wallet",
+        );
+    } else if config.vault_address == config.profit_address
+        || config.control_address == config.vault_address
+        || config.control_address == config.profit_address
+    {
         dashboard.event(
             "warn",
-            "vault wallet matches profit wallet; treasury separation is reduced",
+            "partial cold-wallet overlap detected; acceptable for bootstrap, split control/vault/profit before larger capital",
         );
     }
 
@@ -254,6 +270,11 @@ async fn wallet_monitor_loop(
     let mut next_sleep = std::time::Duration::from_secs(5);
 
     loop {
+        if dashboard.runtime_paused() {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            continue;
+        }
+
         let Some(endpoint) = rpc_fleet.read_candidates(1).into_iter().next() else {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             continue;

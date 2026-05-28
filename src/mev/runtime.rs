@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::config::{Config, MonitoredTokenConfig};
+use crate::config::{Config, MonitoredTokenConfig, OpportunityMode};
 use crate::dashboard::DashboardHandle;
 use crate::mev::adaptive::{
     AdaptivePolicy, AdaptiveQuoteInput, ClusterKey, ContextSignal, PreflightInput,
@@ -347,6 +347,9 @@ pub async fn run(
         let dashboard = dashboard.clone();
         tokio::spawn(async move {
             while let Some(task) = recv_from_shared_channel(&rx).await {
+                if dashboard.runtime_paused() {
+                    continue;
+                }
                 if let Some(decoded) = process_lookup_decode_task(
                     task,
                     config.clone(),
@@ -380,6 +383,9 @@ pub async fn run(
 
         tokio::spawn(async move {
             while let Some(candidate) = recv_from_shared_channel(&rx).await {
+                if dashboard.runtime_paused() {
+                    continue;
+                }
                 if let Some(ready) = process_evaluation_task(
                     candidate,
                     config.clone(),
@@ -408,6 +414,9 @@ pub async fn run(
     loop {
         tokio::select! {
             Some(tx_hash) = tx_hash_stream.recv() => {
+                if dashboard.runtime_paused() {
+                    continue;
+                }
                 if last_profile_refresh.elapsed() >= Duration::from_secs(60) {
                     refresh_historical_profiles(&adaptive, &storage, &dashboard);
                     last_profile_refresh = Instant::now();
@@ -481,6 +490,10 @@ fn connect_mempool_fan_in(
         let dashboard = dashboard.clone();
         tokio::spawn(async move {
             loop {
+                if dashboard.runtime_paused() {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
                 match Ws::connect(ws_url.clone()).await {
                     Ok(ws) => {
                         dashboard.event("info", format!("mempool ws connected {}", ws_url));
@@ -489,6 +502,9 @@ fn connect_mempool_fan_in(
                         match subscribe_result {
                             Ok(mut stream) => {
                                 while let Some(hash) = stream.next().await {
+                                    if dashboard.runtime_paused() {
+                                        break;
+                                    }
                                     if tx.send(hash).is_err() {
                                         return;
                                     }
@@ -620,6 +636,7 @@ async fn process_lookup_decode_task(
         &tx,
         &config.monitored_tokens,
         ethers::utils::parse_ether(config.mev.effective_min_large_swap_eth().to_string()).ok()?,
+        config.mev.opportunity_mode(),
     ) else {
         latency_trace.decode_swap_us = Some(elapsed_us(decode_started));
         latency_trace.total_internal_us = Some(elapsed_us(task.candidate_started));
@@ -929,6 +946,7 @@ async fn process_evaluation_task(
     if std::env::var("MEV_EVM_PREFLIGHT_ENABLED")
         .unwrap_or_default()
         .eq_ignore_ascii_case("true")
+        && config.mev.opportunity_mode() != OpportunityMode::Scavenger
     {
         let preflight_started = std::time::Instant::now();
 
@@ -1174,6 +1192,9 @@ fn should_override_preflight_reject(
                 && preflight.preflight_score >= 0.12
                 && preflight.gas_pressure <= 1.05
         }
+        crate::config::OpportunityMode::Scavenger => {
+            preflight.preflight_score >= 0.02 && preflight.gas_pressure <= 1.25
+        }
     }
 }
 
@@ -1192,6 +1213,12 @@ fn should_override_adaptive_reject(config: &Config, quote: &crate::mev::adaptive
                 && quote.risk_score <= 0.95
                 && quote.gas_pressure <= 1.00
         }
+        crate::config::OpportunityMode::Scavenger => {
+            quote.ev_real_usd >= config.mev.effective_min_profit_usd() * 0.20
+                && quote.p_positive >= 0.08
+                && quote.risk_score <= 0.99
+                && quote.gas_pressure <= 1.20
+        }
     }
 }
 
@@ -1200,6 +1227,11 @@ pub(crate) fn passes_quality_gate(
     payload: &crate::mev::execution::payload_builder::ExecutionPayload,
     execution_cost_wei: U256,
 ) -> bool {
+    if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
+        return !payload.expected_profit_wei.is_zero()
+            && payload.price_impact_bps <= config.mev.effective_max_price_impact_bps();
+    }
+
     let roi = roi_bps(payload.expected_profit_wei, execution_cost_wei);
     let impact_score = ((payload.price_impact_bps as f64
         / config.mev.effective_max_price_impact_bps().max(1) as f64)
@@ -1281,14 +1313,29 @@ pub(crate) fn fast_preflight_gate(
         - context_signal.priority_score.clamp(0.0, 1.0) * (0.03 + context_confidence * 0.05))
         .clamp(0.0, 1.0);
 
-    let reject_reason = if ev_upper_bound_usd < config.mev.effective_min_profit_usd() * 1.5 {
-        Some("ev_upper_bound_below_min")
-    } else if competition_score_fast > 0.75 {
-        Some("competition_fast_too_high")
-    } else if gas_ratio > 1.8 {
-        Some("gas_ratio_too_high")
-    } else {
-        None
+    let reject_reason = match config.mev.opportunity_mode() {
+        OpportunityMode::Scavenger => {
+            if gas_ratio > 2.40 {
+                Some("gas_ratio_too_high")
+            } else if competition_score_fast > 0.94 {
+                Some("competition_fast_too_high")
+            } else if ev_upper_bound_usd < -estimated_gas_cost_usd * 0.50 {
+                Some("ev_upper_bound_below_min")
+            } else {
+                None
+            }
+        }
+        _ => {
+            if ev_upper_bound_usd < config.mev.effective_min_profit_usd() * 1.5 {
+                Some("ev_upper_bound_below_min")
+            } else if competition_score_fast > 0.75 {
+                Some("competition_fast_too_high")
+            } else if gas_ratio > 1.8 {
+                Some("gas_ratio_too_high")
+            } else {
+                None
+            }
+        }
     };
 
     FastPreflightDecision {
@@ -1346,6 +1393,19 @@ pub(crate) fn passes_ev_gate_v2(
     lookup_latency: std::time::Duration,
     min_profit_wei: U256,
 ) -> bool {
+    if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
+        let lookup_is_fresh = lookup_latency.as_millis()
+            <= u128::from(config.mev.effective_max_pending_age_ms().max(1));
+        let profit_above_threshold = payload.expected_profit_wei >= min_profit_wei;
+        let net_ev_usd = wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price;
+        let gas_budget_ok = payload.gas_limit <= config.mev.max_gas_per_tx;
+
+        return lookup_is_fresh
+            && profit_above_threshold
+            && net_ev_usd >= config.mev.effective_min_profit_usd()
+            && gas_budget_ok;
+    }
+
     let lookup_is_fresh =
         lookup_latency.as_millis() <= u128::from(config.mev.effective_max_pending_age_ms().max(1));
     let large_enough = signal.notional_wei
@@ -1371,6 +1431,19 @@ pub(crate) fn passes_ev_gate_v3(
     lookup_latency: std::time::Duration,
     min_profit_wei: U256,
 ) -> bool {
+    if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
+        let lookup_is_fresh = lookup_latency.as_millis()
+            <= u128::from(config.mev.effective_max_pending_age_ms().max(1));
+        let profit_above_threshold = payload.expected_profit_wei >= min_profit_wei;
+        let net_ev_usd = wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price;
+        let gas_budget_ok = payload.gas_limit <= config.mev.max_gas_per_tx;
+
+        return lookup_is_fresh
+            && profit_above_threshold
+            && net_ev_usd >= config.mev.effective_min_profit_usd()
+            && gas_budget_ok;
+    }
+
     let lookup_is_fresh =
         lookup_latency.as_millis() <= u128::from(config.mev.effective_max_pending_age_ms().max(1));
     let large_enough = signal.notional_wei
@@ -1647,6 +1720,7 @@ pub(crate) fn decode_relevant_swap(
     tx: &Transaction,
     monitored_tokens: &[MonitoredTokenConfig],
     min_large_swap_wei: U256,
+    mode: OpportunityMode,
 ) -> Option<SwapSignal> {
     let selector = selector(tx)?;
     let router = tx.to?;
@@ -1775,8 +1849,13 @@ pub(crate) fn decode_relevant_swap(
         _ => return None,
     };
 
-    let notional_wei = estimate_notional_wei(&signal, monitored_tokens)?;
-    if notional_wei < min_large_swap_wei || signal.path.len() < 2 {
+    let notional_wei = estimate_notional_wei(&signal, monitored_tokens).or_else(|| {
+        (mode == OpportunityMode::Scavenger).then_some(min_large_swap_wei)
+    })?;
+    if signal.path.len() < 2 {
+        return None;
+    }
+    if mode != OpportunityMode::Scavenger && notional_wei < min_large_swap_wei {
         return None;
     }
     signal.notional_wei = notional_wei;

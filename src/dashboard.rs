@@ -11,6 +11,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 
@@ -21,6 +22,7 @@ pub struct DashboardHandle {
     rpc_fleet: Arc<RpcFleet>,
     opportunity_mode: Arc<RwLock<OpportunityMode>>,
     runtime_thresholds: Arc<RwLock<OpportunityThresholds>>,
+    runtime_paused: Arc<AtomicBool>,
     pending: Arc<Mutex<PendingStorageWrites>>,
 }
 
@@ -214,6 +216,7 @@ pub struct DashboardState {
     pub runtime_mode: String,
     pub market_regime: String,
     pub allow_send: bool,
+    pub runtime_paused: bool,
     pub network: String,
     pub native_asset_symbol: String,
     pub control_address: String,
@@ -298,6 +301,18 @@ struct RpcControlResponse {
 #[derive(Debug, Serialize)]
 struct EventsControlResponse {
     ok: bool,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimePauseRequest {
+    paused: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimePauseResponse {
+    ok: bool,
+    paused: bool,
     message: String,
 }
 
@@ -405,6 +420,7 @@ impl DashboardHandle {
                 runtime_mode: "fee-extraction".to_string(),
                 market_regime: "normal".to_string(),
                 allow_send: config.allow_send,
+                runtime_paused: false,
                 network: config.network.clone(),
                 native_asset_symbol: config.native_asset_symbol().to_string(),
                 control_address: format!("{:?}", config.control_address),
@@ -453,12 +469,14 @@ impl DashboardHandle {
             rpc_fleet,
             opportunity_mode: config.mev.opportunity_mode.clone(),
             runtime_thresholds: config.mev.runtime_thresholds.clone(),
+            runtime_paused: Arc::new(AtomicBool::new(false)),
             pending: Arc::new(Mutex::new(PendingStorageWrites::default())),
         }
     }
 
     pub fn snapshot(&self) -> DashboardState {
         let mut state = self.inner.read().expect("dashboard state lock").clone();
+        state.runtime_paused = self.runtime_paused.load(Ordering::Relaxed);
         state.rpc_endpoints = self.rpc_fleet.snapshot();
         if let Ok(toxicity_profiles) = self.storage.toxicity_profiles(12) {
             state.toxicity_profiles = toxicity_profiles;
@@ -521,6 +539,16 @@ impl DashboardHandle {
             &state.rpc_endpoints,
         );
         state
+    }
+
+    pub fn runtime_paused(&self) -> bool {
+        self.runtime_paused.load(Ordering::Relaxed)
+    }
+
+    pub fn set_runtime_paused(&self, paused: bool) {
+        self.runtime_paused.store(paused, Ordering::Relaxed);
+        let mut state = self.inner.write().expect("dashboard state lock");
+        state.runtime_paused = paused;
     }
 
     pub fn event(&self, level: &str, message: impl Into<String>) {
@@ -897,6 +925,7 @@ pub async fn run_server(
         .route("/api/export", get(status))
         .route("/api/rpc/:id/enabled", post(set_rpc_enabled))
         .route("/api/rpc/only-getblock", post(only_getblock))
+        .route("/api/runtime/pause", post(set_runtime_paused))
         .route("/api/events/clear", post(clear_events))
         .route("/api/opportunity-mode/:mode", post(set_opportunity_mode))
         .route("/api/opportunity-thresholds", post(set_opportunity_thresholds))
@@ -1024,6 +1053,20 @@ async fn clear_events(State(dashboard): State<DashboardHandle>) -> impl IntoResp
             }),
         ),
     }
+}
+
+async fn set_runtime_paused(
+    State(dashboard): State<DashboardHandle>,
+    Json(request): Json<RuntimePauseRequest>,
+) -> Json<RuntimePauseResponse> {
+    dashboard.set_runtime_paused(request.paused);
+    let action = if request.paused { "paused" } else { "resumed" };
+    dashboard.event("warn", format!("runtime {action} from dashboard"));
+    Json(RuntimePauseResponse {
+        ok: true,
+        paused: request.paused,
+        message: format!("runtime {action}"),
+    })
 }
 
 async fn set_opportunity_mode(
