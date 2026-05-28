@@ -970,7 +970,13 @@ fn parse_rpc_preference(value: &str) -> Result<RpcPreference, Box<dyn std::error
 }
 
 pub fn parse_opportunity_mode(value: &str) -> Result<OpportunityMode, Box<dyn std::error::Error>> {
-    match value.trim().to_lowercase().as_str() {
+    let normalized = value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_lowercase();
+    match normalized.as_str() {
         "conservative" | "safe" | "atual" => Ok(OpportunityMode::Conservative),
         "balanced" | "medium" | "medio" => Ok(OpportunityMode::Balanced),
         "aggressive" | "bloody" | "sangrento" => Ok(OpportunityMode::Aggressive),
