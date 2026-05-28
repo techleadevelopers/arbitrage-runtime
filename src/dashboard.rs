@@ -259,6 +259,7 @@ pub struct EdgeSampleSnapshot {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ScavengerObserverReport {
     pub status: String,
+    pub phase: String,
     pub observed_secs: u64,
     pub sample_count: u64,
     pub healthy_rpc_now: u64,
@@ -281,6 +282,7 @@ pub struct ScavengerObserverReport {
     pub block_fail_rate_pct: f64,
     pub recommendation: String,
     pub notes: Vec<String>,
+    pub last_completed: Option<Box<ScavengerObserverReport>>,
 }
 
 #[derive(Debug, Clone)]
@@ -298,11 +300,14 @@ struct ScavengerObserverSample {
 #[derive(Default)]
 struct ScavengerObserver {
     samples: VecDeque<ScavengerObserverSample>,
+    current_started_at: Option<Instant>,
+    last_completed: Option<ScavengerObserverReport>,
 }
 
 impl ScavengerObserver {
     fn push(&mut self, state: &DashboardState) {
         let now = Instant::now();
+        self.current_started_at.get_or_insert(now);
         let healthy_rpc = state
             .rpc_endpoints
             .iter()
@@ -331,7 +336,7 @@ impl ScavengerObserver {
             .max()
             .unwrap_or_default();
 
-        self.samples.push_back(ScavengerObserverSample {
+        let sample = ScavengerObserverSample {
             observed_at: now,
             funnel: state.opportunity_funnel.clone(),
             edge_sample_count: state.edge_telemetry.sample_count,
@@ -340,138 +345,174 @@ impl ScavengerObserver {
             disabled_rpc,
             penalized_rpc,
             max_block_age_secs,
-        });
+        };
+        self.samples.push_back(sample.clone());
 
-        while matches!(
-            self.samples.front(),
-            Some(sample) if now.saturating_duration_since(sample.observed_at) > Duration::from_secs(15 * 60)
-        ) {
-            self.samples.pop_front();
+        if self
+            .current_started_at
+            .map(|started| now.saturating_duration_since(started) >= Duration::from_secs(15 * 60))
+            .unwrap_or(false)
+            && self.samples.len() >= 2
+        {
+            self.last_completed = Some(build_scavenger_report(
+                &self.samples,
+                "completed",
+                None,
+            ));
+            self.samples.clear();
+            self.current_started_at = Some(now);
+            self.samples.push_back(sample);
         }
     }
 
     fn report(&self) -> ScavengerObserverReport {
-        let Some(first) = self.samples.front() else {
-            return ScavengerObserverReport::default();
-        };
-        let Some(last) = self.samples.back() else {
-            return ScavengerObserverReport::default();
-        };
+        build_scavenger_report(
+            &self.samples,
+            "current",
+            self.last_completed
+                .clone()
+                .map(Box::new),
+        )
+    }
+}
 
-        let observed_secs = last
-            .observed_at
-            .saturating_duration_since(first.observed_at)
-            .as_secs();
-        let sample_count = self.samples.len() as u64;
-        let avg_healthy_rpc = if self.samples.is_empty() {
-            0.0
-        } else {
-            self.samples
-                .iter()
-                .map(|sample| sample.healthy_rpc as f64)
-                .sum::<f64>()
-                / self.samples.len() as f64
+fn build_scavenger_report(
+    samples: &VecDeque<ScavengerObserverSample>,
+    phase: &str,
+    last_completed: Option<Box<ScavengerObserverReport>>,
+) -> ScavengerObserverReport {
+    let Some(first) = samples.front() else {
+        return ScavengerObserverReport {
+            phase: phase.to_string(),
+            last_completed,
+            ..ScavengerObserverReport::default()
         };
-        let max_block_age_secs = self
-            .samples
+    };
+    let Some(last) = samples.back() else {
+        return ScavengerObserverReport {
+            phase: phase.to_string(),
+            last_completed,
+            ..ScavengerObserverReport::default()
+        };
+    };
+
+    let observed_secs = last
+        .observed_at
+        .saturating_duration_since(first.observed_at)
+        .as_secs();
+    let sample_count = samples.len() as u64;
+    let avg_healthy_rpc = if samples.is_empty() {
+        0.0
+    } else {
+        samples
             .iter()
-            .map(|sample| sample.max_block_age_secs)
-            .max()
-            .unwrap_or_default();
+            .map(|sample| sample.healthy_rpc as f64)
+            .sum::<f64>()
+            / samples.len() as f64
+    };
+    let max_block_age_secs = samples
+        .iter()
+        .map(|sample| sample.max_block_age_secs)
+        .max()
+        .unwrap_or_default();
 
-        let pending_delta = delta(last.funnel.pending_hashes_received, first.funnel.pending_hashes_received);
-        let lookup_ok_delta = delta(last.funnel.tx_lookup_success, first.funnel.tx_lookup_success);
-        let lookup_miss_delta = delta(last.funnel.tx_lookup_miss, first.funnel.tx_lookup_miss);
-        let lookup_shed_delta = delta(last.funnel.tx_lookup_throttled, first.funnel.tx_lookup_throttled);
-        let decode_pass_delta = delta(last.funnel.decode_pass, first.funnel.decode_pass);
-        let block_fail_delta = delta(last.funnel.block_lookup_fail, first.funnel.block_lookup_fail);
-        let payload_reject_delta = delta(last.funnel.payload_reject, first.funnel.payload_reject);
-        let edge_samples_delta = delta(last.edge_sample_count, first.edge_sample_count);
+    let pending_delta = delta(last.funnel.pending_hashes_received, first.funnel.pending_hashes_received);
+    let lookup_ok_delta = delta(last.funnel.tx_lookup_success, first.funnel.tx_lookup_success);
+    let lookup_miss_delta = delta(last.funnel.tx_lookup_miss, first.funnel.tx_lookup_miss);
+    let lookup_shed_delta = delta(last.funnel.tx_lookup_throttled, first.funnel.tx_lookup_throttled);
+    let decode_pass_delta = delta(last.funnel.decode_pass, first.funnel.decode_pass);
+    let block_fail_delta = delta(last.funnel.block_lookup_fail, first.funnel.block_lookup_fail);
+    let payload_reject_delta = delta(last.funnel.payload_reject, first.funnel.payload_reject);
+    let edge_samples_delta = delta(last.edge_sample_count, first.edge_sample_count);
 
-        let lookup_attempts = lookup_ok_delta.saturating_add(lookup_miss_delta);
-        let lookup_hit_rate_pct = pct(lookup_ok_delta, lookup_attempts);
-        let shed_rate_pct = pct(lookup_shed_delta, pending_delta);
-        let decode_pass_rate_pct = pct(decode_pass_delta, lookup_ok_delta);
-        let block_total = delta(last.funnel.block_lookup_success, first.funnel.block_lookup_success)
-            .saturating_add(block_fail_delta);
-        let block_fail_rate_pct = pct(block_fail_delta, block_total);
+    let lookup_attempts = lookup_ok_delta.saturating_add(lookup_miss_delta);
+    let lookup_hit_rate_pct = pct(lookup_ok_delta, lookup_attempts);
+    let shed_rate_pct = pct(lookup_shed_delta, pending_delta);
+    let decode_pass_rate_pct = pct(decode_pass_delta, lookup_ok_delta);
+    let block_total = delta(last.funnel.block_lookup_success, first.funnel.block_lookup_success)
+        .saturating_add(block_fail_delta);
+    let block_fail_rate_pct = pct(block_fail_delta, block_total);
 
-        let mut notes = Vec::new();
-        if observed_secs < 15 * 60 {
-            notes.push(format!("warming up: {}s observed, target 900s", observed_secs));
-        }
-        if last.healthy_rpc == 0 {
-            notes.push("no healthy rpc at last sample".to_string());
-        }
-        if avg_healthy_rpc < 1.0 {
-            notes.push("average healthy rpc below 1.0".to_string());
-        }
-        if last.penalized_rpc > 0 {
-            notes.push(format!("{} rpc in cooldown/rate-limit", last.penalized_rpc));
-        }
-        if block_fail_rate_pct > 5.0 {
-            notes.push(format!("block lookup fail rate high: {:.1}%", block_fail_rate_pct));
-        }
-        if shed_rate_pct < 25.0 && pending_delta > 1_000 {
-            notes.push("shed rate low for high pending flow; rpc may be over-reading".to_string());
-        }
-        if decode_pass_delta == 0 && lookup_ok_delta > 200 {
-            notes.push("lookup ok but decode pass zero; parser/scope may be too narrow".to_string());
-        }
-        if edge_samples_delta == 0 && decode_pass_delta > 0 {
-            notes.push("decode passes without edge samples; payload instrumentation gap".to_string());
-        }
+    let mut notes = Vec::new();
+    if observed_secs < 15 * 60 {
+        notes.push(format!("warming up current cycle: {}s observed, target 900s", observed_secs));
+    }
+    if last.healthy_rpc == 0 {
+        notes.push("no healthy rpc at last sample".to_string());
+    }
+    if avg_healthy_rpc < 1.0 {
+        notes.push("average healthy rpc below 1.0".to_string());
+    }
+    if last.penalized_rpc > 0 {
+        notes.push(format!("{} rpc in cooldown/rate-limit", last.penalized_rpc));
+    }
+    if block_fail_rate_pct > 5.0 {
+        notes.push(format!("block lookup fail rate high: {:.1}%", block_fail_rate_pct));
+    }
+    if shed_rate_pct < 25.0 && pending_delta > 1_000 {
+        notes.push("shed rate low for high pending flow; rpc may be over-reading".to_string());
+    }
+    if decode_pass_delta == 0 && lookup_ok_delta > 200 {
+        notes.push("lookup ok but decode pass zero; parser/scope may be too narrow".to_string());
+    }
+    if edge_samples_delta == 0 && decode_pass_delta > 0 {
+        notes.push("decode passes without edge samples; payload instrumentation gap".to_string());
+    }
 
-        let status = if observed_secs >= 15 * 60
-            && last.healthy_rpc >= 1
-            && avg_healthy_rpc >= 1.0
-            && block_fail_rate_pct <= 5.0
-            && lookup_hit_rate_pct >= 15.0
-            && edge_samples_delta > 0
-        {
-            "READY"
-        } else if last.healthy_rpc >= 1
-            && block_fail_rate_pct <= 10.0
-            && lookup_hit_rate_pct >= 10.0
-            && decode_pass_delta > 0
-        {
-            "WATCH"
-        } else {
-            "NOT_READY"
-        }
-        .to_string();
+    let status = if observed_secs >= 15 * 60
+        && last.healthy_rpc >= 1
+        && avg_healthy_rpc >= 1.0
+        && block_fail_rate_pct <= 5.0
+        && lookup_hit_rate_pct >= 15.0
+        && edge_samples_delta > 0
+    {
+        "READY"
+    } else if observed_secs < 15 * 60 {
+        "WARMING"
+    } else if last.healthy_rpc >= 1
+        && block_fail_rate_pct <= 10.0
+        && lookup_hit_rate_pct >= 10.0
+        && decode_pass_delta > 0
+    {
+        "WATCH"
+    } else {
+        "NOT_READY"
+    }
+    .to_string();
 
-        let recommendation = match status.as_str() {
-            "READY" => "rpc stable for contract deploy test; keep low capital and fanout=1".to_string(),
-            "WATCH" => "continue observing; keep MEV_PENDING_LOOKUP_MAX_PER_SEC at 40-60".to_string(),
-            _ => "do not deploy live execution yet; reduce lookup budget or disable degraded rpc".to_string(),
-        };
+    let recommendation = match status.as_str() {
+        "READY" => "current cycle stable for contract deploy test; keep low capital and fanout=1".to_string(),
+        "WATCH" => "current cycle improved; continue one more clean 15m cycle before live execution".to_string(),
+        "WARMING" => "new clean 15m cycle running; wait for this cycle to close".to_string(),
+        _ => "do not deploy live execution yet; reduce lookup budget or disable degraded rpc".to_string(),
+    };
 
-        ScavengerObserverReport {
-            status,
-            observed_secs,
-            sample_count,
-            healthy_rpc_now: last.healthy_rpc,
-            active_rpc_now: last.active_rpc,
-            disabled_rpc_now: last.disabled_rpc,
-            penalized_rpc_now: last.penalized_rpc,
-            avg_healthy_rpc,
-            max_block_age_secs,
-            pending_delta,
-            lookup_ok_delta,
-            lookup_miss_delta,
-            lookup_shed_delta,
-            decode_pass_delta,
-            block_fail_delta,
-            payload_reject_delta,
-            edge_samples_delta,
-            lookup_hit_rate_pct,
-            shed_rate_pct,
-            decode_pass_rate_pct,
-            block_fail_rate_pct,
-            recommendation,
-            notes,
-        }
+    ScavengerObserverReport {
+        status,
+        phase: phase.to_string(),
+        observed_secs,
+        sample_count,
+        healthy_rpc_now: last.healthy_rpc,
+        active_rpc_now: last.active_rpc,
+        disabled_rpc_now: last.disabled_rpc,
+        penalized_rpc_now: last.penalized_rpc,
+        avg_healthy_rpc,
+        max_block_age_secs,
+        pending_delta,
+        lookup_ok_delta,
+        lookup_miss_delta,
+        lookup_shed_delta,
+        decode_pass_delta,
+        block_fail_delta,
+        payload_reject_delta,
+        edge_samples_delta,
+        lookup_hit_rate_pct,
+        shed_rate_pct,
+        decode_pass_rate_pct,
+        block_fail_rate_pct,
+        recommendation,
+        notes,
+        last_completed,
     }
 }
 
