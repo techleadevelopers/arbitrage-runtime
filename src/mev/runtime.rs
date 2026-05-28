@@ -34,7 +34,7 @@ const MICROBATCH_WINDOW_MS: u64 = 45;
 const MICROBATCH_MAX_CANDIDATES: usize = 4;
 const LOOKUP_DECODE_QUEUE_CAPACITY: usize = 2048;
 const EVAL_QUEUE_CAPACITY: usize = 512;
-const LOOKUP_DECODE_WORKERS_MAX: usize = 4;
+const LOOKUP_DECODE_WORKERS_MAX: usize = 2;
 const EVAL_WORKERS_MAX: usize = 4;
 
 const SWAP_EXACT_TOKENS_FOR_TOKENS: [u8; 4] = [0x38, 0xed, 0x17, 0x39];
@@ -900,10 +900,16 @@ fn effective_pending_lookup_budget(config: &Config, pressure: RpcLookupPressure)
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok());
     let base = configured.unwrap_or_else(|| match config.mev.opportunity_mode() {
-        OpportunityMode::Conservative => 90,
-        OpportunityMode::Aggressive => 150,
-        OpportunityMode::Scavenger => 180,
+        OpportunityMode::Conservative => 60,
+        OpportunityMode::Aggressive => 90,
+        OpportunityMode::Scavenger => 25,
     });
+    let healthy_reader_cap = match config.mev.opportunity_mode() {
+        OpportunityMode::Scavenger => pressure.available_readers.max(1) as u64 * 25,
+        OpportunityMode::Aggressive => pressure.available_readers.max(1) as u64 * 60,
+        OpportunityMode::Conservative => pressure.available_readers.max(1) as u64 * 40,
+    };
+    let base = base.min(healthy_reader_cap);
 
     let pressure_multiplier = if pressure.available_readers == 0 {
         0.03
