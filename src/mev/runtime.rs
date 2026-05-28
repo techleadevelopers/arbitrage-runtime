@@ -5,7 +5,7 @@ use crate::dashboard::DashboardHandle;
 use crate::mev::adaptive::{
     AdaptivePolicy, AdaptiveQuoteInput, ClusterKey, ContextSignal, PreflightInput,
 };
-use crate::mev::amm::uniswap_v2::V2PoolState;
+use crate::mev::amm::uniswap_v2::{amount_out_exact_in, V2PoolState};
 use crate::mev::amm::uniswap_v3::V3PoolState;
 use crate::mev::cache::pool_cache::PoolCache;
 use crate::mev::execution::payload_builder::{EdgeMetadata, ExecutionPayload};
@@ -985,7 +985,9 @@ async fn process_evaluation_task(
         Ok(payload) => payload,
         Err(err) => {
             dashboard.record_opportunity_funnel("payload_reject");
-            if let Some(sample) = extract_edge_sample(&err) {
+            if let Some(sample) = extract_edge_sample(&err).map(|sample| {
+                enrich_edge_explainer_sample(sample, tx_hash, &candidate.signal, &fast_gate)
+            }) {
                 dashboard.record_edge_sample(sample);
             }
             let human_reason = human_payload_error(&err);
@@ -1009,7 +1011,9 @@ async fn process_evaluation_task(
         }
     };
     dashboard.record_opportunity_funnel("payload_built");
-    if let Some(sample) = payload.edge_metadata.clone() {
+    if let Some(sample) = payload.edge_metadata.clone().map(|sample| {
+        enrich_edge_explainer_sample(sample, tx_hash, &candidate.signal, &fast_gate)
+    }) {
         dashboard.record_edge_sample(sample);
     }
     candidate.latency_trace.payload_build_us = Some(elapsed_us(payload_started));
@@ -1759,6 +1763,44 @@ fn extract_edge_sample(error: &str) -> Option<EdgeMetadata> {
     serde_json::from_str::<EdgeMetadata>(json).ok()
 }
 
+fn enrich_edge_explainer_sample(
+    mut sample: EdgeMetadata,
+    tx_hash: H256,
+    signal: &SwapSignal,
+    fast_gate: &FastPreflightDecision,
+) -> EdgeMetadata {
+    sample.victim_tx = short_hash(tx_hash);
+    sample.selector = format!(
+        "0x{:02x}{:02x}{:02x}{:02x}",
+        signal.selector[0], signal.selector[1], signal.selector[2], signal.selector[3]
+    );
+    if sample.path.is_empty() {
+        sample.path = signal.path.iter().map(|address| format!("{address:?}")).collect();
+    }
+    if sample.hops == 0 {
+        sample.hops = signal.path_len().saturating_sub(1) as u64;
+    }
+    sample.slippage_window_score = scavenger_slippage_window_hint(signal);
+    sample.pool_imbalance_score = scavenger_impact_imbalance_hint(
+        wei_to_eth_f64(signal.notional_wei),
+        1.0,
+        signal.path_len(),
+    );
+    sample.cross_dex_deviation_bps =
+        ((sample.gross_edge_native * 10_000.0).round() as i64).clamp(-1_000_000, 1_000_000);
+    sample.gas_estimate = sample.gas_estimate.max(
+        fast_gate
+            .estimated_gas_cost_usd
+            .max(0.0)
+            .round()
+            .min(u64::MAX as f64) as u64,
+    );
+    if sample.simulated_extraction_native == 0.0 {
+        sample.simulated_extraction_native = sample.gross_edge_native;
+    }
+    sample
+}
+
 fn compact_text(value: &str, max_chars: usize) -> String {
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() <= max_chars {
@@ -1832,6 +1874,23 @@ pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
     };
 
     let capital_available_wei = contextual_capital_available_wei(config, context_signal)?;
+    let (v2_swap_path, v2_swap_pools) = if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
+        best_scavenger_v2_reverse_route(
+            provider.clone(),
+            config,
+            signal,
+            token_in,
+            token_out,
+            pair,
+            capital_available_wei,
+            pool_cache,
+            block_number,
+        )
+        .await
+        .unwrap_or_else(|| (vec![token_out, token_in], vec![pool]))
+    } else {
+        (vec![token_out, token_in], vec![pool])
+    };
 
     PayloadBuilder::build_fee_extraction_v2(
         config,
@@ -1849,6 +1908,8 @@ pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
             context_priority_score: context_signal.priority_score,
             context_toxicity_score: context_signal.toxicity_score,
             route_kind: AmmRouteKind::UniswapV2,
+            v2_swap_path: Some(v2_swap_path),
+            v2_swap_pools,
         },
     )
 }
@@ -1890,6 +1951,144 @@ async fn find_v2_pair<M: Middleware + 'static>(
     }
 
     Err(compact_payload_errors(errors))
+}
+
+async fn best_scavenger_v2_reverse_route<M: Middleware + 'static>(
+    provider: Arc<M>,
+    config: &Config,
+    signal: &SwapSignal,
+    token_in: Address,
+    token_out: Address,
+    victim_pair: Address,
+    capital_available_wei: U256,
+    pool_cache: &PoolCache,
+    block_number: u64,
+) -> Option<(Vec<Address>, Vec<V2PoolState>)> {
+    let probe_amount = capital_available_wei
+        .saturating_mul(U256::from(25u64))
+        / U256::from(10_000u64);
+    if probe_amount.is_zero() {
+        return None;
+    }
+
+    let mut best: Option<(U256, Vec<Address>, Vec<V2PoolState>)> = None;
+    for route in scavenger_reverse_route_candidates(config, signal, token_in, token_out) {
+        let Some(pools) = load_v2_route_pools(
+            provider.clone(),
+            config,
+            signal.router,
+            &route,
+            victim_pair,
+            pool_cache,
+            block_number,
+        )
+        .await
+        else {
+            continue;
+        };
+        let Some(amount_out) = quote_v2_runtime_route_exact_in(probe_amount, &route, &pools) else {
+            continue;
+        };
+        let replace = best
+            .as_ref()
+            .map(|(best_out, _, _)| amount_out > *best_out)
+            .unwrap_or(true);
+        if replace {
+            best = Some((amount_out, route, pools));
+        }
+    }
+
+    best.map(|(_, route, pools)| (route, pools))
+}
+
+fn scavenger_reverse_route_candidates(
+    config: &Config,
+    signal: &SwapSignal,
+    token_in: Address,
+    token_out: Address,
+) -> Vec<Vec<Address>> {
+    let mut routes = Vec::new();
+    routes.push(vec![token_out, token_in]);
+
+    for token in config.monitored_tokens.iter().take(6) {
+        let mid = token.address;
+        if mid != token_in && mid != token_out {
+            routes.push(vec![token_out, mid, token_in]);
+        }
+    }
+
+    for mid in signal.path.iter().copied().skip(2).take(2) {
+        if mid != token_in && mid != token_out {
+            routes.push(vec![token_out, mid, token_in]);
+        }
+    }
+
+    dedup_routes(routes)
+}
+
+fn dedup_routes(routes: Vec<Vec<Address>>) -> Vec<Vec<Address>> {
+    let mut out = Vec::new();
+    for route in routes {
+        if !out.iter().any(|existing: &Vec<Address>| *existing == route) {
+            out.push(route);
+        }
+    }
+    out
+}
+
+async fn load_v2_route_pools<M: Middleware + 'static>(
+    provider: Arc<M>,
+    config: &Config,
+    router: Address,
+    route: &[Address],
+    victim_pair: Address,
+    pool_cache: &PoolCache,
+    block_number: u64,
+) -> Option<Vec<V2PoolState>> {
+    if route.len() < 2 {
+        return None;
+    }
+
+    let mut pools = Vec::with_capacity(route.len().saturating_sub(1));
+    for edge in route.windows(2) {
+        let (_, pair) = find_v2_pair(provider.clone(), config, router, edge[0], edge[1])
+            .await
+            .ok()?;
+        if pair == Address::zero() {
+            return None;
+        }
+        if route.len() > 2 && pair == victim_pair {
+            return None;
+        }
+        let cached = pool_cache
+            .get_or_fetch_v2(pair, provider.clone(), block_number)
+            .await?;
+        pools.push(V2PoolState {
+            pair,
+            token0: cached.token0,
+            token1: cached.token1,
+            reserve0: cached.reserve0,
+            reserve1: cached.reserve1,
+            fee_bps: 30,
+        });
+    }
+    Some(pools)
+}
+
+fn quote_v2_runtime_route_exact_in(
+    amount_in: U256,
+    route: &[Address],
+    pools: &[V2PoolState],
+) -> Option<U256> {
+    if route.len() < 2 || pools.len() + 1 != route.len() {
+        return None;
+    }
+    let mut amount = amount_in;
+    for (idx, pool) in pools.iter().enumerate() {
+        let (reserve_in, reserve_out) = pool.reserves_for(route[idx], route[idx + 1])?;
+        amount = amount_out_exact_in(amount, reserve_in, reserve_out, pool.fee_bps)?;
+    }
+    Some(amount)
 }
 
 fn push_unique_address(addresses: &mut Vec<Address>, address: Address) {
@@ -2044,6 +2243,8 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
                 fee_tier,
                 path: encoded_path,
             },
+            v2_swap_path: None,
+            v2_swap_pools: Vec::new(),
         },
     )
 }

@@ -4,7 +4,7 @@
 
 use crate::config::{Config, OpportunityMode};
 use crate::mev::amm::uniswap_v2::{
-    amount_out_exact_in, select_best_size_candidate, SizeCandidate,
+    amount_out_exact_in, select_best_size_candidate, SizeCandidate, V2PoolState,
 };
 use crate::mev::amm::uniswap_v3::{
     select_best_v3_size_candidate, size_candidates_v3, V3PoolState, V3SizeCandidate,
@@ -45,9 +45,29 @@ pub struct ExecutionPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgeMetadata {
+    #[serde(default)]
+    pub victim_tx: String,
+    #[serde(default)]
+    pub selector: String,
     pub status: String,
     pub reason: String,
     pub route_kind: String,
+    #[serde(default)]
+    pub path: Vec<String>,
+    #[serde(default)]
+    pub hops: u64,
+    #[serde(default)]
+    pub impacted_pools: Vec<String>,
+    #[serde(default)]
+    pub slippage_window_score: f64,
+    #[serde(default)]
+    pub pool_imbalance_score: f64,
+    #[serde(default)]
+    pub cross_dex_deviation_bps: i64,
+    #[serde(default)]
+    pub gas_estimate: u64,
+    #[serde(default)]
+    pub simulated_extraction_native: f64,
     pub best_size_bps: u64,
     pub amount_in_wei: String,
     pub amount_out_wei: String,
@@ -79,6 +99,8 @@ pub struct FeeExtractionBuildInput {
     pub context_priority_score: f64,
     pub context_toxicity_score: f64,
     pub route_kind: AmmRouteKind,
+    pub v2_swap_path: Option<Vec<Address>>,
+    pub v2_swap_pools: Vec<V2PoolState>,
 }
 
 pub struct PayloadBuilder;
@@ -144,9 +166,20 @@ impl PayloadBuilder {
         } else {
             &[1_000, 2_000, 3_500, 5_000, 7_500]
         };
+        let swap_path = input
+            .v2_swap_path
+            .clone()
+            .unwrap_or_else(|| vec![input.token_out, input.token_in]);
+        let route_pools = if input.v2_swap_pools.is_empty() {
+            vec![pool_after]
+        } else {
+            input.v2_swap_pools.clone()
+        };
         let candidates = fee_extraction_v2_size_candidates(
             reserve_in,
             reserve_out,
+            &swap_path,
+            &route_pools,
             input.capital_available_wei,
             gas_cost,
             pool_after.fee_bps,
@@ -156,6 +189,8 @@ impl PayloadBuilder {
         let blocked_sample = best_v2_edge_metadata(
             reserve_in,
             reserve_out,
+            &swap_path,
+            &route_pools,
             input.capital_available_wei,
             pool_after.fee_bps,
             sizing_fractions,
@@ -222,9 +257,22 @@ impl PayloadBuilder {
         }
 
         let edge_metadata = EdgeMetadata {
+            victim_tx: String::new(),
+            selector: String::new(),
             status: "payload_built".to_string(),
             reason: "selected positive gross edge".to_string(),
             route_kind: "v2".to_string(),
+            path: swap_path.iter().map(|address| format!("{address:?}")).collect(),
+            hops: swap_path.len().saturating_sub(1) as u64,
+            impacted_pools: route_pools
+                .iter()
+                .map(|pool| format!("{:?}", pool.pair))
+                .collect(),
+            slippage_window_score: 0.0,
+            pool_imbalance_score: 0.0,
+            cross_dex_deviation_bps: 0,
+            gas_estimate,
+            simulated_extraction_native: wei_to_eth_f64(gross_profit_wei),
             best_size_bps: capital_fraction_bps,
             amount_in_wei: amount_in.to_string(),
             amount_out_wei: amount_out.to_string(),
@@ -254,7 +302,7 @@ impl PayloadBuilder {
         })?;
         let step = EncodedSwapStep {
             router: input.router,
-            path: vec![input.token_out, input.token_in],
+            path: swap_path,
             amount_in,
             min_out: min_amount_out,
         };
@@ -431,9 +479,19 @@ impl PayloadBuilder {
         }
 
         let edge_metadata = EdgeMetadata {
+            victim_tx: String::new(),
+            selector: String::new(),
             status: "payload_built".to_string(),
             reason: "selected positive v3 gross edge".to_string(),
             route_kind: "v3".to_string(),
+            path: vec![format!("{:?}", input.token_out), format!("{:?}", input.token_in)],
+            hops: 1,
+            impacted_pools: vec![format!("{:?}", input.pair)],
+            slippage_window_score: 0.0,
+            pool_imbalance_score: 0.0,
+            cross_dex_deviation_bps: 0,
+            gas_estimate,
+            simulated_extraction_native: wei_to_eth_f64(gross_profit_wei),
             best_size_bps: capital_fraction_bps,
             amount_in_wei: amount_in.to_string(),
             amount_out_wei: amount_out.to_string(),
@@ -543,6 +601,8 @@ fn format_optional_address(address: Option<Address>) -> String {
 fn best_v2_edge_metadata(
     borrow_reserve: U256,
     profit_reserve: U256,
+    route_path: &[Address],
+    route_pools: &[V2PoolState],
     capital_cap: U256,
     fee_bps: u64,
     fractions_bps: &[u64],
@@ -557,8 +617,7 @@ fn best_v2_edge_metadata(
         if amount_in.is_zero() || amount_in >= borrow_reserve {
             continue;
         }
-        let Some(amount_out) =
-            amount_out_exact_in(amount_in, borrow_reserve, profit_reserve, fee_bps)
+        let Some(amount_out) = quote_v2_route_exact_in(amount_in, route_path, route_pools, fee_bps)
         else {
             continue;
         };
@@ -581,9 +640,22 @@ fn best_v2_edge_metadata(
             profit_reserve,
         );
         let sample = EdgeMetadata {
+            victim_tx: String::new(),
+            selector: String::new(),
             status: status.to_string(),
             reason: reason.to_string(),
             route_kind: "v2".to_string(),
+            path: route_path.iter().map(|address| format!("{address:?}")).collect(),
+            hops: route_path.len().saturating_sub(1) as u64,
+            impacted_pools: route_pools
+                .iter()
+                .map(|pool| format!("{:?}", pool.pair))
+                .collect(),
+            slippage_window_score: 0.0,
+            pool_imbalance_score: 0.0,
+            cross_dex_deviation_bps: 0,
+            gas_estimate: 0,
+            simulated_extraction_native: gross_edge_native,
             best_size_bps: bps,
             amount_in_wei: amount_in.to_string(),
             amount_out_wei: amount_out.to_string(),
@@ -628,9 +700,19 @@ fn best_v3_edge_metadata(
 ) -> Option<EdgeMetadata> {
     let candidate = candidates.iter().max_by_key(|candidate| candidate.gross_profit_wei)?;
     Some(EdgeMetadata {
+        victim_tx: String::new(),
+        selector: String::new(),
         status: status.to_string(),
         reason: reason.to_string(),
         route_kind: "v3".to_string(),
+        path: vec![format!("{:?}", input.token_out), format!("{:?}", input.token_in)],
+        hops: 1,
+        impacted_pools: vec![format!("{:?}", input.pair)],
+        slippage_window_score: 0.0,
+        pool_imbalance_score: 0.0,
+        cross_dex_deviation_bps: 0,
+        gas_estimate: 0,
+        simulated_extraction_native: wei_to_eth_f64(candidate.gross_profit_wei),
         best_size_bps: candidate.capital_fraction_bps,
         amount_in_wei: candidate.amount_in.to_string(),
         amount_out_wei: candidate.amount_out.to_string(),
@@ -663,6 +745,8 @@ fn select_scavenger_v2_candidate(candidates: &[SizeCandidate]) -> Option<SizeCan
 fn fee_extraction_v2_size_candidates(
     borrow_reserve: U256,
     profit_reserve: U256,
+    route_path: &[Address],
+    route_pools: &[V2PoolState],
     capital_cap: U256,
     gas_cost_wei: U256,
     fee_bps: u64,
@@ -679,7 +763,7 @@ fn fee_extraction_v2_size_candidates(
         if amount_in.is_zero() || amount_in >= borrow_reserve {
             continue;
         }
-        let Some(amount_out) = amount_out_exact_in(amount_in, borrow_reserve, profit_reserve, fee_bps)
+        let Some(amount_out) = quote_v2_route_exact_in(amount_in, route_path, route_pools, fee_bps)
         else {
             continue;
         };
@@ -720,6 +804,35 @@ fn fee_extraction_v2_size_candidates(
         });
     }
     candidates
+}
+
+fn quote_v2_route_exact_in(
+    amount_in: U256,
+    route_path: &[Address],
+    route_pools: &[V2PoolState],
+    fallback_fee_bps: u64,
+) -> Option<U256> {
+    if route_path.len() < 2 || route_pools.len() + 1 != route_path.len() {
+        return None;
+    }
+
+    let mut amount = amount_in;
+    for (idx, pool) in route_pools.iter().enumerate() {
+        let token_in = route_path[idx];
+        let token_out = route_path[idx + 1];
+        let (reserve_in, reserve_out) = pool.reserves_for(token_in, token_out)?;
+        amount = amount_out_exact_in(
+            amount,
+            reserve_in,
+            reserve_out,
+            if pool.fee_bps == 0 {
+                fallback_fee_bps
+            } else {
+                pool.fee_bps
+            },
+        )?;
+    }
+    Some(amount)
 }
 
 fn v2_repayment_amount_in_profit_token(
