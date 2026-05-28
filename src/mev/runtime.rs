@@ -546,7 +546,7 @@ async fn lookup_pending_tx_parallel(
     tx_hash: H256,
 ) -> Option<Transaction> {
     let mut join_set = JoinSet::new();
-    for handle in rpc_fleet.read_candidates(3) {
+    for handle in rpc_fleet.read_candidates(pending_lookup_fanout()) {
         let rpc_fleet = rpc_fleet.clone();
         join_set.spawn(async move {
             rpc_fleet.reserve_read_selection(handle.id);
@@ -612,11 +612,17 @@ async fn process_lookup_decode_task(
     }
 
     let decode_started = Instant::now();
-    let signal = decode_relevant_swap(
+    let Some(signal) = decode_relevant_swap(
         &tx,
         &config.monitored_tokens,
         ethers::utils::parse_ether(config.mev.effective_min_large_swap_eth().to_string()).ok()?,
-    )?;
+    ) else {
+        latency_trace.decode_swap_us = Some(elapsed_us(decode_started));
+        latency_trace.total_internal_us = Some(elapsed_us(task.candidate_started));
+        dashboard.record_reject_reason("decode", "not_relevant_or_below_min");
+        latency_trace.emit(&config, &dashboard, task.tx_hash, "reject", "decode_no_signal");
+        return None;
+    };
     latency_trace.decode_swap_us = Some(elapsed_us(decode_started));
 
     let hour_utc = chrono::Utc::now().hour() as u8;
@@ -634,6 +640,9 @@ async fn process_lookup_decode_task(
 
     let gas_price = tx.max_fee_per_gas.or(tx.gas_price).unwrap_or_default();
     if gas_price.is_zero() {
+        dashboard.record_reject_reason("decode", "zero_gas_price");
+        latency_trace.total_internal_us = Some(elapsed_us(task.candidate_started));
+        latency_trace.emit(&config, &dashboard, task.tx_hash, "reject", "zero_gas_price");
         return None;
     }
 
@@ -656,6 +665,14 @@ async fn process_lookup_decode_task(
         latency_trace,
         block_number,
     })
+}
+
+fn pending_lookup_fanout() -> usize {
+    std::env::var("MEV_PENDING_LOOKUP_FANOUT")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, 3)
 }
 
 // NOVA FUNÇÃO auxiliar
