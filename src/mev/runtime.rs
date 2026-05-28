@@ -316,11 +316,11 @@ impl PendingLookupBackpressure {
 
         self.dropped_since_event = self.dropped_since_event.saturating_add(1);
         dashboard.record_opportunity_funnel("tx_lookup_throttled");
-        dashboard.record_reject_reason(
-            "pending_lookup",
-            if queue_soft_full { "queue_backpressure" } else { "rpc_budget" },
-        );
         if now.saturating_duration_since(self.last_event_at) >= Duration::from_secs(5) {
+            dashboard.record_reject_reason(
+                "pending_lookup",
+                if queue_soft_full { "queue_backpressure" } else { "rpc_budget" },
+            );
             dashboard.event(
                 "warn",
                 format!(
@@ -870,16 +870,19 @@ fn effective_pending_lookup_budget(config: &Config, pressure: RpcLookupPressure)
     });
 
     let pressure_multiplier = if pressure.available_readers == 0 {
-        0.08
+        0.03
+    } else if pressure.available_readers <= 1 && pressure.rate_limited_readers > 0 {
+        0.18
     } else if pressure.available_readers <= 1 || pressure.rate_limited_readers > 0 {
-        0.35
+        0.28
     } else if pressure.failing_readers > pressure.available_readers {
-        0.55
+        0.45
     } else {
         1.0
     };
 
-    ((base as f64) * pressure_multiplier).round().max(10.0) as u64
+    let floor = if pressure.available_readers == 0 { 4.0 } else { 10.0 };
+    ((base as f64) * pressure_multiplier).round().max(floor) as u64
 }
 
 async fn get_current_block_parallel(rpc_fleet: Arc<RpcFleet>) -> Option<u64> {
