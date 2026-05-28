@@ -46,6 +46,7 @@ struct RpcEndpointState {
     timeout_failures: u32,
     rate_limit_failures: u32,
     stale_failures: u32,
+    last_failure_decay_at: Instant,
     disabled: bool,
     disabled_reason: Option<String>,
     cooldown_until: Option<Instant>,
@@ -148,6 +149,7 @@ impl RpcFleet {
                     timeout_failures: 0,
                     rate_limit_failures: 0,
                     stale_failures: 0,
+                    last_failure_decay_at: Instant::now(),
                     disabled: false,
                     disabled_reason: None,
                     cooldown_until: None,
@@ -249,6 +251,7 @@ impl RpcFleet {
         };
         let mut state = endpoint.state.lock().expect("rpc endpoint state lock");
         prune_burst_reservations(&mut state, now);
+        decay_failure_counters(&mut state, now);
         state.avg_latency = Some(match state.avg_latency {
             Some(previous) => Duration::from_secs_f64(
                 previous.as_secs_f64() * 0.72 + latency.as_secs_f64() * 0.28,
@@ -281,11 +284,12 @@ impl RpcFleet {
         };
         let mut state = endpoint.state.lock().expect("rpc endpoint state lock");
         prune_burst_reservations(&mut state, now);
+        decay_failure_counters(&mut state, now);
         state.failures = state.failures.saturating_add(1);
         let cooldown = match kind {
             RpcFailureKind::RateLimited => {
                 state.rate_limit_failures = state.rate_limit_failures.saturating_add(1);
-                Duration::from_secs((2u64.saturating_pow(state.rate_limit_failures.min(5))) * 2)
+                Duration::from_secs((2u64.saturating_pow(state.rate_limit_failures.min(4))) * 2)
             }
             RpcFailureKind::Timeout => {
                 state.timeout_failures = state.timeout_failures.saturating_add(1);
@@ -300,7 +304,7 @@ impl RpcFleet {
             RpcFailureKind::Transport => Duration::from_millis(700),
             RpcFailureKind::Remote => Duration::from_millis(500),
         };
-        let until = now + cooldown.min(Duration::from_secs(90));
+        let until = now + cooldown.min(Duration::from_secs(45));
         state.cooldown_until = Some(match state.cooldown_until {
             Some(existing) if existing > until => existing,
             _ => until,
@@ -352,7 +356,9 @@ impl RpcFleet {
         self.endpoints
             .iter()
             .map(|endpoint| {
-                let state = endpoint.state.lock().expect("rpc endpoint state lock");
+                let mut state = endpoint.state.lock().expect("rpc endpoint state lock");
+                prune_burst_reservations(&mut state, now);
+                decay_failure_counters(&mut state, now);
                 let cooldown_remaining_secs = state
                     .cooldown_until
                     .and_then(|until| until.checked_duration_since(now))
@@ -432,7 +438,9 @@ impl RpcFleet {
             return None;
         }
 
-        let state = endpoint.state.lock().expect("rpc endpoint state lock");
+        let mut state = endpoint.state.lock().expect("rpc endpoint state lock");
+        prune_burst_reservations(&mut state, now);
+        decay_failure_counters(&mut state, now);
         if state.disabled {
             return None;
         }
@@ -447,8 +455,8 @@ impl RpcFleet {
             .avg_latency
             .map(|value| value.as_secs_f64() * 1000.0)
             .unwrap_or(120.0);
-        let failure_penalty = f64::from(state.failures) * 400.0;
-        let rate_limit_penalty = f64::from(state.rate_limit_failures) * 5000.0;
+        let failure_penalty = f64::from(state.failures.min(20)) * 180.0;
+        let rate_limit_penalty = f64::from(state.rate_limit_failures.min(12)) * 900.0;
         let stale_penalty = if matches!(state.last_block_at, Some(at) if at.elapsed() > Duration::from_secs(30))
         {
             500.0
@@ -469,7 +477,7 @@ impl RpcFleet {
         };
         let infura_rate_limited_penalty =
             if matches!(endpoint.kind, RpcKind::Infura) && state.rate_limit_failures > 0 {
-                20_000.0
+                2_500.0
             } else {
                 0.0
             };
@@ -565,6 +573,7 @@ impl RpcFleet {
     fn reserve_burst_units(&self, endpoint: &Arc<RpcEndpoint>, units: u32, now: Instant) {
         let mut state = endpoint.state.lock().expect("rpc endpoint state lock");
         prune_burst_reservations(&mut state, now);
+        decay_failure_counters(&mut state, now);
         state.recent_burst_reservations.push_back(BurstReservation {
             reserved_at: now,
             units,
@@ -665,6 +674,7 @@ fn parse_hex_u256(value: &str) -> Result<U256, String> {
 }
 
 const BURST_WINDOW_MS: u64 = 1_200;
+const FAILURE_DECAY_SECS: u64 = 20;
 
 fn prune_burst_reservations(state: &mut RpcEndpointState, now: Instant) {
     while matches!(
@@ -673,6 +683,19 @@ fn prune_burst_reservations(state: &mut RpcEndpointState, now: Instant) {
     ) {
         state.recent_burst_reservations.pop_front();
     }
+}
+
+fn decay_failure_counters(state: &mut RpcEndpointState, now: Instant) {
+    let elapsed = now.saturating_duration_since(state.last_failure_decay_at);
+    let steps = (elapsed.as_secs() / FAILURE_DECAY_SECS) as u32;
+    if steps == 0 {
+        return;
+    }
+    state.last_failure_decay_at += Duration::from_secs(FAILURE_DECAY_SECS * steps as u64);
+    state.failures = state.failures.saturating_sub(steps.saturating_mul(2));
+    state.timeout_failures = state.timeout_failures.saturating_sub(steps.saturating_mul(2));
+    state.stale_failures = state.stale_failures.saturating_sub(steps.saturating_mul(2));
+    state.rate_limit_failures = state.rate_limit_failures.saturating_sub(steps.saturating_mul(4));
 }
 
 fn burst_load_units(state: &RpcEndpointState, now: Instant) -> u32 {
@@ -691,7 +714,7 @@ fn endpoint_burst_capacity_units(kind: RpcKind, send_mode: bool) -> u32 {
     match (kind, send_mode) {
         (RpcKind::Alchemy, false) => 24,
         (RpcKind::Alchemy, true) => 18,
-        (RpcKind::Infura, false) => 18,
+        (RpcKind::Infura, false) => 30,
         (RpcKind::Infura, true) => 12,
         (RpcKind::Tenderly, false) => 10,
         (RpcKind::Tenderly, true) => 8,
