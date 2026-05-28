@@ -135,7 +135,7 @@ impl OpportunityMode {
         match self {
             OpportunityMode::Conservative => "conservative",
             OpportunityMode::Balanced => "balanced",
-            OpportunityMode::Aggressive => "aggressive",
+            OpportunityMode::Aggressive => "sangrento",
         }
     }
 }
@@ -620,12 +620,6 @@ impl MevConfig {
                 min_profit_usd: self.min_profit_usd,
                 min_liquidity_eth: self.min_liquidity_eth,
             })
-    }
-
-    pub fn set_runtime_thresholds(&self, thresholds: OpportunityThresholds) {
-        if let Ok(mut guard) = self.runtime_thresholds.write() {
-            *guard = thresholds;
-        }
     }
 
     pub fn opportunity_mode(&self) -> OpportunityMode {
