@@ -922,7 +922,7 @@ async fn process_evaluation_task(
     }
 
     let payload_started = Instant::now();
-    let Some(payload) = build_payload_with_fallback_parallel(
+    let payload = match build_payload_with_fallback_parallel(
         rpc_fleet.clone(),
         config.clone(),
         candidate.signal.clone(),
@@ -932,12 +932,28 @@ async fn process_evaluation_task(
         candidate.block_number,
     )
     .await
-    else {
-        dashboard.record_opportunity_funnel("payload_reject");
-        candidate.latency_trace.payload_build_us = Some(elapsed_us(payload_started));
-        candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
-        candidate.latency_trace.emit(&config, &dashboard, tx_hash, "reject", "payload_build");
-        return None;
+    {
+        Ok(payload) => payload,
+        Err(err) => {
+            dashboard.record_opportunity_funnel("payload_reject");
+            dashboard.record_reject_reason("payload_build", &err);
+            dashboard.event(
+                "warn",
+                format!(
+                    "payload build rejected mode={} victim={:?}: {}",
+                    config.mev.opportunity_mode().as_str(),
+                    tx_hash,
+                    err
+                ),
+            );
+            candidate.latency_trace.payload_build_us = Some(elapsed_us(payload_started));
+            candidate.latency_trace.total_internal_us =
+                Some(elapsed_us(candidate.candidate_started));
+            candidate
+                .latency_trace
+                .emit(&config, &dashboard, tx_hash, "reject", "payload_build");
+            return None;
+        }
     };
     dashboard.record_opportunity_funnel("payload_built");
     candidate.latency_trace.payload_build_us = Some(elapsed_us(payload_started));
@@ -1491,7 +1507,7 @@ async fn build_payload_with_fallback_parallel(
     context_signal: ContextSignal,
     pool_cache: Arc<PoolCache>, // NOVO
     block_number: u64,          // NOVO
-) -> Option<ExecutionPayload> {
+) -> Result<ExecutionPayload, String> {
     let mut join_set = JoinSet::new();
     for handle in rpc_fleet.read_candidates(3) {
         let rpc_fleet = rpc_fleet.clone();
@@ -1516,23 +1532,53 @@ async fn build_payload_with_fallback_parallel(
             {
                 Ok(payload) => {
                     rpc_fleet.record_success(handle.id, started.elapsed(), Some(block_number));
-                    Some(payload)
+                    Ok(payload)
                 }
                 Err(err) => {
                     rpc_fleet.record_failure(handle.id, RpcFleet::classify_failure(&err));
-                    None
+                    Err(err)
                 }
             }
         });
     }
 
+    let mut errors = Vec::new();
     while let Some(result) = join_set.join_next().await {
-        if let Ok(Some(payload)) = result {
-            join_set.abort_all();
-            return Some(payload);
+        match result {
+            Ok(Ok(payload)) => {
+                join_set.abort_all();
+                return Ok(payload);
+            }
+            Ok(Err(err)) => errors.push(err),
+            Err(err) => errors.push(err.to_string()),
         }
     }
-    None
+    Err(compact_payload_errors(errors))
+}
+
+fn compact_payload_errors(errors: Vec<String>) -> String {
+    let mut unique = Vec::new();
+    for err in errors {
+        let normalized = err.trim();
+        if normalized.is_empty() {
+            continue;
+        }
+        if !unique
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(normalized))
+        {
+            unique.push(normalized.to_string());
+        }
+        if unique.len() >= 3 {
+            break;
+        }
+    }
+
+    if unique.is_empty() {
+        "all payload builders failed without error detail".to_string()
+    } else {
+        unique.join(" | ")
+    }
 }
 
 fn contextual_capital_available_wei(
