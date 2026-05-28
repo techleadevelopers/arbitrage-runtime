@@ -258,7 +258,13 @@ impl Config {
             .unwrap_or_else(|_| "25000".to_string())
             .parse::<u64>()?;
         let max_infura_endpoints = env::var("MAX_INFURA_ENDPOINTS")
-            .unwrap_or_else(|_| "2".to_string())
+            .unwrap_or_else(|_| {
+                if network == "polygon" {
+                    "0".to_string()
+                } else {
+                    "2".to_string()
+                }
+            })
             .parse::<usize>()?;
         let rpc_read_preference = parse_network_rpc_preference(&network, "RPC_READ_PREFERENCE")?;
         let rpc_send_preference = parse_network_rpc_preference(&network, "RPC_SEND_PREFERENCE")?;
@@ -816,6 +822,9 @@ fn parse_rpc_urls(network: &str) -> Vec<(String, String)> {
             "RPC_URL_BSC",
             "RPC_URL_BNB",
             "RPC_URL_POLYGON",
+            "RPC_URL_POLYGON_2",
+            "RPC_URL_POLYGON_3",
+            "RPC_URL_POLYGON_4",
             "RPC_URL_ETHEREUM",
             "RPC_URL_ARBITRUM",
         ],
@@ -831,11 +840,17 @@ fn parse_rpc_urls(network: &str) -> Vec<(String, String)> {
             "GETBLOCK_RPC_URL_BSC",
             "GETBLOCK_RPC_URL_BNB",
             "GETBLOCK_RPC_URL_POLYGON",
+            "GETBLOCK_RPC_URL_POLYGON_2",
+            "GETBLOCK_RPC_URL_POLYGON_3",
+            "GETBLOCK_RPC_URL_POLYGON_4",
             "GETBLOCK_RPC_URL_ETHEREUM",
             "GETBLOCK_RPC_URL_ARBITRUM",
             "GETBLOCK_BSC",
             "GETBLOCK_BNB",
             "GETBLOCK_POLYGON",
+            "GETBLOCK_POLYGON_2",
+            "GETBLOCK_POLYGON_3",
+            "GETBLOCK_POLYGON_4",
             "GETBLOCK_ETHEREUM",
             "GETBLOCK_ARBITRUM",
         ],
@@ -850,10 +865,6 @@ fn push_rpc_url_entries(
     keys: &[&str],
     urls: &mut Vec<(String, String)>,
 ) {
-    let mut label_index = urls
-        .iter()
-        .filter(|(name, _)| name.starts_with(label))
-        .count();
     for key in prioritized_network_keys(network, keys) {
         if let Ok(value) = env::var(key) {
             for item in value
@@ -865,12 +876,25 @@ fn push_rpc_url_entries(
                     .iter()
                     .any(|(_, existing)| existing.eq_ignore_ascii_case(item))
                 {
-                    label_index += 1;
-                    urls.push((format!("{label}-{label_index}"), item.to_string()));
+                    let effective_label = if label == "rpc" && looks_like_getblock_url(item) {
+                        "getblock"
+                    } else {
+                        label
+                    };
+                    let label_index = urls
+                        .iter()
+                        .filter(|(name, _)| name.starts_with(effective_label))
+                        .count()
+                        + 1;
+                    urls.push((format!("{effective_label}-{label_index}"), item.to_string()));
                 }
             }
         }
     }
+}
+
+fn looks_like_getblock_url(url: &str) -> bool {
+    url.to_ascii_lowercase().contains("getblock.io")
 }
 
 fn parse_optional_address_env(
@@ -1033,7 +1057,7 @@ fn rpc_name_allowed_for_network(network: &str, name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     match network {
         "bsc" | "bnb" => lower.starts_with("getblock-"),
-        "polygon" => lower.starts_with("alchemy-") || lower.starts_with("infura-"),
+        "polygon" => lower.starts_with("alchemy-") || lower.starts_with("getblock-") || lower.starts_with("rpc-"),
         _ => true,
     }
 }
