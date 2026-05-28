@@ -815,10 +815,10 @@ pub async fn run_server(
         .route("/js/radar.js", get(js_radar))
         .route("/api/status", get(status))
         .route("/api/export", get(status))
-        .route("/api/rpc/{id}/enabled", post(set_rpc_enabled))
+        .route("/api/rpc/:id/enabled", post(set_rpc_enabled))
         .route("/api/rpc/only-getblock", post(only_getblock))
         .route("/api/events/clear", post(clear_events))
-        .route("/api/opportunity-mode/{mode}", post(set_opportunity_mode))
+        .route("/api/opportunity-mode/:mode", post(set_opportunity_mode))
         .route("/api/opportunity-thresholds", post(set_opportunity_thresholds))
         .with_state(dashboard)
         .layer(CorsLayer::permissive());
