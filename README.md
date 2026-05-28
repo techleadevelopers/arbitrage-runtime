@@ -1212,10 +1212,13 @@ For BNB Chain configuration, use the `_BSC` suffix as the canonical operator-fac
 - `RPC_SEND_PREFERENCE`
 - `MEV_PENDING_LOOKUP_FANOUT`
 - `MEV_BLOCK_LOOKUP_FANOUT`
+- `MEV_PAYLOAD_BUILD_FANOUT`
 
 `MEV_PENDING_LOOKUP_FANOUT` controls how many read RPC endpoints are queried for each pending transaction hash before decode. The default is `1`. Raising it to `2` or `3` can improve pending transaction hit rate, but it multiplies paid RPC usage and can trigger provider rate limits.
 
 `MEV_BLOCK_LOOKUP_FANOUT` controls how many read RPC endpoints are queried for the current block once a transaction already decoded into a relevant candidate. The default is `1`. Block lookup intentionally happens after decode so irrelevant transactions do not spend extra RPC.
+
+`MEV_PAYLOAD_BUILD_FANOUT` controls how many read RPC endpoints race during payload construction. The default is `1` in `scavenger` and `3` in the other modes. Keep it at `1` when providers show rate limiting; payload build is the most expensive read stage because it performs factory, pair/pool, and pool-state calls.
 
 The runtime tracks burst reservations per endpoint and decays failure counters over time. Short cooldowns or old provider errors should not permanently mark an endpoint as unusable. The operator panel reports:
 

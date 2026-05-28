@@ -8,7 +8,7 @@ use crate::mev::adaptive::{
 use crate::mev::amm::uniswap_v2::V2PoolState;
 use crate::mev::amm::uniswap_v3::V3PoolState;
 use crate::mev::cache::pool_cache::PoolCache;
-use crate::mev::execution::payload_builder::ExecutionPayload;
+use crate::mev::execution::payload_builder::{EdgeMetadata, ExecutionPayload};
 use crate::mev::execution::payload_builder::{
     AmmRouteKind, FeeExtractionBuildInput, PayloadBuilder,
 };
@@ -718,8 +718,23 @@ fn pending_lookup_fanout() -> usize {
 async fn get_current_block_parallel(rpc_fleet: Arc<RpcFleet>) -> Option<u64> {
     let mut join_set = JoinSet::new();
     for handle in rpc_fleet.read_candidates(block_lookup_fanout()) {
+        let rpc_fleet = rpc_fleet.clone();
         let provider = handle.provider.clone();
-        join_set.spawn(async move { provider.get_block_number().await.ok().map(|b| b.as_u64()) });
+        join_set.spawn(async move {
+            rpc_fleet.reserve_read_selection(handle.id);
+            let started = Instant::now();
+            match provider.get_block_number().await {
+                Ok(block) => {
+                    let block = block.as_u64();
+                    rpc_fleet.record_success(handle.id, started.elapsed(), Some(block));
+                    Some(block)
+                }
+                Err(err) => {
+                    rpc_fleet.record_failure(handle.id, RpcFleet::classify_failure(&err.to_string()));
+                    None
+                }
+            }
+        });
     }
 
     while let Some(result) = join_set.join_next().await {
@@ -942,14 +957,18 @@ async fn process_evaluation_task(
         Ok(payload) => payload,
         Err(err) => {
             dashboard.record_opportunity_funnel("payload_reject");
-            dashboard.record_reject_reason("payload_build", &err);
+            if let Some(sample) = extract_edge_sample(&err) {
+                dashboard.record_edge_sample(sample);
+            }
+            let human_reason = human_payload_error(&err);
+            dashboard.record_reject_reason("payload_build", &human_reason);
             dashboard.event(
                 "warn",
                 format!(
                     "payload blocked mode={} tx={} reason={}",
                     config.mev.opportunity_mode().as_str(),
                     short_hash(tx_hash),
-                    human_payload_error(&err)
+                    human_reason
                 ),
             );
             candidate.latency_trace.payload_build_us = Some(elapsed_us(payload_started));
@@ -962,6 +981,9 @@ async fn process_evaluation_task(
         }
     };
     dashboard.record_opportunity_funnel("payload_built");
+    if let Some(sample) = payload.edge_metadata.clone() {
+        dashboard.record_edge_sample(sample);
+    }
     candidate.latency_trace.payload_build_us = Some(elapsed_us(payload_started));
 
     // WAR LEVEL: EVM preflight validation (opcional, ativado por env)
@@ -1504,7 +1526,7 @@ async fn build_payload_with_fallback_parallel(
     block_number: u64,          // NOVO
 ) -> Result<ExecutionPayload, String> {
     let mut join_set = JoinSet::new();
-    for handle in rpc_fleet.read_candidates(3) {
+    for handle in rpc_fleet.read_candidates(payload_build_fanout(&config)) {
         let rpc_fleet = rpc_fleet.clone();
         let provider = handle.provider.clone();
         let signal = signal.clone();
@@ -1551,6 +1573,20 @@ async fn build_payload_with_fallback_parallel(
     Err(compact_payload_errors(errors))
 }
 
+fn payload_build_fanout(config: &Config) -> usize {
+    if let Ok(value) = std::env::var("MEV_PAYLOAD_BUILD_FANOUT") {
+        if let Ok(parsed) = value.trim().parse::<usize>() {
+            return parsed.clamp(1, 3);
+        }
+    }
+
+    if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
+        1
+    } else {
+        3
+    }
+}
+
 fn compact_payload_errors(errors: Vec<String>) -> String {
     let mut unique = Vec::new();
     for err in errors {
@@ -1577,7 +1613,8 @@ fn compact_payload_errors(errors: Vec<String>) -> String {
 }
 
 fn human_payload_error(error: &str) -> String {
-    let lower = error.to_ascii_lowercase();
+    let clean_error = strip_edge_sample(error);
+    let lower = clean_error.to_ascii_lowercase();
     let reason = if lower.contains("missing uniswap v2 factory")
         || lower.contains("missing uniswap v3 factory")
     {
@@ -1600,7 +1637,20 @@ fn human_payload_error(error: &str) -> String {
         "payload build failed"
     };
 
-    format!("{reason} ({})", compact_text(error, 96))
+    format!("{reason} ({})", compact_text(&clean_error, 96))
+}
+
+fn strip_edge_sample(error: &str) -> String {
+    error
+        .split(" | edge_sample=")
+        .next()
+        .unwrap_or(error)
+        .to_string()
+}
+
+fn extract_edge_sample(error: &str) -> Option<EdgeMetadata> {
+    let (_, json) = error.split_once(" | edge_sample=")?;
+    serde_json::from_str::<EdgeMetadata>(json).ok()
 }
 
 fn compact_text(value: &str, max_chars: usize) -> String {
@@ -1653,7 +1703,7 @@ pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
         .get(1)
         .ok_or_else(|| "missing token_out".to_string())?;
 
-    let (_factory, pair) =
+    let (factory, pair) =
         find_v2_pair(provider.clone(), config, signal.router, token_in, token_out).await?;
 
     if pair == Address::zero() {
@@ -1681,6 +1731,7 @@ pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
         config,
         FeeExtractionBuildInput {
             router: signal.router,
+            factory: Some(factory),
             pair,
             recipient,
             token_in,
@@ -1842,7 +1893,7 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
         .get(1)
         .ok_or_else(|| "missing edge token_out".to_string())?;
 
-    let (_factory, pool) =
+    let (factory, pool) =
         find_v3_pool(provider.clone(), config, token_in, token_out, fee_tier).await?;
 
     if pool == Address::zero() {
@@ -1872,6 +1923,7 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
         config,
         FeeExtractionBuildInput {
             router: signal.router,
+            factory: Some(factory),
             pair: pool,
             recipient,
             token_in,

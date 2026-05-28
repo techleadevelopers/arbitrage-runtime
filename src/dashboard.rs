@@ -1,4 +1,5 @@
 use crate::config::{parse_opportunity_mode, Config, OpportunityMode, OpportunityThresholds};
+use crate::mev::execution::payload_builder::EdgeMetadata;
 use crate::rpc::{RpcEndpointSnapshot, RpcFleet};
 use crate::storage::Storage;
 use axum::extract::{Path, State};
@@ -211,6 +212,37 @@ pub struct OpportunityFunnelSnapshot {
     pub submit_failed: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EdgeTelemetrySnapshot {
+    pub sample_count: u64,
+    pub payload_ready_count: u64,
+    pub blocked_count: u64,
+    pub last_sample: Option<EdgeSampleSnapshot>,
+    pub samples: VecDeque<EdgeSampleSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EdgeSampleSnapshot {
+    pub observed_at: String,
+    pub status: String,
+    pub reason: String,
+    pub route_kind: String,
+    pub best_size_bps: u64,
+    pub amount_in_wei: String,
+    pub amount_out_wei: String,
+    pub gross_edge_wei: String,
+    pub gross_edge_native: f64,
+    pub repayment_wei: String,
+    pub repayment_native: f64,
+    pub price_impact_bps: u64,
+    pub self_slippage_bps: u64,
+    pub pool: String,
+    pub factory: String,
+    pub router: String,
+    pub token_in: String,
+    pub token_out: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DashboardState {
     pub runtime_mode: String,
@@ -255,6 +287,7 @@ pub struct DashboardState {
     pub latency_metrics: Vec<LatencyMetric>,
     pub latency_risk: LatencyRiskSnapshot,
     pub opportunity_funnel: OpportunityFunnelSnapshot,
+    pub edge_telemetry: EdgeTelemetrySnapshot,
     pub reject_reasons: Vec<RejectReasonSnapshot>,
     pub relay_rankings: Vec<RelaySnapshot>,
     pub toxicity_profiles: Vec<ToxicitySnapshot>,
@@ -459,6 +492,7 @@ impl DashboardHandle {
                 latency_metrics,
                 latency_risk,
                 opportunity_funnel: OpportunityFunnelSnapshot::default(),
+                edge_telemetry: EdgeTelemetrySnapshot::default(),
                 reject_reasons: Vec::new(),
                 relay_rankings,
                 toxicity_profiles,
@@ -665,6 +699,44 @@ impl DashboardHandle {
             }
             "submit_failed" => funnel.submit_failed = funnel.submit_failed.saturating_add(1),
             _ => {}
+        }
+    }
+
+    pub fn record_edge_sample(&self, sample: EdgeMetadata) {
+        let mut state = self.inner.write().expect("dashboard state lock");
+        let snapshot = EdgeSampleSnapshot {
+            observed_at: Utc::now().to_rfc3339(),
+            status: sample.status,
+            reason: sample.reason,
+            route_kind: sample.route_kind,
+            best_size_bps: sample.best_size_bps,
+            amount_in_wei: sample.amount_in_wei,
+            amount_out_wei: sample.amount_out_wei,
+            gross_edge_wei: sample.gross_edge_wei,
+            gross_edge_native: sample.gross_edge_native,
+            repayment_wei: sample.repayment_wei,
+            repayment_native: sample.repayment_native,
+            price_impact_bps: sample.price_impact_bps,
+            self_slippage_bps: sample.self_slippage_bps,
+            pool: sample.pool,
+            factory: sample.factory,
+            router: sample.router,
+            token_in: sample.token_in,
+            token_out: sample.token_out,
+        };
+
+        state.edge_telemetry.sample_count = state.edge_telemetry.sample_count.saturating_add(1);
+        if snapshot.status == "payload_built" {
+            state.edge_telemetry.payload_ready_count =
+                state.edge_telemetry.payload_ready_count.saturating_add(1);
+        } else {
+            state.edge_telemetry.blocked_count =
+                state.edge_telemetry.blocked_count.saturating_add(1);
+        }
+        state.edge_telemetry.last_sample = Some(snapshot.clone());
+        state.edge_telemetry.samples.push_front(snapshot);
+        while state.edge_telemetry.samples.len() > 50 {
+            state.edge_telemetry.samples.pop_back();
         }
     }
 

@@ -14,6 +14,7 @@ use crate::mev::execution::flashloan_builder::{build_v2_flashswap_call, build_v3
 use crate::mev::opportunity::wei_to_eth_f64;
 use crate::mev::simulation::state_simulator::{AmmState, StateSimulator};
 use ethers::types::{Address, Bytes, U256};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
 pub enum AmmRouteKind {
@@ -37,13 +38,36 @@ pub struct ExecutionPayload {
     pub profit_recipient: Address,
     pub context_priority_score: f64,
     pub context_toxicity_score: f64,
+    pub edge_metadata: Option<EdgeMetadata>,
     // NOVO: Estado do pool antes da execução para EVM preflight
     pub pool_state_before: AmmState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeMetadata {
+    pub status: String,
+    pub reason: String,
+    pub route_kind: String,
+    pub best_size_bps: u64,
+    pub amount_in_wei: String,
+    pub amount_out_wei: String,
+    pub gross_edge_wei: String,
+    pub gross_edge_native: f64,
+    pub repayment_wei: String,
+    pub repayment_native: f64,
+    pub price_impact_bps: u64,
+    pub self_slippage_bps: u64,
+    pub pool: String,
+    pub factory: String,
+    pub router: String,
+    pub token_in: String,
+    pub token_out: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct FeeExtractionBuildInput {
     pub router: Address,
+    pub factory: Option<Address>,
     pub pair: Address,
     pub recipient: Address,
     pub token_in: Address,
@@ -129,9 +153,24 @@ impl PayloadBuilder {
             sizing_fractions,
             scavenger,
         );
+        let blocked_sample = best_v2_edge_metadata(
+            reserve_in,
+            reserve_out,
+            input.capital_available_wei,
+            pool_after.fee_bps,
+            sizing_fractions,
+            &input,
+            post_victim.slippage_impact_bps,
+            "blocked",
+            "no positive gross edge",
+        );
         let selected = if scavenger {
-            select_scavenger_v2_candidate(&candidates)
-                .ok_or_else(|| "no positive gross edge for scavenger payload".to_string())?
+            select_scavenger_v2_candidate(&candidates).ok_or_else(|| {
+                payload_error_with_edge_sample(
+                    "no positive gross edge for scavenger payload",
+                    blocked_sample,
+                )
+            })?
         } else {
             select_best_size_candidate(
                 &candidates,
@@ -141,9 +180,12 @@ impl PayloadBuilder {
             .ok_or_else(|| "no ROI-positive trade size after gas".to_string())?
         };
         let SizeCandidate {
+            capital_fraction_bps,
             amount_in,
+            amount_out,
             gross_profit_wei,
             net_profit_wei,
+            self_slippage_bps,
             ..
         } = selected;
         let simulated_profit_wei = if scavenger {
@@ -152,9 +194,8 @@ impl PayloadBuilder {
             net_profit_wei
         };
 
-        let amount_out =
-            amount_out_exact_in(amount_in, reserve_in, reserve_out, pool_after.fee_bps)
-                .ok_or_else(|| "fee extraction output quote failed".to_string())?;
+        let repayment_wei = v2_repayment_amount_in_profit_token(reserve_in, reserve_out, amount_in)
+            .unwrap_or_else(U256::zero);
         let min_amount_out = amount_out.saturating_mul(U256::from(
             10_000u64.saturating_sub(effective_payload_slippage_bps(config)),
         )) / U256::from(10_000u64);
@@ -207,6 +248,25 @@ impl PayloadBuilder {
             profit_recipient: input.recipient,
             context_priority_score: input.context_priority_score,
             context_toxicity_score: input.context_toxicity_score,
+            edge_metadata: Some(EdgeMetadata {
+                status: "payload_built".to_string(),
+                reason: "selected positive gross edge".to_string(),
+                route_kind: "v2".to_string(),
+                best_size_bps: capital_fraction_bps,
+                amount_in_wei: amount_in.to_string(),
+                amount_out_wei: amount_out.to_string(),
+                gross_edge_wei: gross_profit_wei.to_string(),
+                gross_edge_native: wei_to_eth_f64(gross_profit_wei),
+                repayment_wei: repayment_wei.to_string(),
+                repayment_native: wei_to_eth_f64(repayment_wei),
+                price_impact_bps,
+                self_slippage_bps,
+                pool: format!("{:?}", input.pair),
+                factory: format_optional_address(input.factory),
+                router: format!("{:?}", input.router),
+                token_in: format!("{:?}", input.token_in),
+                token_out: format!("{:?}", input.token_out),
+            }),
             pool_state_before: input.state_before,
         })
     }
@@ -292,8 +352,18 @@ impl PayloadBuilder {
             sizing_fractions,
         );
         let selected = if scavenger {
-            select_scavenger_v3_candidate(&candidates)
-                .ok_or_else(|| "no positive gross v3 edge for scavenger payload".to_string())?
+            select_scavenger_v3_candidate(&candidates).ok_or_else(|| {
+                payload_error_with_edge_sample(
+                    "no positive gross v3 edge for scavenger payload",
+                    best_v3_edge_metadata(
+                        &candidates,
+                        &input,
+                        post_victim.slippage_impact_bps,
+                        "blocked",
+                        "no positive gross v3 edge",
+                    ),
+                )
+            })?
         } else {
             select_best_v3_size_candidate(
                 &candidates,
@@ -303,10 +373,12 @@ impl PayloadBuilder {
             .ok_or_else(|| "no ROI-positive v3 trade size after gas".to_string())?
         };
         let V3SizeCandidate {
+            capital_fraction_bps,
             amount_in,
             amount_out,
             gross_profit_wei,
             net_profit_wei,
+            self_slippage_bps,
             ..
         } = selected;
         let simulated_profit_wei = if scavenger {
@@ -367,9 +439,152 @@ impl PayloadBuilder {
             profit_recipient: input.recipient,
             context_priority_score: input.context_priority_score,
             context_toxicity_score: input.context_toxicity_score,
+            edge_metadata: Some(EdgeMetadata {
+                status: "payload_built".to_string(),
+                reason: "selected positive v3 gross edge".to_string(),
+                route_kind: "v3".to_string(),
+                best_size_bps: capital_fraction_bps,
+                amount_in_wei: amount_in.to_string(),
+                amount_out_wei: amount_out.to_string(),
+                gross_edge_wei: gross_profit_wei.to_string(),
+                gross_edge_native: wei_to_eth_f64(gross_profit_wei),
+                repayment_wei: amount_in.to_string(),
+                repayment_native: wei_to_eth_f64(amount_in),
+                price_impact_bps,
+                self_slippage_bps,
+                pool: format!("{:?}", input.pair),
+                factory: format_optional_address(input.factory),
+                router: format!("{:?}", input.router),
+                token_in: format!("{:?}", input.token_in),
+                token_out: format!("{:?}", input.token_out),
+            }),
             pool_state_before: input.state_before,
         })
     }
+}
+
+fn payload_error_with_edge_sample(reason: &str, sample: Option<EdgeMetadata>) -> String {
+    let Some(sample) = sample else {
+        return reason.to_string();
+    };
+    match serde_json::to_string(&sample) {
+        Ok(json) => format!("{reason} | edge_sample={json}"),
+        Err(_) => reason.to_string(),
+    }
+}
+
+fn format_optional_address(address: Option<Address>) -> String {
+    address
+        .map(|address| format!("{address:?}"))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn best_v2_edge_metadata(
+    borrow_reserve: U256,
+    profit_reserve: U256,
+    capital_cap: U256,
+    fee_bps: u64,
+    fractions_bps: &[u64],
+    input: &FeeExtractionBuildInput,
+    price_impact_bps: u64,
+    status: &str,
+    reason: &str,
+) -> Option<EdgeMetadata> {
+    let mut best: Option<(bool, U256, EdgeMetadata)> = None;
+    for &bps in fractions_bps {
+        let amount_in = capital_cap.saturating_mul(U256::from(bps)) / U256::from(10_000u64);
+        if amount_in.is_zero() || amount_in >= borrow_reserve {
+            continue;
+        }
+        let Some(amount_out) =
+            amount_out_exact_in(amount_in, borrow_reserve, profit_reserve, fee_bps)
+        else {
+            continue;
+        };
+        let Some(repayment) =
+            v2_repayment_amount_in_profit_token(borrow_reserve, profit_reserve, amount_in)
+        else {
+            continue;
+        };
+        let (positive, edge_abs, gross_edge_wei, gross_edge_native) = if amount_out >= repayment {
+            let edge = amount_out.saturating_sub(repayment);
+            (true, edge, edge.to_string(), wei_to_eth_f64(edge))
+        } else {
+            let edge = repayment.saturating_sub(amount_out);
+            (false, edge, format!("-{edge}"), -wei_to_eth_f64(edge))
+        };
+        let self_slippage_bps = crate::mev::amm::uniswap_v2::price_impact_bps(
+            amount_in,
+            amount_out,
+            borrow_reserve,
+            profit_reserve,
+        );
+        let sample = EdgeMetadata {
+            status: status.to_string(),
+            reason: reason.to_string(),
+            route_kind: "v2".to_string(),
+            best_size_bps: bps,
+            amount_in_wei: amount_in.to_string(),
+            amount_out_wei: amount_out.to_string(),
+            gross_edge_wei,
+            gross_edge_native,
+            repayment_wei: repayment.to_string(),
+            repayment_native: wei_to_eth_f64(repayment),
+            price_impact_bps,
+            self_slippage_bps,
+            pool: format!("{:?}", input.pair),
+            factory: format_optional_address(input.factory),
+            router: format!("{:?}", input.router),
+            token_in: format!("{:?}", input.token_in),
+            token_out: format!("{:?}", input.token_out),
+        };
+
+        let replace = match &best {
+            None => true,
+            Some((best_positive, best_abs, _)) => {
+                (positive && !*best_positive)
+                    || (positive == *best_positive
+                        && if positive {
+                            edge_abs > *best_abs
+                        } else {
+                            edge_abs < *best_abs
+                        })
+            }
+        };
+        if replace {
+            best = Some((positive, edge_abs, sample));
+        }
+    }
+    best.map(|(_, _, sample)| sample)
+}
+
+fn best_v3_edge_metadata(
+    candidates: &[V3SizeCandidate],
+    input: &FeeExtractionBuildInput,
+    price_impact_bps: u64,
+    status: &str,
+    reason: &str,
+) -> Option<EdgeMetadata> {
+    let candidate = candidates.iter().max_by_key(|candidate| candidate.gross_profit_wei)?;
+    Some(EdgeMetadata {
+        status: status.to_string(),
+        reason: reason.to_string(),
+        route_kind: "v3".to_string(),
+        best_size_bps: candidate.capital_fraction_bps,
+        amount_in_wei: candidate.amount_in.to_string(),
+        amount_out_wei: candidate.amount_out.to_string(),
+        gross_edge_wei: candidate.gross_profit_wei.to_string(),
+        gross_edge_native: wei_to_eth_f64(candidate.gross_profit_wei),
+        repayment_wei: candidate.amount_in.to_string(),
+        repayment_native: wei_to_eth_f64(candidate.amount_in),
+        price_impact_bps,
+        self_slippage_bps: candidate.self_slippage_bps,
+        pool: format!("{:?}", input.pair),
+        factory: format_optional_address(input.factory),
+        router: format!("{:?}", input.router),
+        token_in: format!("{:?}", input.token_in),
+        token_out: format!("{:?}", input.token_out),
+    })
 }
 
 fn select_scavenger_v2_candidate(candidates: &[SizeCandidate]) -> Option<SizeCandidate> {
