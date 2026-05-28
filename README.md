@@ -1259,10 +1259,10 @@ This avoids unnecessary internal wallet movement while capital is small. The run
 `MEV_OPPORTUNITY_MODE` controls the boot-time opportunity filter profile. Accepted values are:
 
 - `conservative`: current strict profile, lowest noise.
-- `balanced`: lower notional/profit/ROI floors and wider pending-age/impact tolerance.
 - `sangrento`: aggressive live profile with controlled preflight/adaptive overrides for apparently positive opportunities.
+- `scavenger`: farelo extractor profile. It opens decode for unknown priced input tokens, uses very low notional/profit/ROI floors, skips the expensive EVM preflight hot path, and allows more candidates to reach payload/EV checks.
 
-The backend also accepts the aliases `safe`/`atual`, `medium`/`medio`, and `aggressive`/`bloody`. Quoted values such as `"conservative"` are accepted.
+The backend also accepts the aliases `safe`/`atual`, `aggressive`/`bloody`, and `bypass`/`farelo`/`farelo-extractor`. Quoted values such as `"conservative"` are accepted. `balanced`, `medium`, and `medio` are not valid modes.
 
 The threshold variables ending in `_ETH` are legacy names for the native chain unit. On Polygon they are interpreted as `POL`; on BNB Chain they are interpreted as `BNB`.
 
@@ -1289,6 +1289,8 @@ The MEV Engine panel also exposes an opportunity funnel:
 - submit attempted/succeeded/failed
 
 Use this funnel before loosening strategy logic. If `pending hashes` rises but `decode pass` stays at zero, the issue is router/token/notional coverage, not execution. If `payload built` stays at zero, the issue is state lookup, pool support, liquidity, or profit gates. If `submit attempted` stays at zero after `execution ready`, the issue is executor readiness or execution guardrails.
+
+For low-capital farelo runs, use `MEV_OPPORTUNITY_MODE=scavenger` first. Keep `conservative` for larger capital, bad market conditions, expensive RPC, or when the priority is avoiding false positives over execution frequency.
 
 ### Expensive execution guardrails
 

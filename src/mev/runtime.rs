@@ -1182,43 +1182,25 @@ fn should_override_preflight_reject(
 ) -> bool {
     match config.mev.opportunity_mode() {
         crate::config::OpportunityMode::Conservative => false,
-        crate::config::OpportunityMode::Balanced => {
-            preflight.upper_bound_ev_usd >= config.mev.effective_min_profit_usd()
-                && preflight.preflight_score >= 0.20
-                && preflight.gas_pressure <= 0.98
-        }
         crate::config::OpportunityMode::Aggressive => {
             preflight.upper_bound_ev_usd >= config.mev.effective_min_profit_usd() * 0.45
                 && preflight.preflight_score >= 0.12
                 && preflight.gas_pressure <= 1.05
         }
-        crate::config::OpportunityMode::Scavenger => {
-            preflight.preflight_score >= 0.02 && preflight.gas_pressure <= 1.25
-        }
+        crate::config::OpportunityMode::Scavenger => true,
     }
 }
 
 fn should_override_adaptive_reject(config: &Config, quote: &crate::mev::adaptive::AdaptiveQuote) -> bool {
     match config.mev.opportunity_mode() {
         crate::config::OpportunityMode::Conservative => false,
-        crate::config::OpportunityMode::Balanced => {
-            quote.ev_real_usd >= config.mev.effective_min_profit_usd() * 1.20
-                && quote.p_positive >= 0.35
-                && quote.risk_score <= 0.85
-                && quote.gas_pressure <= 0.90
-        }
         crate::config::OpportunityMode::Aggressive => {
             quote.ev_real_usd >= config.mev.effective_min_profit_usd()
                 && quote.p_positive >= 0.20
                 && quote.risk_score <= 0.95
                 && quote.gas_pressure <= 1.00
         }
-        crate::config::OpportunityMode::Scavenger => {
-            quote.ev_real_usd >= config.mev.effective_min_profit_usd() * 0.20
-                && quote.p_positive >= 0.08
-                && quote.risk_score <= 0.99
-                && quote.gas_pressure <= 1.20
-        }
+        crate::config::OpportunityMode::Scavenger => quote.gas_pressure <= 1.50,
     }
 }
 
@@ -1298,6 +1280,17 @@ pub(crate) fn fast_preflight_gate(
     ) * config.mev.eth_usd_price;
     let ev_upper_bound_usd = notional_usd * heuristic_factor - estimated_gas_cost_usd;
 
+    if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
+        return FastPreflightDecision {
+            should_continue: true,
+            reject_reason: None,
+            ev_upper_bound_usd,
+            estimated_gas_cost_usd,
+            competition_score_fast: 0.0,
+            gas_ratio,
+        };
+    }
+
     let gas_pressure = ((gas_ratio - 1.0) / 0.8).clamp(0.0, 1.0);
     let size_pressure = match size_bucket {
         0 => 0.20,
@@ -1313,29 +1306,14 @@ pub(crate) fn fast_preflight_gate(
         - context_signal.priority_score.clamp(0.0, 1.0) * (0.03 + context_confidence * 0.05))
         .clamp(0.0, 1.0);
 
-    let reject_reason = match config.mev.opportunity_mode() {
-        OpportunityMode::Scavenger => {
-            if gas_ratio > 2.40 {
-                Some("gas_ratio_too_high")
-            } else if competition_score_fast > 0.94 {
-                Some("competition_fast_too_high")
-            } else if ev_upper_bound_usd < -estimated_gas_cost_usd * 0.50 {
-                Some("ev_upper_bound_below_min")
-            } else {
-                None
-            }
-        }
-        _ => {
-            if ev_upper_bound_usd < config.mev.effective_min_profit_usd() * 1.5 {
-                Some("ev_upper_bound_below_min")
-            } else if competition_score_fast > 0.75 {
-                Some("competition_fast_too_high")
-            } else if gas_ratio > 1.8 {
-                Some("gas_ratio_too_high")
-            } else {
-                None
-            }
-        }
+    let reject_reason = if ev_upper_bound_usd < config.mev.effective_min_profit_usd() * 1.5 {
+        Some("ev_upper_bound_below_min")
+    } else if competition_score_fast > 0.75 {
+        Some("competition_fast_too_high")
+    } else if gas_ratio > 1.8 {
+        Some("gas_ratio_too_high")
+    } else {
+        None
     };
 
     FastPreflightDecision {

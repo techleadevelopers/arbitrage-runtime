@@ -118,7 +118,6 @@ pub enum RpcPreference {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpportunityMode {
     Conservative,
-    Balanced,
     Aggressive,
     Scavenger,
 }
@@ -135,7 +134,6 @@ impl OpportunityMode {
     pub fn as_str(self) -> &'static str {
         match self {
             OpportunityMode::Conservative => "conservative",
-            OpportunityMode::Balanced => "balanced",
             OpportunityMode::Aggressive => "sangrento",
             OpportunityMode::Scavenger => "scavenger",
         }
@@ -635,7 +633,6 @@ impl MevConfig {
         let base = self.runtime_thresholds().min_large_swap_eth;
         match self.opportunity_mode() {
             OpportunityMode::Conservative => base,
-            OpportunityMode::Balanced => base * 0.35,
             OpportunityMode::Aggressive => base * 0.12,
             OpportunityMode::Scavenger => base * 0.02,
         }
@@ -646,7 +643,6 @@ impl MevConfig {
         let base = self.runtime_thresholds().min_net_profit_eth;
         match self.opportunity_mode() {
             OpportunityMode::Conservative => base,
-            OpportunityMode::Balanced => base * 0.40,
             OpportunityMode::Aggressive => base * 0.15,
             OpportunityMode::Scavenger => base * 0.03,
         }
@@ -657,7 +653,6 @@ impl MevConfig {
         let base = self.runtime_thresholds().min_profit_usd;
         match self.opportunity_mode() {
             OpportunityMode::Conservative => base,
-            OpportunityMode::Balanced => base * 0.35,
             OpportunityMode::Aggressive => base * 0.10,
             OpportunityMode::Scavenger => base * 0.02,
         }
@@ -668,7 +663,6 @@ impl MevConfig {
         let base = self.runtime_thresholds().min_liquidity_eth;
         match self.opportunity_mode() {
             OpportunityMode::Conservative => base,
-            OpportunityMode::Balanced => base * 0.50,
             OpportunityMode::Aggressive => base * 0.25,
             OpportunityMode::Scavenger => base * 0.08,
         }
@@ -678,7 +672,6 @@ impl MevConfig {
     pub fn effective_min_roi_bps(&self) -> u64 {
         let value = match self.opportunity_mode() {
             OpportunityMode::Conservative => self.min_roi_bps as f64,
-            OpportunityMode::Balanced => self.min_roi_bps as f64 * 0.55,
             OpportunityMode::Aggressive => self.min_roi_bps as f64 * 0.25,
             OpportunityMode::Scavenger => self.min_roi_bps as f64 * 0.05,
         };
@@ -688,7 +681,6 @@ impl MevConfig {
     pub fn effective_max_price_impact_bps(&self) -> u64 {
         let value = match self.opportunity_mode() {
             OpportunityMode::Conservative => self.max_price_impact_bps as f64,
-            OpportunityMode::Balanced => self.max_price_impact_bps as f64 * 1.50,
             OpportunityMode::Aggressive => self.max_price_impact_bps as f64 * 2.20,
             OpportunityMode::Scavenger => self.max_price_impact_bps as f64 * 4.00,
         };
@@ -698,7 +690,6 @@ impl MevConfig {
     pub fn effective_max_pending_age_ms(&self) -> u64 {
         let value = match self.opportunity_mode() {
             OpportunityMode::Conservative => self.max_pending_age_ms as f64,
-            OpportunityMode::Balanced => self.max_pending_age_ms as f64 * 1.40,
             OpportunityMode::Aggressive => self.max_pending_age_ms as f64 * 2.00,
             OpportunityMode::Scavenger => self.max_pending_age_ms as f64 * 3.00,
         };
@@ -993,7 +984,6 @@ pub fn parse_opportunity_mode(value: &str) -> Result<OpportunityMode, Box<dyn st
         .to_lowercase();
     match normalized.as_str() {
         "conservative" | "safe" | "atual" => Ok(OpportunityMode::Conservative),
-        "balanced" | "medium" | "medio" => Ok(OpportunityMode::Balanced),
         "aggressive" | "bloody" | "sangrento" => Ok(OpportunityMode::Aggressive),
         "scavenger" | "bypass" | "farelo" | "farelo-extractor" | "crumbs" => {
             Ok(OpportunityMode::Scavenger)
