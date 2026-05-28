@@ -300,8 +300,10 @@ pub async fn run(
 
     let pool_cache = Arc::new(PoolCache::new(config.mev.pool_state_cache_ttl_ms));
     let mut tx_hash_stream = connect_mempool_fan_in(&ws_urls, &dashboard);
-    let min_large_swap_wei = ethers::utils::parse_ether(config.mev.min_large_swap_eth.to_string())?;
-    let min_profit_wei = ethers::utils::parse_ether(config.mev.min_net_profit_eth.to_string())?;
+    let min_large_swap_wei =
+        ethers::utils::parse_ether(config.mev.effective_min_large_swap_eth().to_string())?;
+    let min_profit_wei =
+        ethers::utils::parse_ether(config.mev.effective_min_net_profit_eth().to_string())?;
     let adaptive = AdaptivePolicy::shared(&config);
     refresh_historical_profiles(&adaptive, &storage, &dashboard);
     let executor = ExecutionEngine::new(
@@ -324,11 +326,12 @@ pub async fn run(
     dashboard.event(
         "info",
         format!(
-            "fee extraction runtime connected to {} min_large_swap={:.3} {} min_profit={:.6} {} lookup_workers={} eval_workers={}",
+            "fee extraction runtime connected to {} mode={} min_large_swap={:.3} {} min_profit={:.6} {} lookup_workers={} eval_workers={}",
             ws_urls.join(" | "),
-            config.mev.min_large_swap_eth,
+            config.mev.opportunity_mode().as_str(),
+            config.mev.effective_min_large_swap_eth(),
             config.native_asset_symbol(),
-            config.mev.min_net_profit_eth,
+            config.mev.effective_min_net_profit_eth(),
             config.native_asset_symbol(),
             lookup_decode_workers,
             eval_workers
@@ -612,7 +615,7 @@ async fn process_lookup_decode_task(
     let signal = decode_relevant_swap(
         &tx,
         &config.monitored_tokens,
-        ethers::utils::parse_ether(config.mev.min_large_swap_eth.to_string()).ok()?,
+        ethers::utils::parse_ether(config.mev.effective_min_large_swap_eth().to_string()).ok()?,
     )?;
     latency_trace.decode_swap_us = Some(elapsed_us(decode_started));
 
@@ -751,6 +754,13 @@ async fn process_evaluation_task(
     pool_cache: Arc<PoolCache>, // NOVO PARÂMETRO
 ) -> Option<PendingExecutionCandidate> {
     let tx_hash = candidate.tx.hash;
+    let min_large_swap_wei = ethers::utils::parse_ether(
+        config.mev.effective_min_large_swap_eth().to_string(),
+    )
+    .unwrap_or(min_large_swap_wei);
+    let min_profit_wei =
+        ethers::utils::parse_ether(config.mev.effective_min_net_profit_eth().to_string())
+            .unwrap_or(min_profit_wei);
 
     if let Some(max_gas_price_wei) = config.mev.max_gas_price_wei() {
         if candidate.gas_price > max_gas_price_wei {
@@ -820,7 +830,8 @@ async fn process_evaluation_task(
     candidate.latency_trace.adaptive_preflight_us = Some(elapsed_us(adaptive_preflight_started));
     dashboard.set_market_regime(preflight.regime.as_str());
 
-    if !preflight.should_continue {
+    let preflight_override = should_override_preflight_reject(&config, &preflight);
+    if !preflight.should_continue && !preflight_override {
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
         if let Some(reason) = preflight.reject_reason {
             dashboard.record_reject_reason("preflight", reason);
@@ -833,6 +844,20 @@ async fn process_evaluation_task(
             preflight.reject_reason.unwrap_or("preflight"),
         );
         return None;
+    }
+    if !preflight.should_continue && preflight_override {
+        dashboard.event(
+            "warn",
+            format!(
+                "opportunity preflight override mode={} victim={:?} reason={} upper_ev={:.2}usd score={:.2} gas_pressure={:.2}",
+                config.mev.opportunity_mode().as_str(),
+                tx_hash,
+                preflight.reject_reason.unwrap_or("preflight"),
+                preflight.upper_bound_ev_usd,
+                preflight.preflight_score,
+                preflight.gas_pressure,
+            ),
+        );
     }
 
     let payload_started = Instant::now();
@@ -986,7 +1011,8 @@ async fn process_evaluation_task(
     candidate.latency_trace.adaptive_quote_us = Some(elapsed_us(adaptive_quote_started));
     dashboard.set_market_regime(quote.regime.as_str());
 
-    if !quote.should_execute {
+    let mode_override = should_override_adaptive_reject(&config, &quote);
+    if !quote.should_execute && !mode_override {
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
         if let Some(reason) = quote.reject_reason {
             dashboard.record_reject_reason("adaptive", reason);
@@ -999,6 +1025,20 @@ async fn process_evaluation_task(
             quote.reject_reason.as_deref().unwrap_or("adaptive"),
         );
         return None;
+    }
+    if !quote.should_execute && mode_override {
+        dashboard.event(
+            "warn",
+            format!(
+                "opportunity mode override mode={} victim={:?} reason={} ev_real={:.2}usd p={:.2} risk={:.2}",
+                config.mev.opportunity_mode().as_str(),
+                tx_hash,
+                quote.reject_reason.unwrap_or("adaptive"),
+                quote.ev_real_usd,
+                quote.p_positive,
+                quote.risk_score
+            ),
+        );
     }
 
     dashboard.event(
@@ -1061,16 +1101,54 @@ async fn process_evaluation_task(
     })
 }
 
+fn should_override_preflight_reject(
+    config: &Config,
+    preflight: &crate::mev::adaptive::PreflightQuote,
+) -> bool {
+    match config.mev.opportunity_mode() {
+        crate::config::OpportunityMode::Conservative => false,
+        crate::config::OpportunityMode::Balanced => {
+            preflight.upper_bound_ev_usd >= config.mev.effective_min_profit_usd()
+                && preflight.preflight_score >= 0.20
+                && preflight.gas_pressure <= 0.98
+        }
+        crate::config::OpportunityMode::Aggressive => {
+            preflight.upper_bound_ev_usd >= config.mev.effective_min_profit_usd() * 0.45
+                && preflight.preflight_score >= 0.12
+                && preflight.gas_pressure <= 1.05
+        }
+    }
+}
+
+fn should_override_adaptive_reject(config: &Config, quote: &crate::mev::adaptive::AdaptiveQuote) -> bool {
+    match config.mev.opportunity_mode() {
+        crate::config::OpportunityMode::Conservative => false,
+        crate::config::OpportunityMode::Balanced => {
+            quote.ev_real_usd >= config.mev.effective_min_profit_usd() * 1.20
+                && quote.p_positive >= 0.35
+                && quote.risk_score <= 0.85
+                && quote.gas_pressure <= 0.90
+        }
+        crate::config::OpportunityMode::Aggressive => {
+            quote.ev_real_usd >= config.mev.effective_min_profit_usd()
+                && quote.p_positive >= 0.20
+                && quote.risk_score <= 0.95
+                && quote.gas_pressure <= 1.00
+        }
+    }
+}
+
 pub(crate) fn passes_quality_gate(
     config: &Config,
     payload: &crate::mev::execution::payload_builder::ExecutionPayload,
     execution_cost_wei: U256,
 ) -> bool {
     let roi = roi_bps(payload.expected_profit_wei, execution_cost_wei);
-    let impact_score =
-        ((payload.price_impact_bps as f64 / config.mev.max_price_impact_bps.max(1) as f64) * 100.0)
-            .clamp(0.0, 100.0) as u16;
-    roi >= config.mev.min_roi_bps && impact_score <= 100
+    let impact_score = ((payload.price_impact_bps as f64
+        / config.mev.effective_max_price_impact_bps().max(1) as f64)
+        * 100.0)
+        .clamp(0.0, 100.0) as u16;
+    roi >= config.mev.effective_min_roi_bps() && impact_score <= 100
 }
 
 pub(crate) fn fast_preflight_gate(
@@ -1107,7 +1185,7 @@ pub(crate) fn fast_preflight_gate(
     let gas_baseline_gwei = heuristic_gas_baseline_gwei(config);
     let gas_price_gwei = wei_to_gwei_f64(gas_price);
     let gas_ratio = (gas_price_gwei / gas_baseline_gwei.max(1e-9)).max(0.0);
-    let size_bucket = notional_size_bucket(notional_eth, config.mev.min_large_swap_eth);
+    let size_bucket = notional_size_bucket(notional_eth, config.mev.effective_min_large_swap_eth());
     let selector_factor = selector_heuristic_factor(signal.selector);
     let path_penalty = fast_path_penalty(path_len);
     let size_factor = match size_bucket {
@@ -1146,7 +1224,7 @@ pub(crate) fn fast_preflight_gate(
         - context_signal.priority_score.clamp(0.0, 1.0) * (0.03 + context_confidence * 0.05))
         .clamp(0.0, 1.0);
 
-    let reject_reason = if ev_upper_bound_usd < config.mev.min_profit_usd * 1.5 {
+    let reject_reason = if ev_upper_bound_usd < config.mev.effective_min_profit_usd() * 1.5 {
         Some("ev_upper_bound_below_min")
     } else if competition_score_fast > 0.75 {
         Some("competition_fast_too_high")
@@ -1212,9 +1290,9 @@ pub(crate) fn passes_ev_gate_v2(
     min_profit_wei: U256,
 ) -> bool {
     let lookup_is_fresh =
-        lookup_latency.as_millis() <= u128::from(config.mev.max_pending_age_ms.max(1));
+        lookup_latency.as_millis() <= u128::from(config.mev.effective_max_pending_age_ms().max(1));
     let large_enough = signal.notional_wei
-        >= ethers::utils::parse_ether(config.mev.min_large_swap_eth.to_string())
+        >= ethers::utils::parse_ether(config.mev.effective_min_large_swap_eth().to_string())
             .unwrap_or_default();
     let inevitable_impact = payload.price_impact_bps >= 8;
     let profit_above_threshold = payload.expected_profit_wei >= min_profit_wei;
@@ -1225,7 +1303,7 @@ pub(crate) fn passes_ev_gate_v2(
         && large_enough
         && inevitable_impact
         && profit_above_threshold
-        && net_ev_usd >= config.mev.min_profit_usd
+        && net_ev_usd >= config.mev.effective_min_profit_usd()
         && gas_budget_ok
 }
 
@@ -1237,9 +1315,9 @@ pub(crate) fn passes_ev_gate_v3(
     min_profit_wei: U256,
 ) -> bool {
     let lookup_is_fresh =
-        lookup_latency.as_millis() <= u128::from(config.mev.max_pending_age_ms.max(1));
+        lookup_latency.as_millis() <= u128::from(config.mev.effective_max_pending_age_ms().max(1));
     let large_enough = signal.notional_wei
-        >= ethers::utils::parse_ether(config.mev.min_large_swap_eth.to_string())
+        >= ethers::utils::parse_ether(config.mev.effective_min_large_swap_eth().to_string())
             .unwrap_or_default();
     let inevitable_impact = payload.price_impact_bps >= 6;
     let profit_above_threshold = payload.expected_profit_wei >= min_profit_wei;
@@ -1250,7 +1328,7 @@ pub(crate) fn passes_ev_gate_v3(
         && large_enough
         && inevitable_impact
         && profit_above_threshold
-        && net_ev_usd >= config.mev.min_profit_usd
+        && net_ev_usd >= config.mev.effective_min_profit_usd()
         && gas_budget_ok
 }
 

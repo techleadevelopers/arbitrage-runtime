@@ -282,12 +282,12 @@ impl AdaptivePolicy {
             eth_usd_price: config.mev.eth_usd_price,
             base_threshold_usd: config
                 .mev
-                .min_profit_usd
-                .max(config.mev.min_net_profit_eth * config.mev.eth_usd_price)
+                .effective_min_profit_usd()
+                .max(config.mev.effective_min_net_profit_eth() * config.mev.eth_usd_price)
                 * threshold_bias,
-            max_price_impact_bps: config.mev.max_price_impact_bps.max(1),
-            min_large_swap_eth: config.mev.min_large_swap_eth.max(0.000_1),
-            min_profit_eth: config.mev.min_net_profit_eth.max(0.000_001),
+            max_price_impact_bps: config.mev.effective_max_price_impact_bps().max(1),
+            min_large_swap_eth: config.mev.effective_min_large_swap_eth().max(0.000_1),
+            min_profit_eth: config.mev.effective_min_net_profit_eth().max(0.000_001),
             preflight_gas_estimate: config
                 .estimated_exec_gas
                 .saturating_add(config.estimated_bundle_overhead_gas)

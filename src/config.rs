@@ -1,11 +1,12 @@
 use clap::Parser;
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::{Address, U256};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use tracing::warn;
 
 #[derive(Parser, Debug)]
@@ -53,6 +54,8 @@ pub struct Config {
 #[derive(Debug, Clone)]
 pub struct MevConfig {
     pub enabled: bool,
+    pub opportunity_mode: Arc<RwLock<OpportunityMode>>,
+    pub runtime_thresholds: Arc<RwLock<OpportunityThresholds>>,
     pub capital_eth: f64,
     pub capital_window_secs: u64,
     pub max_window_exposure_eth: f64,
@@ -110,6 +113,31 @@ pub enum RpcPreference {
     GetBlock,
     Alchemy,
     Infura,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpportunityMode {
+    Conservative,
+    Balanced,
+    Aggressive,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct OpportunityThresholds {
+    pub min_large_swap_eth: f64,
+    pub min_net_profit_eth: f64,
+    pub min_profit_usd: f64,
+    pub min_liquidity_eth: f64,
+}
+
+impl OpportunityMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OpportunityMode::Conservative => "conservative",
+            OpportunityMode::Balanced => "balanced",
+            OpportunityMode::Aggressive => "aggressive",
+        }
+    }
 }
 
 impl RpcPreference {
@@ -244,11 +272,33 @@ impl Config {
             .parse::<SocketAddr>()?;
         let explicit_rpc_urls = parse_rpc_urls(&network);
         let mempool_ws_urls = parse_mempool_ws_urls(&network, tenderly_rpc_only, &alchemy_keys);
+        let min_net_profit_eth = env::var("MEV_MIN_NET_PROFIT_ETH")
+            .unwrap_or_else(|_| "0.0025".to_string())
+            .parse::<f64>()?;
+        let min_large_swap_eth = env::var("MEV_MIN_LARGE_SWAP_ETH")
+            .unwrap_or_else(|_| "25.0".to_string())
+            .parse::<f64>()?;
+        let min_profit_usd = env::var("MEV_MIN_PROFIT_USD")
+            .unwrap_or_else(|_| "2.0".to_string())
+            .parse::<f64>()?;
+        let min_liquidity_eth = env::var("MEV_MIN_LIQUIDITY_ETH")
+            .unwrap_or_else(|_| "25.0".to_string())
+            .parse::<f64>()?;
+        let runtime_thresholds = OpportunityThresholds {
+            min_large_swap_eth,
+            min_net_profit_eth,
+            min_profit_usd,
+            min_liquidity_eth,
+        };
         let mev = MevConfig {
             enabled: env::var("MEV_ENGINE_ENABLED")
                 .unwrap_or_else(|_| "false".to_string())
                 .trim()
                 .eq_ignore_ascii_case("true"),
+            opportunity_mode: Arc::new(RwLock::new(parse_opportunity_mode(
+                &env::var("MEV_OPPORTUNITY_MODE").unwrap_or_else(|_| "conservative".to_string()),
+            )?)),
+            runtime_thresholds: Arc::new(RwLock::new(runtime_thresholds)),
             capital_eth: env::var("MEV_CAPITAL_ETH")
                 .unwrap_or_else(|_| "0.05".to_string())
                 .parse::<f64>()?,
@@ -264,15 +314,11 @@ impl Config {
             max_pair_window_exposure_eth: env::var("MEV_MAX_PAIR_WINDOW_EXPOSURE_ETH")
                 .unwrap_or_else(|_| "0.10".to_string())
                 .parse::<f64>()?,
-            min_net_profit_eth: env::var("MEV_MIN_NET_PROFIT_ETH")
-                .unwrap_or_else(|_| "0.0025".to_string())
-                .parse::<f64>()?,
+            min_net_profit_eth,
             min_roi_bps: env::var("MEV_MIN_ROI_BPS")
                 .unwrap_or_else(|_| "1500".to_string())
                 .parse::<u64>()?,
-            min_large_swap_eth: env::var("MEV_MIN_LARGE_SWAP_ETH")
-                .unwrap_or_else(|_| "25.0".to_string())
-                .parse::<f64>()?,
+            min_large_swap_eth,
             gas_safety_margin_bps: env::var("MEV_GAS_SAFETY_MARGIN_BPS")
                 .unwrap_or_else(|_| "12500".to_string())
                 .parse::<u64>()?,
@@ -297,15 +343,11 @@ impl Config {
             slippage_protection_bps: env::var("MEV_SLIPPAGE_PROTECTION_BPS")
                 .unwrap_or_else(|_| "50".to_string())
                 .parse::<u64>()?,
-            min_profit_usd: env::var("MEV_MIN_PROFIT_USD")
-                .unwrap_or_else(|_| "2.0".to_string())
-                .parse::<f64>()?,
+            min_profit_usd,
             eth_usd_price: env::var("MEV_ETH_USD_PRICE")
                 .unwrap_or_else(|_| "3200.0".to_string())
                 .parse::<f64>()?,
-            min_liquidity_eth: env::var("MEV_MIN_LIQUIDITY_ETH")
-                .unwrap_or_else(|_| "25.0".to_string())
-                .parse::<f64>()?,
+            min_liquidity_eth,
             latency_trace: env::var("MEV_LATENCY_TRACE")
                 .unwrap_or_else(|_| "false".to_string())
                 .trim()
@@ -568,6 +610,67 @@ fn apply_replay_tuned_runtime_env() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 impl MevConfig {
+    pub fn opportunity_mode(&self) -> OpportunityMode {
+        self.opportunity_mode
+            .read()
+            .map(|guard| *guard)
+            .unwrap_or(OpportunityMode::Conservative)
+    }
+
+    pub fn effective_min_large_swap_eth(&self) -> f64 {
+        match self.opportunity_mode() {
+            OpportunityMode::Conservative => self.min_large_swap_eth,
+            OpportunityMode::Balanced => self.min_large_swap_eth * 0.35,
+            OpportunityMode::Aggressive => self.min_large_swap_eth * 0.12,
+        }
+        .max(0.000_001)
+    }
+
+    pub fn effective_min_net_profit_eth(&self) -> f64 {
+        match self.opportunity_mode() {
+            OpportunityMode::Conservative => self.min_net_profit_eth,
+            OpportunityMode::Balanced => self.min_net_profit_eth * 0.40,
+            OpportunityMode::Aggressive => self.min_net_profit_eth * 0.15,
+        }
+        .max(0.000_000_1)
+    }
+
+    pub fn effective_min_profit_usd(&self) -> f64 {
+        match self.opportunity_mode() {
+            OpportunityMode::Conservative => self.min_profit_usd,
+            OpportunityMode::Balanced => self.min_profit_usd * 0.35,
+            OpportunityMode::Aggressive => self.min_profit_usd * 0.10,
+        }
+        .max(0.000_001)
+    }
+
+    pub fn effective_min_roi_bps(&self) -> u64 {
+        let value = match self.opportunity_mode() {
+            OpportunityMode::Conservative => self.min_roi_bps as f64,
+            OpportunityMode::Balanced => self.min_roi_bps as f64 * 0.55,
+            OpportunityMode::Aggressive => self.min_roi_bps as f64 * 0.25,
+        };
+        value.round().max(1.0) as u64
+    }
+
+    pub fn effective_max_price_impact_bps(&self) -> u64 {
+        let value = match self.opportunity_mode() {
+            OpportunityMode::Conservative => self.max_price_impact_bps as f64,
+            OpportunityMode::Balanced => self.max_price_impact_bps as f64 * 1.50,
+            OpportunityMode::Aggressive => self.max_price_impact_bps as f64 * 2.20,
+        };
+        value.round().max(1.0) as u64
+    }
+
+    pub fn effective_max_pending_age_ms(&self) -> u64 {
+        let value = match self.opportunity_mode() {
+            OpportunityMode::Conservative => self.max_pending_age_ms as f64,
+            OpportunityMode::Balanced => self.max_pending_age_ms as f64 * 1.40,
+            OpportunityMode::Aggressive => self.max_pending_age_ms as f64 * 2.00,
+        };
+        value.round().max(1.0) as u64
+    }
+
     pub fn max_gas_price_wei(&self) -> Option<U256> {
         self.max_gas_price_gwei
             .map(|value| U256::from(value).saturating_mul(U256::from(1_000_000_000u64)))
@@ -844,6 +947,15 @@ fn parse_rpc_preference(value: &str) -> Result<RpcPreference, Box<dyn std::error
         "alchemy" => Ok(RpcPreference::Alchemy),
         "infura" => Ok(RpcPreference::Infura),
         other => Err(format!("unsupported RPC preference: {other}").into()),
+    }
+}
+
+pub fn parse_opportunity_mode(value: &str) -> Result<OpportunityMode, Box<dyn std::error::Error>> {
+    match value.trim().to_lowercase().as_str() {
+        "conservative" | "safe" | "atual" => Ok(OpportunityMode::Conservative),
+        "balanced" | "medium" | "medio" => Ok(OpportunityMode::Balanced),
+        "aggressive" | "bloody" | "sangrento" => Ok(OpportunityMode::Aggressive),
+        other => Err(format!("unsupported opportunity mode: {other}").into()),
     }
 }
 

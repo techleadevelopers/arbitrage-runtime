@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{parse_opportunity_mode, Config, OpportunityMode};
 use crate::rpc::{RpcEndpointSnapshot, RpcFleet};
 use crate::storage::Storage;
 use axum::extract::{Path, State};
@@ -19,6 +19,7 @@ pub struct DashboardHandle {
     inner: Arc<RwLock<DashboardState>>,
     storage: Storage,
     rpc_fleet: Arc<RpcFleet>,
+    opportunity_mode: Arc<RwLock<OpportunityMode>>,
     pending: Arc<Mutex<PendingStorageWrites>>,
 }
 
@@ -205,6 +206,7 @@ pub struct DashboardState {
     pub treasury_status: String,
     pub treasury_note: String,
     pub private_relay_only: bool,
+    pub opportunity_mode: String,
     pub scan_interval_ms: u64,
     pub wallet_count: usize,
     pub total_keys_read: usize,
@@ -267,6 +269,13 @@ struct RpcControlResponse {
 #[derive(Debug, Serialize)]
 struct EventsControlResponse {
     ok: bool,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OpportunityModeResponse {
+    ok: bool,
+    mode: String,
     message: String,
 }
 
@@ -370,6 +379,7 @@ impl DashboardHandle {
                 treasury_status,
                 treasury_note,
                 private_relay_only: true,
+                opportunity_mode: config.mev.opportunity_mode().as_str().to_string(),
                 scan_interval_ms: config.mev.max_pending_age_ms,
                 wallet_count,
                 total_keys_read,
@@ -394,6 +404,7 @@ impl DashboardHandle {
             })),
             storage,
             rpc_fleet,
+            opportunity_mode: config.mev.opportunity_mode.clone(),
             pending: Arc::new(Mutex::new(PendingStorageWrites::default())),
         }
     }
@@ -446,6 +457,11 @@ impl DashboardHandle {
         if let Ok(execution_outcomes) = self.storage.execution_outcomes(12) {
             state.execution_outcomes = execution_outcomes;
         }
+        state.opportunity_mode = self
+            .opportunity_mode
+            .read()
+            .map(|mode| mode.as_str().to_string())
+            .unwrap_or_else(|_| "conservative".to_string());
         state.latency_risk = build_latency_risk(
             self.storage.telemetry_window_summary(300).unwrap_or_default(),
             &state.rpc_endpoints,
@@ -775,6 +791,7 @@ pub async fn run_server(
         .route("/api/rpc/{id}/enabled", post(set_rpc_enabled))
         .route("/api/rpc/only-getblock", post(only_getblock))
         .route("/api/events/clear", post(clear_events))
+        .route("/api/opportunity-mode/{mode}", post(set_opportunity_mode))
         .with_state(dashboard)
         .layer(CorsLayer::permissive());
 
@@ -895,6 +912,47 @@ async fn clear_events(State(dashboard): State<DashboardHandle>) -> impl IntoResp
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(EventsControlResponse {
                 ok: false,
+                message: err.to_string(),
+            }),
+        ),
+    }
+}
+
+async fn set_opportunity_mode(
+    State(dashboard): State<DashboardHandle>,
+    Path(mode): Path<String>,
+) -> impl IntoResponse {
+    match parse_opportunity_mode(&mode) {
+        Ok(parsed) => {
+            if let Ok(mut guard) = dashboard.opportunity_mode.write() {
+                *guard = parsed;
+            }
+            {
+                let mut state = dashboard.inner.write().expect("dashboard state lock");
+                state.opportunity_mode = parsed.as_str().to_string();
+            }
+            dashboard.event(
+                "warn",
+                format!("opportunity mode switched to {}", parsed.as_str()),
+            );
+            (
+                StatusCode::OK,
+                Json(OpportunityModeResponse {
+                    ok: true,
+                    mode: parsed.as_str().to_string(),
+                    message: format!("opportunity mode set to {}", parsed.as_str()),
+                }),
+            )
+        }
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(OpportunityModeResponse {
+                ok: false,
+                mode: dashboard
+                    .opportunity_mode
+                    .read()
+                    .map(|mode| mode.as_str().to_string())
+                    .unwrap_or_else(|_| "conservative".to_string()),
                 message: err.to_string(),
             }),
         ),
