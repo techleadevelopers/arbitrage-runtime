@@ -220,6 +220,7 @@ pub struct DashboardState {
     pub rpc_endpoints: Vec<RpcEndpointSnapshot>,
     pub recent_events: VecDeque<DashboardEvent>,
     pub latency_metrics: Vec<LatencyMetric>,
+    pub latency_risk: LatencyRiskSnapshot,
     pub reject_reasons: Vec<RejectReasonSnapshot>,
     pub relay_rankings: Vec<RelaySnapshot>,
     pub toxicity_profiles: Vec<ToxicitySnapshot>,
@@ -234,6 +235,20 @@ pub struct LatencyMetric {
     pub last_ms: Option<u128>,
     pub avg_ms: Option<u128>,
     pub max_ms: Option<u128>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LatencyRiskSnapshot {
+    pub updated_at: String,
+    pub window_secs: u64,
+    pub sample_count: u64,
+    pub hot_path_avg_ms: u128,
+    pub hot_path_max_ms: u128,
+    pub monitor_avg_ms: u128,
+    pub rpc_avg_ms: u128,
+    pub score: f64,
+    pub level: String,
+    pub bottleneck_stage: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,6 +287,10 @@ impl DashboardHandle {
         let (attempted, succeeded, failed) = storage.sweep_counts().unwrap_or((0, 0, 0));
         let latency_metrics =
             build_latency_metrics(storage.telemetry_summary().unwrap_or_default());
+        let latency_risk = build_latency_risk(
+            storage.telemetry_window_summary(300).unwrap_or_default(),
+            &rpc_fleet.snapshot(),
+        );
         let top_residual_wallets = storage
             .top_wallet_residuals(10)
             .unwrap_or_default()
@@ -366,6 +385,7 @@ impl DashboardHandle {
                 rpc_endpoints: rpc_fleet.snapshot(),
                 recent_events,
                 latency_metrics,
+                latency_risk,
                 reject_reasons: Vec::new(),
                 relay_rankings,
                 toxicity_profiles,
@@ -426,6 +446,10 @@ impl DashboardHandle {
         if let Ok(execution_outcomes) = self.storage.execution_outcomes(12) {
             state.execution_outcomes = execution_outcomes;
         }
+        state.latency_risk = build_latency_risk(
+            self.storage.telemetry_window_summary(300).unwrap_or_default(),
+            &state.rpc_endpoints,
+        );
         state
     }
 
@@ -917,6 +941,112 @@ fn build_latency_metrics(summary: HashMap<String, (u64, u128, u128, u128)>) -> V
         }));
     }
     metrics
+}
+
+fn build_latency_risk(
+    summary: HashMap<String, (u64, u128, u128, u128)>,
+    rpc_endpoints: &[RpcEndpointSnapshot],
+) -> LatencyRiskSnapshot {
+    let mut sample_count = 0u64;
+    let mut hot_weighted_sum = 0u128;
+    let mut hot_samples = 0u64;
+    let mut hot_max_ms = 0u128;
+    let mut monitor_weighted_sum = 0u128;
+    let mut monitor_samples = 0u64;
+    let mut bottleneck_stage = "none".to_string();
+    let mut bottleneck_ms = 0u128;
+
+    for (stage, (samples, _last_ms, avg_ms, max_ms)) in summary {
+        sample_count = sample_count.saturating_add(samples);
+        if max_ms > bottleneck_ms {
+            bottleneck_ms = max_ms;
+            bottleneck_stage = stage.clone();
+        }
+
+        if is_hot_path_latency_stage(&stage) {
+            hot_weighted_sum =
+                hot_weighted_sum.saturating_add(avg_ms.saturating_mul(u128::from(samples)));
+            hot_samples = hot_samples.saturating_add(samples);
+            hot_max_ms = hot_max_ms.max(max_ms);
+        } else {
+            monitor_weighted_sum =
+                monitor_weighted_sum.saturating_add(avg_ms.saturating_mul(u128::from(samples)));
+            monitor_samples = monitor_samples.saturating_add(samples);
+        }
+    }
+
+    let rpc_latencies: Vec<u128> = rpc_endpoints
+        .iter()
+        .filter(|endpoint| !endpoint.disabled)
+        .filter_map(|endpoint| endpoint.avg_latency_ms)
+        .collect();
+    let rpc_avg_ms = if rpc_latencies.is_empty() {
+        0
+    } else {
+        rpc_latencies.iter().sum::<u128>() / rpc_latencies.len() as u128
+    };
+    let hot_path_avg_ms = if hot_samples == 0 {
+        0
+    } else {
+        hot_weighted_sum / u128::from(hot_samples)
+    };
+    let monitor_avg_ms = if monitor_samples == 0 {
+        0
+    } else {
+        monitor_weighted_sum / u128::from(monitor_samples)
+    };
+
+    let hot_pressure = pressure(hot_path_avg_ms as f64, 250.0);
+    let tail_pressure = pressure(hot_max_ms as f64, 750.0);
+    let rpc_pressure = pressure(rpc_avg_ms as f64, 350.0);
+    let monitor_pressure = pressure(monitor_avg_ms as f64, 700.0) * 0.5;
+    let score = (hot_pressure * 0.40
+        + tail_pressure * 0.25
+        + rpc_pressure * 0.25
+        + monitor_pressure * 0.10)
+        .clamp(0.0, 1.0);
+    let level = if score >= 0.75 {
+        "BREACH"
+    } else if score >= 0.45 {
+        "WARN"
+    } else {
+        "OK"
+    };
+
+    LatencyRiskSnapshot {
+        updated_at: Utc::now().to_rfc3339(),
+        window_secs: 300,
+        sample_count,
+        hot_path_avg_ms,
+        hot_path_max_ms: hot_max_ms,
+        monitor_avg_ms,
+        rpc_avg_ms,
+        score,
+        level: level.to_string(),
+        bottleneck_stage,
+    }
+}
+
+fn is_hot_path_latency_stage(stage: &str) -> bool {
+    matches!(
+        stage,
+        "decode"
+            | "fast_preflight"
+            | "adaptive_preflight"
+            | "payload_build"
+            | "quote"
+            | "fee_pending_lookup"
+            | "tx_prepare"
+            | "bundle_attempt"
+    )
+}
+
+fn pressure(value: f64, budget: f64) -> f64 {
+    if value <= 0.0 || budget <= 0.0 {
+        0.0
+    } else {
+        ((value / budget) - 0.5).clamp(0.0, 1.5) / 1.5
+    }
 }
 
 fn upsert_latency_metric(metrics: &mut Vec<LatencyMetric>, stage: &str, duration_ms: u128) {

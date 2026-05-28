@@ -518,6 +518,108 @@ impl Storage {
         }
     }
 
+    pub fn telemetry_window_summary(
+        &self,
+        window_secs: i64,
+    ) -> Result<HashMap<String, (u64, u128, u128, u128)>, Box<dyn std::error::Error>> {
+        let cutoff = (Utc::now() - chrono::Duration::seconds(window_secs.max(1))).to_rfc3339();
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                let conn = conn.lock().map_err(|_| "storage lock poisoned")?;
+                let mut summary = HashMap::new();
+
+                let mut stmt = conn.prepare(
+                    "SELECT stage, COUNT(*), AVG(duration_ms), MAX(duration_ms)
+                     FROM telemetry
+                     WHERE at >= ?1
+                     GROUP BY stage",
+                )?;
+                let rows = stmt.query_map([cutoff.as_str()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, f64>(2)? as u128,
+                        row.get::<_, i64>(3)? as u128,
+                    ))
+                })?;
+
+                for row in rows {
+                    let (stage, samples, avg_ms, max_ms) = row?;
+                    summary.insert(stage, (samples, 0, avg_ms, max_ms));
+                }
+
+                let mut stmt = conn.prepare(
+                    "SELECT t.stage, t.duration_ms
+                     FROM telemetry t
+                     INNER JOIN (
+                        SELECT stage, MAX(id) AS last_id
+                        FROM telemetry
+                        WHERE at >= ?1
+                        GROUP BY stage
+                     ) latest ON latest.stage = t.stage AND latest.last_id = t.id",
+                )?;
+                let rows = stmt.query_map([cutoff.as_str()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u128))
+                })?;
+
+                for row in rows {
+                    let (stage, last_ms) = row?;
+                    if let Some(entry) = summary.get_mut(&stage) {
+                        entry.1 = last_ms;
+                    }
+                }
+
+                Ok(summary)
+            }
+            StorageBackend::Postgres(pool) => {
+                let mut summary = HashMap::new();
+                let rows = Self::wait(
+                    sqlx::query(
+                        "SELECT
+                            stage,
+                            COUNT(*)::bigint AS samples,
+                            AVG(duration_ms)::double precision AS avg_ms,
+                            MAX(duration_ms)::bigint AS max_ms
+                         FROM telemetry
+                         WHERE at >= $1
+                         GROUP BY stage",
+                    )
+                    .bind(cutoff.clone())
+                    .fetch_all(pool),
+                )?;
+                for row in rows {
+                    summary.insert(
+                        row.get::<String, _>("stage"),
+                        (
+                            row.get::<i64, _>("samples") as u64,
+                            0,
+                            row.try_get::<Option<f64>, _>("avg_ms")?.unwrap_or(0.0) as u128,
+                            row.get::<i64, _>("max_ms") as u128,
+                        ),
+                    );
+                }
+
+                let rows = Self::wait(
+                    sqlx::query(
+                        "SELECT DISTINCT ON (stage) stage, duration_ms
+                         FROM telemetry
+                         WHERE at >= $1
+                         ORDER BY stage, id DESC",
+                    )
+                    .bind(cutoff)
+                    .fetch_all(pool),
+                )?;
+                for row in rows {
+                    let stage = row.get::<String, _>("stage");
+                    if let Some(entry) = summary.get_mut(&stage) {
+                        entry.1 = row.get::<i64, _>("duration_ms") as u128;
+                    }
+                }
+                Ok(summary)
+            }
+        }
+    }
+
     pub fn top_wallet_residuals(
         &self,
         limit: usize,
