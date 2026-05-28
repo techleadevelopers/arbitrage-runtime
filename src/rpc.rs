@@ -412,7 +412,27 @@ impl RpcFleet {
         }
 
         candidates.sort_by(|left, right| left.1.partial_cmp(&right.1).unwrap_or(Ordering::Equal));
-        let top_n = candidates.len().min(3);
+        if !send_mode {
+            let healthy_candidates: Vec<(Arc<RpcEndpoint>, f64)> = candidates
+                .iter()
+                .filter(|(endpoint, _)| self.endpoint_is_read_healthy(endpoint, now))
+                .cloned()
+                .collect();
+            if !healthy_candidates.is_empty() {
+                candidates = healthy_candidates;
+            }
+        }
+
+        let top_n = if send_mode {
+            candidates.len().min(2)
+        } else {
+            std::env::var("RPC_READ_ROTATE_TOP_N")
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(1)
+                .clamp(1, 3)
+                .min(candidates.len())
+        };
         if top_n > 1 {
             let rotation = self.rotation.fetch_add(1, AtomicOrdering::Relaxed) % top_n;
             candidates[..top_n].rotate_left(rotation);
@@ -422,6 +442,27 @@ impl RpcFleet {
             .take(limit.max(1))
             .map(|(endpoint, _)| self.to_handle(&endpoint))
             .collect()
+    }
+
+    fn endpoint_is_read_healthy(&self, endpoint: &Arc<RpcEndpoint>, now: Instant) -> bool {
+        let mut state = endpoint.state.lock().expect("rpc endpoint state lock");
+        prune_burst_reservations(&mut state, now);
+        decay_failure_counters(&mut state, now);
+        if state.disabled || matches!(state.cooldown_until, Some(until) if until > now) {
+            return false;
+        }
+        let burst_capacity_units = endpoint_burst_capacity_units(endpoint.kind, false);
+        let recent_burst_units = burst_load_units(&state, now);
+        let block_fresh = state
+            .last_block_at
+            .map(|at| at.elapsed() <= Duration::from_secs(20))
+            .unwrap_or(true);
+        state.failures == 0
+            && state.rate_limit_failures == 0
+            && state.timeout_failures == 0
+            && state.stale_failures == 0
+            && recent_burst_units < burst_capacity_units
+            && block_fresh
     }
 
     fn endpoint_score(
@@ -718,8 +759,8 @@ fn endpoint_burst_capacity_units(kind: RpcKind, send_mode: bool) -> u32 {
         (RpcKind::Infura, true) => 12,
         (RpcKind::Tenderly, false) => 10,
         (RpcKind::Tenderly, true) => 8,
-        (RpcKind::GetBlock, false) => 18,
-        (RpcKind::GetBlock, true) => 14,
+        (RpcKind::GetBlock, false) => 10,
+        (RpcKind::GetBlock, true) => 8,
         (RpcKind::Generic, false) => 12,
         (RpcKind::Generic, true) => 10,
     }
