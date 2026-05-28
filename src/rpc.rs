@@ -413,13 +413,25 @@ impl RpcFleet {
 
         candidates.sort_by(|left, right| left.1.partial_cmp(&right.1).unwrap_or(Ordering::Equal));
         if !send_mode {
-            let healthy_candidates: Vec<(Arc<RpcEndpoint>, f64)> = candidates
+            let preferred_healthy: Vec<(Arc<RpcEndpoint>, f64)> = candidates
                 .iter()
                 .filter(|(endpoint, _)| self.endpoint_is_read_healthy(endpoint, now))
                 .cloned()
                 .collect();
-            if !healthy_candidates.is_empty() {
-                candidates = healthy_candidates;
+            if !preferred_healthy.is_empty() {
+                candidates = preferred_healthy;
+            } else {
+                let mut any_healthy: Vec<(Arc<RpcEndpoint>, f64)> = self
+                    .endpoints
+                    .iter()
+                    .filter_map(|endpoint| self.endpoint_score(endpoint, now, send_mode, true))
+                    .filter(|(endpoint, _)| self.endpoint_is_read_healthy(endpoint, now))
+                    .collect();
+                any_healthy
+                    .sort_by(|left, right| left.1.partial_cmp(&right.1).unwrap_or(Ordering::Equal));
+                if !any_healthy.is_empty() {
+                    candidates = any_healthy;
+                }
             }
         }
 
