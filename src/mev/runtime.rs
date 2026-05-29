@@ -797,6 +797,12 @@ async fn process_lookup_decode_task(
         dashboard.record_opportunity_funnel("decode_reject");
         if let Some(name) = aggregator_name_from_tx(&tx) {
             dashboard.record_reject_reason("aggregator_decode", name);
+            dashboard.record_edge_sample(aggregator_intelligence_sample(
+                &config,
+                &tx,
+                task.tx_hash,
+                name,
+            ));
             dashboard.event(
                 "warn",
                 format!(
@@ -2031,6 +2037,33 @@ fn enrich_edge_explainer_sample(
     if sample.simulated_extraction_native == 0.0 {
         sample.simulated_extraction_native = sample.gross_edge_native;
     }
+    if sample.aggregator_type.is_empty() {
+        sample.aggregator_type = "direct_router".to_string();
+    }
+    if sample.route_complexity == 0 {
+        sample.route_complexity = sample.hops.max(1);
+    }
+    if sample.dex_sequence.is_empty() {
+        sample.dex_sequence = vec![sample.route_kind.clone()];
+    }
+    if sample.route_inefficiency_score == 0.0 {
+        sample.route_inefficiency_score = scavenger_route_inefficiency_hint(signal);
+    }
+    if sample.liquidity_distortion_score == 0.0 {
+        sample.liquidity_distortion_score = sample.pool_imbalance_score;
+    }
+    if sample.hop_profitability_rank.is_empty() {
+        sample.hop_profitability_rank = (0..sample.hops.max(1).min(4))
+            .map(|idx| {
+                format!(
+                    "hop_{}: gross={:.6} impact={}bps",
+                    idx + 1,
+                    sample.gross_edge_native,
+                    sample.price_impact_bps
+                )
+            })
+            .collect();
+    }
     sample
 }
 
@@ -2673,6 +2706,228 @@ fn aggregator_name_from_tx(tx: &Transaction) -> Option<&'static str> {
         KYBER_SWAP => Some("kyber"),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone)]
+struct AggregatorRouteIntel {
+    command_count: u64,
+    swap_command_count: u64,
+    split_ratio_bps: u64,
+    dex_sequence: Vec<String>,
+    path: Vec<String>,
+    route_inefficiency_score: f64,
+    liquidity_distortion_score: f64,
+    hop_profitability_rank: Vec<String>,
+}
+
+fn aggregator_intelligence_sample(
+    config: &Config,
+    tx: &Transaction,
+    tx_hash: H256,
+    source: &str,
+) -> EdgeMetadata {
+    let selector = selector(tx).unwrap_or([0, 0, 0, 0]);
+    let intel = aggregator_route_intel(config, tx, source);
+    EdgeMetadata {
+        victim_tx: short_hash(tx_hash),
+        selector: format!(
+            "0x{:02x}{:02x}{:02x}{:02x}",
+            selector[0], selector[1], selector[2], selector[3]
+        ),
+        status: "aggregator_candidate".to_string(),
+        reason: "aggregator flow not decoded into executable graph yet".to_string(),
+        route_kind: "aggregator".to_string(),
+        path: intel.path,
+        hops: intel.command_count.max(1),
+        impacted_pools: Vec::new(),
+        slippage_window_score: aggregator_slippage_hint(source, tx),
+        pool_imbalance_score: intel.liquidity_distortion_score,
+        cross_dex_deviation_bps: ((intel.route_inefficiency_score * 10_000.0).round() as i64)
+            .clamp(0, 10_000),
+        gas_estimate: tx.gas.as_u64(),
+        simulated_extraction_native: 0.0,
+        aggregator_type: source.to_string(),
+        route_complexity: intel.command_count,
+        split_ratio_bps: intel.split_ratio_bps,
+        dex_sequence: intel.dex_sequence,
+        route_inefficiency_score: intel.route_inefficiency_score,
+        liquidity_distortion_score: intel.liquidity_distortion_score,
+        hop_profitability_rank: intel.hop_profitability_rank,
+        best_size_bps: 0,
+        amount_in_wei: tx.value.to_string(),
+        amount_out_wei: "0".to_string(),
+        gross_edge_wei: "0".to_string(),
+        gross_edge_native: 0.0,
+        repayment_wei: "0".to_string(),
+        repayment_native: 0.0,
+        price_impact_bps: 0,
+        self_slippage_bps: 0,
+        pool: "unknown".to_string(),
+        factory: "aggregator".to_string(),
+        router: tx.to.map(|address| format!("{address:?}")).unwrap_or_else(|| "unknown".to_string()),
+        token_in: "unknown".to_string(),
+        token_out: "unknown".to_string(),
+    }
+}
+
+fn aggregator_route_intel(config: &Config, tx: &Transaction, source: &str) -> AggregatorRouteIntel {
+    if source == "universal_router" {
+        if let Some(intel) = universal_router_intel(tx) {
+            return intel;
+        }
+    }
+
+    let input = tx.input.as_ref();
+    let matched_tokens = monitored_token_path_hint(config, input);
+    let complexity = ((input.len().saturating_sub(4) / 128).max(1).min(24)) as u64;
+    let route_inefficiency_score = match source {
+        "odos" | "1inch" | "0x_matcha" => 0.72,
+        "paraswap" | "kyber" => 0.66,
+        _ => 0.58,
+    };
+    let split_ratio_bps = if input.len() > 900 { 3_000 } else { 0 };
+    AggregatorRouteIntel {
+        command_count: complexity,
+        swap_command_count: 1,
+        split_ratio_bps,
+        dex_sequence: vec![source.to_string(), "unknown_dex".to_string()],
+        path: matched_tokens,
+        route_inefficiency_score,
+        liquidity_distortion_score: (0.30 + route_inefficiency_score * 0.45).clamp(0.0, 1.0),
+        hop_profitability_rank: vec![
+            "hop_1: route intent unresolved".to_string(),
+            "hop_2: decode aggregator inputs next".to_string(),
+        ],
+    }
+}
+
+fn universal_router_intel(tx: &Transaction) -> Option<AggregatorRouteIntel> {
+    let args = tx.input.as_ref().get(4..)?;
+    let decoded = abi::decode(
+        &[
+            ParamType::Bytes,
+            ParamType::Array(Box::new(ParamType::Bytes)),
+            ParamType::Uint(256),
+        ],
+        args,
+    )
+    .or_else(|_| {
+        abi::decode(
+            &[ParamType::Bytes, ParamType::Array(Box::new(ParamType::Bytes))],
+            args,
+        )
+    })
+    .ok()?;
+    let commands = match decoded.first()? {
+        Token::Bytes(value) => value.clone(),
+        _ => return None,
+    };
+    let command_count = commands.len() as u64;
+    let mut swap_command_count = 0u64;
+    let mut dex_sequence = Vec::new();
+    let mut wraps = 0u64;
+    let mut permit2 = 0u64;
+    for command in commands {
+        let opcode = command & 0x1f;
+        match opcode {
+            0x00 => {
+                swap_command_count += 1;
+                dex_sequence.push("v3_exact_in".to_string());
+            }
+            0x01 => {
+                swap_command_count += 1;
+                dex_sequence.push("v3_exact_out".to_string());
+            }
+            0x08 => {
+                swap_command_count += 1;
+                dex_sequence.push("v2_exact_in".to_string());
+            }
+            0x09 => {
+                swap_command_count += 1;
+                dex_sequence.push("v2_exact_out".to_string());
+            }
+            0x0b | 0x0c => wraps += 1,
+            0x02 | 0x03 | 0x0a | 0x0d => permit2 += 1,
+            _ => {}
+        }
+    }
+    if dex_sequence.is_empty() {
+        dex_sequence.push("universal_router".to_string());
+    }
+    let split_ratio_bps = if swap_command_count > 1 {
+        ((swap_command_count - 1) * 2_500).min(8_000)
+    } else {
+        0
+    };
+    let complexity_score = (command_count as f64 / 8.0).clamp(0.0, 1.0);
+    let split_score = (split_ratio_bps as f64 / 10_000.0).clamp(0.0, 1.0);
+    let route_inefficiency_score = (0.35 + complexity_score * 0.35 + split_score * 0.30)
+        .clamp(0.0, 1.0);
+    let liquidity_distortion_score =
+        (0.25 + split_score * 0.45 + (wraps as f64 * 0.04) + (permit2 as f64 * 0.03))
+            .clamp(0.0, 1.0);
+    Some(AggregatorRouteIntel {
+        command_count,
+        swap_command_count,
+        split_ratio_bps,
+        dex_sequence,
+        path: Vec::new(),
+        route_inefficiency_score,
+        liquidity_distortion_score,
+        hop_profitability_rank: universal_router_hop_rank(
+            swap_command_count,
+            split_ratio_bps,
+            route_inefficiency_score,
+        ),
+    })
+}
+
+fn universal_router_hop_rank(
+    swap_command_count: u64,
+    split_ratio_bps: u64,
+    route_inefficiency_score: f64,
+) -> Vec<String> {
+    if swap_command_count == 0 {
+        return vec!["no swap command extracted".to_string()];
+    }
+    (0..swap_command_count.min(4))
+        .map(|idx| {
+            let score = (route_inefficiency_score * 100.0).round() as u64;
+            format!(
+                "hop_{}: score={} split={}bps",
+                idx + 1,
+                score,
+                split_ratio_bps
+            )
+        })
+        .collect()
+}
+
+fn monitored_token_path_hint(config: &Config, input: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in &config.monitored_tokens {
+        if input
+            .windows(20)
+            .any(|window| window == token.address.as_bytes())
+        {
+            out.push(format!("{:?}", token.address));
+        }
+        if out.len() >= 6 {
+            break;
+        }
+    }
+    out
+}
+
+fn aggregator_slippage_hint(source: &str, tx: &Transaction) -> f64 {
+    let size_hint = (tx.input.as_ref().len() as f64 / 1600.0).clamp(0.0, 0.35);
+    let source_hint = match source {
+        "universal_router" => 0.62,
+        "odos" | "1inch" => 0.58,
+        "0x_matcha" | "paraswap" | "kyber" => 0.52,
+        _ => 0.45,
+    };
+    (source_hint + size_hint).clamp(0.0, 0.95)
 }
 
 fn selector_heuristic_factor(selector: [u8; 4]) -> f64 {

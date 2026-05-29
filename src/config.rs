@@ -29,7 +29,7 @@ pub struct Config {
     pub chain_id: u64,
     pub allow_send: bool,
     pub tenderly_rpc_only: bool,
-    pub alchemy_keys: Vec<String>,
+    pub alchemy_keys: Vec<(String, String)>,
     pub infura_ids: Vec<String>,
     pub flashbots_relay: String,
     pub builder_relays: Vec<String>,
@@ -500,9 +500,9 @@ impl Config {
         for (name, rpc_url) in &self.explicit_rpc_urls {
             urls.push((name.clone(), rpc_url.clone()));
         }
-        for (idx, alchemy_key) in self.alchemy_keys.iter().enumerate() {
+        for (name, alchemy_key) in &self.alchemy_keys {
             if let Some(alchemy_url) = alchemy_url_for_network(&self.network, alchemy_key) {
-                urls.push((format!("alchemy-{}", idx + 1), alchemy_url));
+                urls.push((name.clone(), alchemy_url));
             }
         }
 
@@ -537,7 +537,7 @@ impl Config {
         }
         self.alchemy_keys
             .iter()
-            .filter_map(|key| alchemy_ws_url_for_network(&self.network, key))
+            .filter_map(|(_, key)| alchemy_ws_url_for_network(&self.network, key))
             .collect()
     }
 
@@ -734,15 +734,8 @@ fn required_env(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     Ok(trimmed.to_string())
 }
 
-fn parse_alchemy_keys() -> Vec<String> {
+fn parse_alchemy_keys() -> Vec<(String, String)> {
     let mut keys = Vec::new();
-
-    if let Ok(value) = env::var("ALCHEMY_KEY") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            keys.push(trimmed.to_string());
-        }
-    }
 
     for idx in 2..=8 {
         if let Ok(value) = env::var(format!("ALCHEMY_KEY_{idx}")) {
@@ -750,9 +743,9 @@ fn parse_alchemy_keys() -> Vec<String> {
             if !trimmed.is_empty()
                 && !keys
                     .iter()
-                    .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+                    .any(|(_, existing): &(String, String)| existing.eq_ignore_ascii_case(trimmed))
             {
-                keys.push(trimmed.to_string());
+                keys.push((format!("alchemy-{idx}"), trimmed.to_string()));
             }
         }
     }
@@ -763,7 +756,7 @@ fn parse_alchemy_keys() -> Vec<String> {
 fn parse_mempool_ws_urls(
     network: &str,
     tenderly_rpc_only: bool,
-    alchemy_keys: &[String],
+    alchemy_keys: &[(String, String)],
 ) -> Vec<String> {
     let mut urls: Vec<String> = Vec::new();
 
@@ -799,7 +792,7 @@ fn parse_mempool_ws_urls(
     }
 
     if urls.is_empty() && !tenderly_rpc_only && supports_default_alchemy_mempool_ws(network) {
-        for key in alchemy_keys {
+        for (_, key) in alchemy_keys {
             if let Some(ws_url) = alchemy_ws_url_for_network(network, key) {
                 urls.push(ws_url);
             }
