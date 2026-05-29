@@ -1,35 +1,21 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {IArbitrageRuntimeExecutor} from "../interfaces/IArbitrageRuntimeExecutor.sol";
-
-interface IERC20Minimal {
+interface IERC20MinimalV2 {
     function balanceOf(address owner) external view returns (uint256);
     function allowance(address owner, address spender) external view returns (uint256);
     function approve(address spender, uint256 value) external returns (bool);
     function transfer(address to, uint256 value) external returns (bool);
 }
 
-interface IUniswapV2PairLike {
+interface IUniswapV2PairLikeV2 {
     function token0() external view returns (address);
     function token1() external view returns (address);
     function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
     function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
 }
 
-interface IUniswapV3PoolLike {
-    function token0() external view returns (address);
-    function token1() external view returns (address);
-    function swap(
-        address recipient,
-        bool zeroForOne,
-        int256 amountSpecified,
-        uint160 sqrtPriceLimitX96,
-        bytes calldata data
-    ) external returns (int256 amount0, int256 amount1);
-}
-
-interface IUniswapV2RouterLike {
+interface IUniswapV2RouterLikeV2 {
     function swapExactTokensForTokens(
         uint256 amountIn,
         uint256 amountOutMin,
@@ -39,50 +25,14 @@ interface IUniswapV2RouterLike {
     ) external returns (uint256[] memory amounts);
 }
 
-interface IUniswapV3RouterLike {
-    struct ExactInputParams {
-        bytes path;
-        address recipient;
-        uint256 deadline;
+contract ArbitrageRuntimeExecutorV2 {
+    struct V2SwapStep {
+        address router;
+        address[] path;
         uint256 amountIn;
-        uint256 amountOutMinimum;
+        uint256 minOut;
     }
 
-    function exactInput(ExactInputParams calldata params) external payable returns (uint256 amountOut);
-}
-
-abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
-    uint160 internal constant MIN_SQRT_RATIO_PLUS_ONE = 4295128740;
-    uint160 internal constant MAX_SQRT_RATIO_MINUS_ONE =
-        1461446703485210103287273052203988822378723970341;
-
-    address public owner;
-    mapping(address => bool) public authorizedOperators;
-    mapping(address => bool) public allowedV2Pairs;
-    mapping(address => bool) public allowedV3Pools;
-    mapping(address => bool) public allowedRouters;
-    mapping(address => bool) public allowedBorrowTokens;
-    mapping(uint24 => bool) public allowedFeeTiers;
-
-    bytes32 public activeExecutionId;
-    bool public executionInProgress;
-
-    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
-    event OperatorAuthorizationUpdated(address indexed operator, bool allowed);
-    event V2PairAuthorizationUpdated(address indexed pair, bool allowed);
-    event V3PoolAuthorizationUpdated(address indexed pool, bool allowed);
-    event RouterAuthorizationUpdated(address indexed router, bool allowed);
-    event BorrowTokenAuthorizationUpdated(address indexed token, bool allowed);
-    event FeeTierAuthorizationUpdated(uint24 indexed feeTier, bool allowed);
-    event TokenRescued(address indexed token, address indexed to, uint256 amount);
-    event NativeRescued(address indexed to, uint256 amount);
-
-    error OnlyOwner();
-    error OnlyAuthorizedOperator();
-    error ExecutionAlreadyInProgress();
-    error NoExecutionInProgress();
-    error UnknownExecution();
-    error InvalidExecutionSource();
     struct V2CallbackContext {
         bytes32 executionId;
         address pair;
@@ -94,17 +44,61 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
         V2SwapStep[] steps;
     }
 
-    struct V3CallbackContext {
-        bytes32 executionId;
-        address pool;
-        address borrowToken;
-        uint256 borrowAmount;
-        uint24 feeTier;
-        uint256 minProfit;
-        address profitToken;
-        address profitRecipient;
-        V3SwapStep[] steps;
-    }
+    address public owner;
+    mapping(address => bool) public authorizedOperators;
+    mapping(address => bool) public allowedV2Pairs;
+    mapping(address => bool) public allowedRouters;
+    mapping(address => bool) public allowedBorrowTokens;
+    bytes32 public activeExecutionId;
+    bool public executionInProgress;
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event OperatorAuthorizationUpdated(address indexed operator, bool allowed);
+    event V2PairAuthorizationUpdated(address indexed pair, bool allowed);
+    event RouterAuthorizationUpdated(address indexed router, bool allowed);
+    event BorrowTokenAuthorizationUpdated(address indexed token, bool allowed);
+    event V2ExecutionStarted(
+        address indexed initiator,
+        address indexed pair,
+        address indexed borrowToken,
+        uint256 borrowAmount,
+        uint256 minProfit,
+        address profitToken
+    );
+    event V2StepExecuted(
+        uint256 indexed stepIndex,
+        address indexed router,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 amountOut
+    );
+    event ExecutionSettled(
+        bytes32 indexed executionId,
+        address indexed profitToken,
+        uint256 grossProfit,
+        uint256 netProfit,
+        uint256 repaymentAmount
+    );
+    event TokenRescued(address indexed token, address indexed to, uint256 amount);
+    event NativeRescued(address indexed to, uint256 amount);
+
+    error OnlyOwner();
+    error OnlyAuthorizedOperator();
+    error ZeroAddress();
+    error ZeroAmount();
+    error InvalidPath();
+    error InvalidStep();
+    error InvalidCaller();
+    error UnsupportedPair();
+    error UnsupportedBorrowToken();
+    error ExecutionAlreadyInProgress();
+    error NoExecutionInProgress();
+    error UnknownExecution();
+    error InvalidExecutionSource();
+    error StepExecutionFailed(uint256 stepIndex);
+    error RepaymentFailed();
+    error ProfitBelowMinimum(uint256 realizedProfit, uint256 minimumProfit);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert OnlyOwner();
@@ -156,21 +150,6 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
         }
     }
 
-    function setAllowedV3Pool(address pool, bool allowed) external onlyOwner {
-        if (pool == address(0)) revert ZeroAddress();
-        allowedV3Pools[pool] = allowed;
-        emit V3PoolAuthorizationUpdated(pool, allowed);
-    }
-
-    function setAllowedV3Pools(address[] calldata pools, bool allowed) external onlyOwner {
-        for (uint256 i = 0; i < pools.length; ++i) {
-            address pool = pools[i];
-            if (pool == address(0)) revert ZeroAddress();
-            allowedV3Pools[pool] = allowed;
-            emit V3PoolAuthorizationUpdated(pool, allowed);
-        }
-    }
-
     function setAllowedRouter(address router, bool allowed) external onlyOwner {
         if (router == address(0)) revert ZeroAddress();
         allowedRouters[router] = allowed;
@@ -201,19 +180,6 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
         }
     }
 
-    function setAllowedFeeTier(uint24 feeTier, bool allowed) external onlyOwner {
-        allowedFeeTiers[feeTier] = allowed;
-        emit FeeTierAuthorizationUpdated(feeTier, allowed);
-    }
-
-    function setAllowedFeeTiers(uint24[] calldata feeTiers, bool allowed) external onlyOwner {
-        for (uint256 i = 0; i < feeTiers.length; ++i) {
-            uint24 feeTier = feeTiers[i];
-            allowedFeeTiers[feeTier] = allowed;
-            emit FeeTierAuthorizationUpdated(feeTier, allowed);
-        }
-    }
-
     function rescueToken(address token, address to, uint256 amount) external onlyOwner {
         if (token == address(0) || to == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
@@ -235,31 +201,14 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
         address pair,
         address borrowToken,
         address[] calldata routers
-    ) external view returns (bool allowed, string memory reason) {
-        if (!authorizedOperators[operator]) return (false, "operator");
-        if (!allowedV2Pairs[pair]) return (false, "pair");
-        if (!allowedBorrowTokens[borrowToken]) return (false, "borrow_token");
+    ) external view returns (bool allowed, uint8 reasonCode) {
+        if (!authorizedOperators[operator]) return (false, 1);
+        if (!allowedV2Pairs[pair]) return (false, 2);
+        if (!allowedBorrowTokens[borrowToken]) return (false, 3);
         for (uint256 i = 0; i < routers.length; ++i) {
-            if (!allowedRouters[routers[i]]) return (false, "router");
+            if (!allowedRouters[routers[i]]) return (false, 4);
         }
-        return (true, "ok");
-    }
-
-    function isV3ExecutionAllowed(
-        address operator,
-        address pool,
-        address borrowToken,
-        uint24 feeTier,
-        address[] calldata routers
-    ) external view returns (bool allowed, string memory reason) {
-        if (!authorizedOperators[operator]) return (false, "operator");
-        if (!allowedV3Pools[pool]) return (false, "pool");
-        if (!allowedBorrowTokens[borrowToken]) return (false, "borrow_token");
-        if (!allowedFeeTiers[feeTier]) return (false, "fee_tier");
-        for (uint256 i = 0; i < routers.length; ++i) {
-            if (!allowedRouters[routers[i]]) return (false, "router");
-        }
-        return (true, "ok");
+        return (true, 0);
     }
 
     function startV2FlashSwap(
@@ -279,12 +228,11 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
         if (!allowedBorrowTokens[borrowToken]) revert UnsupportedBorrowToken();
         _validateV2Steps(steps);
 
-        address token0 = IUniswapV2PairLike(pair).token0();
-        address token1 = IUniswapV2PairLike(pair).token1();
+        address token0 = IUniswapV2PairLikeV2(pair).token0();
+        address token1 = IUniswapV2PairLikeV2(pair).token1();
         if (borrowToken != token0 && borrowToken != token1) revert UnsupportedBorrowToken();
 
         bytes32 executionId = _deriveExecutionId(
-            keccak256("V2"),
             pair,
             borrowToken,
             borrowAmount,
@@ -310,67 +258,7 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
 
         uint256 amount0Out = borrowToken == token0 ? borrowAmount : 0;
         uint256 amount1Out = borrowToken == token1 ? borrowAmount : 0;
-        IUniswapV2PairLike(pair).swap(amount0Out, amount1Out, address(this), abi.encode(ctx));
-    }
-
-    function startV3FlashSwap(
-        address pool,
-        address borrowToken,
-        uint256 borrowAmount,
-        uint24 feeTier,
-        uint256 minProfit,
-        address profitToken,
-        address profitRecipient,
-        V3SwapStep[] calldata steps
-    ) external onlyAuthorizedOperator {
-        if (pool == address(0) || borrowToken == address(0) || profitToken == address(0) || profitRecipient == address(0)) {
-            revert ZeroAddress();
-        }
-        if (borrowAmount == 0) revert ZeroAmount();
-        if (!allowedV3Pools[pool]) revert UnsupportedPool();
-        if (!allowedBorrowTokens[borrowToken]) revert UnsupportedBorrowToken();
-        if (!allowedFeeTiers[feeTier]) revert UnsupportedFeeTier();
-        _validateV3Steps(steps);
-
-        address token0 = IUniswapV3PoolLike(pool).token0();
-        address token1 = IUniswapV3PoolLike(pool).token1();
-        if (borrowToken != token0 && borrowToken != token1) revert UnsupportedBorrowToken();
-
-        bytes32 executionId = _deriveExecutionId(
-            keccak256("V3"),
-            pool,
-            borrowToken,
-            borrowAmount,
-            minProfit,
-            profitToken,
-            profitRecipient,
-            steps.length
-        );
-        _beginExecution(executionId);
-
-        V3CallbackContext memory ctx = V3CallbackContext({
-            executionId: executionId,
-            pool: pool,
-            borrowToken: borrowToken,
-            borrowAmount: borrowAmount,
-            feeTier: feeTier,
-            minProfit: minProfit,
-            profitToken: profitToken,
-            profitRecipient: profitRecipient,
-            steps: steps
-        });
-
-        emit V3ExecutionStarted(
-            msg.sender,
-            pool,
-            borrowToken,
-            feeTier,
-            borrowAmount,
-            minProfit,
-            profitToken
-        );
-
-        _startV3PoolSwap(pool, borrowToken == token1, borrowAmount, ctx);
+        IUniswapV2PairLikeV2(pair).swap(amount0Out, amount1Out, address(this), abi.encode(ctx));
     }
 
     function uniswapV2Call(
@@ -388,7 +276,7 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
 
         uint256 preProfitBalance = _balanceOf(ctx.profitToken);
         for (uint256 i = 0; i < ctx.steps.length; ++i) {
-            (address tokenIn, address tokenOut, uint256 amountOut) = _executeV2Step(ctx.steps[i], i, ctx);
+            (address tokenIn, address tokenOut, uint256 amountOut) = _executeV2Step(ctx.steps[i], i);
             emit V2StepExecuted(i, ctx.steps[i].router, tokenIn, tokenOut, ctx.steps[i].amountIn, amountOut);
         }
 
@@ -405,56 +293,50 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
         if (netProfit < ctx.minProfit) revert ProfitBelowMinimum(netProfit, ctx.minProfit);
     }
 
-    function uniswapV3SwapCallback(
-        int256 amount0Delta,
-        int256 amount1Delta,
-        bytes calldata data
-    ) external {
-        if (!executionInProgress) revert NoExecutionInProgress();
+    function _executeV2Step(
+        V2SwapStep memory step,
+        uint256 stepIndex
+    ) internal returns (address tokenIn, address tokenOut, uint256 amountOut) {
+        tokenIn = step.path[0];
+        tokenOut = step.path[step.path.length - 1];
 
-        V3CallbackContext memory ctx = abi.decode(data, (V3CallbackContext));
-        if (ctx.executionId != activeExecutionId) revert UnknownExecution();
-        if (msg.sender != ctx.pool) revert InvalidExecutionSource();
+        uint256 amountIn = _currentAmountIn(step.amountIn, tokenIn);
+        if (amountIn == 0) revert ZeroAmount();
 
-        uint256 preProfitBalance = _balanceOf(ctx.profitToken);
-        for (uint256 i = 0; i < ctx.steps.length; ++i) {
-            uint256 amountOut = _executeV3Step(ctx.steps[i], i, ctx);
-            emit V3StepExecuted(i, ctx.steps[i].router, ctx.steps[i].path, ctx.steps[i].amountIn, amountOut);
-        }
-
-        uint256 repaymentAmount = _settleV3PoolDebt(ctx, amount0Delta, amount1Delta);
-        uint256 postProfitBalance = _balanceOf(ctx.profitToken);
-        uint256 grossProfit = postProfitBalance > preProfitBalance ? postProfitBalance - preProfitBalance : 0;
-        uint256 netProfit = _finalizeExecution(
-            ctx.executionId,
-            ctx.profitToken,
-            ctx.profitRecipient,
-            grossProfit,
-            repaymentAmount
+        _forceApprove(tokenIn, step.router, amountIn);
+        uint256 beforeOut = _balanceOf(tokenOut);
+        uint256[] memory amounts = IUniswapV2RouterLikeV2(step.router).swapExactTokensForTokens(
+            amountIn,
+            step.minOut,
+            step.path,
+            address(this),
+            block.timestamp
         );
-        if (netProfit < ctx.minProfit) revert ProfitBelowMinimum(netProfit, ctx.minProfit);
+        if (amounts.length == 0) revert StepExecutionFailed(stepIndex);
+        amountOut = amounts[amounts.length - 1];
+
+        uint256 afterOut = _balanceOf(tokenOut);
+        if (afterOut < beforeOut) revert StepExecutionFailed(stepIndex);
+        uint256 balanceDiff = afterOut - beforeOut;
+        if (balanceDiff > amountOut) amountOut = balanceDiff;
+        if (amountOut < step.minOut) revert StepExecutionFailed(stepIndex);
+    }
+
+    function _settleV2PairDebt(
+        V2CallbackContext memory ctx,
+        uint256 amount0,
+        uint256 amount1
+    ) internal returns (uint256 repaymentAmount) {
+        uint256 borrowedAmount = amount0 > 0 ? amount0 : amount1;
+        if (borrowedAmount == 0) borrowedAmount = ctx.borrowAmount;
+        repaymentAmount = _v2RepaymentAmountIn(ctx.pair, ctx.borrowToken, ctx.profitToken, borrowedAmount);
+        _transferToken(ctx.profitToken, ctx.pair, repaymentAmount);
     }
 
     function _beginExecution(bytes32 executionId) internal {
         if (executionInProgress) revert ExecutionAlreadyInProgress();
         executionInProgress = true;
         activeExecutionId = executionId;
-    }
-
-    function _startV3PoolSwap(
-        address pool,
-        bool zeroForOne,
-        uint256 borrowAmount,
-        V3CallbackContext memory ctx
-    ) internal {
-        uint160 sqrtPriceLimitX96 = zeroForOne ? MIN_SQRT_RATIO_PLUS_ONE : MAX_SQRT_RATIO_MINUS_ONE;
-        IUniswapV3PoolLike(pool).swap(
-            address(this),
-            zeroForOne,
-            -int256(borrowAmount),
-            sqrtPriceLimitX96,
-            abi.encode(ctx)
-        );
     }
 
     function _finalizeExecution(
@@ -483,18 +365,7 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
         }
     }
 
-    function _validateV3Steps(V3SwapStep[] calldata steps) internal view {
-        if (steps.length == 0) revert InvalidStep();
-        for (uint256 i = 0; i < steps.length; ++i) {
-            V3SwapStep calldata step = steps[i];
-            if (!allowedRouters[step.router]) revert InvalidStep();
-            if (step.path.length < 43) revert InvalidPath();
-            if (step.minOut == 0) revert ZeroAmount();
-        }
-    }
-
     function _deriveExecutionId(
-        bytes32 flowKind,
         address venue,
         address borrowToken,
         uint256 borrowAmount,
@@ -505,7 +376,7 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
     ) internal view returns (bytes32) {
         return keccak256(
             abi.encodePacked(
-                flowKind,
+                keccak256("V2"),
                 block.chainid,
                 address(this),
                 venue,
@@ -521,17 +392,17 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
     }
 
     function _balanceOf(address token) internal view returns (uint256) {
-        return IERC20Minimal(token).balanceOf(address(this));
+        return IERC20MinimalV2(token).balanceOf(address(this));
     }
 
     function _transferToken(address token, address to, uint256 amount) internal {
         if (amount == 0) return;
-        bool ok = IERC20Minimal(token).transfer(to, amount);
+        bool ok = IERC20MinimalV2(token).transfer(to, amount);
         if (!ok) revert RepaymentFailed();
     }
 
     function _forceApprove(address token, address spender, uint256 amount) internal {
-        IERC20Minimal erc20 = IERC20Minimal(token);
+        IERC20MinimalV2 erc20 = IERC20MinimalV2(token);
         uint256 current = erc20.allowance(address(this), spender);
         if (current >= amount) return;
         if (current != 0) {
@@ -543,25 +414,8 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
     }
 
     function _currentAmountIn(uint256 requestedAmount, address tokenIn) internal view returns (uint256) {
-        if (requestedAmount == type(uint256).max) {
-            return _balanceOf(tokenIn);
-        }
+        if (requestedAmount == type(uint256).max) return _balanceOf(tokenIn);
         return requestedAmount;
-    }
-
-    function _v3PathTokenIn(bytes memory path) internal pure returns (address tokenIn) {
-        if (path.length < 43) revert InvalidPath();
-        assembly {
-            tokenIn := shr(96, mload(add(path, 32)))
-        }
-    }
-
-    function _v3PathTokenOut(bytes memory path) internal pure returns (address tokenOut) {
-        if (path.length < 43) revert InvalidPath();
-        uint256 offset = path.length - 20;
-        assembly {
-            tokenOut := shr(96, mload(add(add(path, 32), offset)))
-        }
     }
 
     function _v2RepaymentAmount(uint256 borrowedAmount) internal pure returns (uint256) {
@@ -574,12 +428,10 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
         address repaymentToken,
         uint256 borrowedAmount
     ) internal view returns (uint256) {
-        if (repaymentToken == borrowedToken) {
-            return _v2RepaymentAmount(borrowedAmount);
-        }
+        if (repaymentToken == borrowedToken) return _v2RepaymentAmount(borrowedAmount);
 
-        address token0 = IUniswapV2PairLike(pair).token0();
-        address token1 = IUniswapV2PairLike(pair).token1();
+        address token0 = IUniswapV2PairLikeV2(pair).token0();
+        address token1 = IUniswapV2PairLikeV2(pair).token1();
         if (
             !((borrowedToken == token0 && repaymentToken == token1) ||
                 (borrowedToken == token1 && repaymentToken == token0))
@@ -587,7 +439,7 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
             revert UnsupportedBorrowToken();
         }
 
-        (uint112 reserve0, uint112 reserve1, ) = IUniswapV2PairLike(pair).getReserves();
+        (uint112 reserve0, uint112 reserve1, ) = IUniswapV2PairLikeV2(pair).getReserves();
         uint256 reserveIn = repaymentToken == token0 ? uint256(reserve0) : uint256(reserve1);
         uint256 reserveOut = borrowedToken == token0 ? uint256(reserve0) : uint256(reserve1);
         if (borrowedAmount >= reserveOut) revert RepaymentFailed();
@@ -596,28 +448,4 @@ abstract contract ArbitrageRuntimeExecutorBase is IArbitrageRuntimeExecutor {
         uint256 denominator = (reserveOut - borrowedAmount) * 997;
         return (numerator / denominator) + 1;
     }
-
-    function _executeV2Step(
-        V2SwapStep memory step,
-        uint256 stepIndex,
-        V2CallbackContext memory ctx
-    ) internal virtual returns (address tokenIn, address tokenOut, uint256 amountOut);
-
-    function _executeV3Step(
-        V3SwapStep memory step,
-        uint256 stepIndex,
-        V3CallbackContext memory ctx
-    ) internal virtual returns (uint256 amountOut);
-
-    function _settleV2PairDebt(
-        V2CallbackContext memory ctx,
-        uint256 amount0,
-        uint256 amount1
-    ) internal virtual returns (uint256 repaymentAmount);
-
-    function _settleV3PoolDebt(
-        V3CallbackContext memory ctx,
-        int256 amount0Delta,
-        int256 amount1Delta
-    ) internal virtual returns (uint256 repaymentAmount);
 }
