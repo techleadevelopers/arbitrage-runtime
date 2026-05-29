@@ -1204,10 +1204,21 @@ async fn process_evaluation_task(
             return None;
         }
     };
-    dashboard.record_opportunity_funnel("payload_built");
-    if let Some(sample) = payload.edge_metadata.clone().map(|sample| {
+    let economic_payload = config.mev.opportunity_mode() != OpportunityMode::Scavenger
+        || scavenger_payload_has_economic_edge(&config, &payload, candidate.gas_price);
+    if economic_payload {
+        dashboard.record_opportunity_funnel("payload_built");
+    } else {
+        dashboard.record_opportunity_funnel("payload_reject");
+        dashboard.record_reject_reason("payload_build", "scavenger_dust_edge_shadow_only");
+    }
+    if let Some(mut sample) = payload.edge_metadata.clone().map(|sample| {
         enrich_edge_explainer_sample(sample, tx_hash, &candidate.signal, &fast_gate)
     }) {
+        if !economic_payload {
+            sample.status = "shadow_candidate".to_string();
+            sample.reason = "dust edge below economic floor".to_string();
+        }
         dashboard.record_edge_sample(sample);
     }
     candidate.latency_trace.payload_build_us = Some(elapsed_us(payload_started));
@@ -1293,6 +1304,15 @@ async fn process_evaluation_task(
     }
 
     if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
+        if !economic_payload {
+            candidate.latency_trace.ev_gate_us = Some(0);
+            candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+            dashboard.record_opportunity_funnel("ev_gate_reject");
+            candidate
+                .latency_trace
+                .emit(&config, &dashboard, tx_hash, "reject", "scavenger_dust_edge");
+            return None;
+        }
         let sanity_started = Instant::now();
         if let Err(reason) = passes_scavenger_sanity_gate(&config, &payload, candidate.lookup_latency) {
             candidate.latency_trace.ev_gate_us = Some(elapsed_us(sanity_started));
@@ -1593,6 +1613,34 @@ fn passes_scavenger_sanity_gate(
         return Err("scavenger_lookup_stale");
     }
     Ok(())
+}
+
+fn scavenger_payload_has_economic_edge(
+    config: &Config,
+    payload: &crate::mev::execution::payload_builder::ExecutionPayload,
+    gas_price: U256,
+) -> bool {
+    if payload.expected_profit_wei.is_zero() {
+        return false;
+    }
+    let gas_cost_wei = gas_price.saturating_mul(U256::from(payload.gas_limit));
+    let min_gas_fraction_bps = std::env::var("MEV_SCAVENGER_MIN_GAS_FRACTION_BPS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(250)
+        .clamp(1, 10_000);
+    let min_edge_wei = gas_cost_wei.saturating_mul(U256::from(min_gas_fraction_bps))
+        / U256::from(10_000u64);
+    let min_edge_usd = std::env::var("MEV_SCAVENGER_MIN_ECONOMIC_EDGE_USD")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .unwrap_or(0.005)
+        .max(0.0);
+    let min_edge_native = min_edge_usd / config.mev.eth_usd_price.max(0.000_001);
+    let min_edge_from_usd = ethers::utils::parse_ether(format!("{:.18}", min_edge_native))
+        .unwrap_or_else(|_| U256::zero());
+    let floor = min_edge_wei.max(min_edge_from_usd);
+    payload.expected_profit_wei >= floor
 }
 
 fn scavenger_quality_price_impact_cap_bps(config: &Config) -> u64 {
