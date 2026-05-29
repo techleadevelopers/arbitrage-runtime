@@ -2697,6 +2697,10 @@ pub(crate) fn decode_relevant_swap(
                 },
             }
         }
+        UNIVERSAL_ROUTER_EXECUTE | UNIVERSAL_ROUTER_EXECUTE_NO_DEADLINE => {
+            decode_universal_router_swap(selector, router, args)?
+        }
+        ZERO_EX_SELL_TO_UNISWAP => decode_zero_ex_sell_to_uniswap(selector, router, args)?,
         _ => return None,
     };
 
@@ -2711,6 +2715,161 @@ pub(crate) fn decode_relevant_swap(
     }
     signal.notional_wei = notional_wei;
     Some(signal)
+}
+
+fn decode_universal_router_swap(
+    selector: [u8; 4],
+    router: Address,
+    args: &[u8],
+) -> Option<SwapSignal> {
+    let decoded = abi::decode(
+        &[
+            ParamType::Bytes,
+            ParamType::Array(Box::new(ParamType::Bytes)),
+            ParamType::Uint(256),
+        ],
+        args,
+    )
+    .or_else(|_| {
+        abi::decode(
+            &[
+                ParamType::Bytes,
+                ParamType::Array(Box::new(ParamType::Bytes)),
+            ],
+            args,
+        )
+    })
+    .ok()?;
+    let commands = match decoded.first()? {
+        Token::Bytes(value) => value,
+        _ => return None,
+    };
+    let inputs = match decoded.get(1)? {
+        Token::Array(values) => values,
+        _ => return None,
+    };
+
+    for (idx, command) in commands.iter().enumerate() {
+        let input = match inputs.get(idx)? {
+            Token::Bytes(value) => value.as_slice(),
+            _ => continue,
+        };
+        match command & 0x1f {
+            0x00 => {
+                if let Some(signal) = decode_universal_router_v3_exact_in(selector, router, input) {
+                    return Some(signal);
+                }
+            }
+            0x08 => {
+                if let Some(signal) = decode_universal_router_v2_exact_in(selector, router, input) {
+                    return Some(signal);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn decode_universal_router_v2_exact_in(
+    selector: [u8; 4],
+    router: Address,
+    input: &[u8],
+) -> Option<SwapSignal> {
+    let decoded = abi::decode(
+        &[
+            ParamType::Address,
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Array(Box::new(ParamType::Address)),
+            ParamType::Bool,
+        ],
+        input,
+    )
+    .ok()?;
+    let amount_in = decoded.get(1).and_then(token_as_uint)?;
+    let amount_out_min = decoded.get(2).and_then(token_as_uint);
+    let path = decoded.get(3).and_then(token_as_address_vec)?;
+    Some(SwapSignal {
+        selector,
+        amount_in,
+        amount_out_min,
+        notional_wei: U256::zero(),
+        path,
+        router,
+        kind: SwapKind::V2,
+    })
+}
+
+fn decode_universal_router_v3_exact_in(
+    selector: [u8; 4],
+    router: Address,
+    input: &[u8],
+) -> Option<SwapSignal> {
+    let decoded = abi::decode(
+        &[
+            ParamType::Address,
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Bytes,
+            ParamType::Bool,
+        ],
+        input,
+    )
+    .ok()?;
+    let amount_in = decoded.get(1).and_then(token_as_uint)?;
+    let amount_out_min = decoded.get(2).and_then(token_as_uint);
+    let path_bytes = match decoded.get(3)? {
+        Token::Bytes(value) => value.clone(),
+        _ => return None,
+    };
+    let parsed = parse_v3_path(&path_bytes)?;
+    Some(SwapSignal {
+        selector,
+        amount_in,
+        amount_out_min,
+        notional_wei: U256::zero(),
+        path: vec![parsed.token_in, parsed.edge_token_out],
+        router,
+        kind: SwapKind::V3 {
+            fee_tier: parsed.first_fee_tier,
+            encoded_path: encode_v3_path(
+                parsed.edge_token_out,
+                parsed.first_fee_tier,
+                parsed.token_in,
+            ),
+            hops: parsed.hops,
+        },
+    })
+}
+
+fn decode_zero_ex_sell_to_uniswap(
+    selector: [u8; 4],
+    router: Address,
+    args: &[u8],
+) -> Option<SwapSignal> {
+    let decoded = abi::decode(
+        &[
+            ParamType::Array(Box::new(ParamType::Address)),
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Bool,
+        ],
+        args,
+    )
+    .ok()?;
+    let path = decoded.first().and_then(token_as_address_vec)?;
+    let amount_in = decoded.get(1).and_then(token_as_uint)?;
+    let amount_out_min = decoded.get(2).and_then(token_as_uint);
+    Some(SwapSignal {
+        selector,
+        amount_in,
+        amount_out_min,
+        notional_wei: U256::zero(),
+        path,
+        router,
+        kind: SwapKind::V2,
+    })
 }
 
 fn estimate_notional_wei(

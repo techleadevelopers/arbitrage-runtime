@@ -823,7 +823,7 @@ fn select_scavenger_v2_candidate(candidates: &[SizeCandidate]) -> Option<SizeCan
                 && !candidate.gross_profit_wei.is_zero()
                 && candidate.self_slippage_bps <= 2_500
         })
-        .min_by_key(|candidate| candidate.amount_in)
+        .max_by_key(|candidate| candidate.gross_profit_wei)
 }
 
 fn fee_extraction_v2_size_candidates(
@@ -954,7 +954,7 @@ fn select_scavenger_v3_candidate(candidates: &[V3SizeCandidate]) -> Option<V3Siz
                 && !candidate.gross_profit_wei.is_zero()
                 && candidate.self_slippage_bps <= 2_500
         })
-        .min_by_key(|candidate| candidate.amount_in)
+        .max_by_key(|candidate| candidate.gross_profit_wei)
 }
 
 fn effective_payload_min_profit_wei(config: &Config) -> Result<U256, String> {
