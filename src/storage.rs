@@ -199,6 +199,42 @@ impl Storage {
         }
     }
 
+    pub fn database_table_counts(
+        &self,
+    ) -> Result<Vec<(String, u64)>, Box<dyn std::error::Error>> {
+        const TABLES: [&str; 7] = [
+            "events",
+            "telemetry",
+            "sweeps",
+            "wallet_residual_stats",
+            "relay_metrics",
+            "treasury_rebalance",
+            "execution_outcomes",
+        ];
+
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                let conn = conn.lock().map_err(|_| "storage lock poisoned")?;
+                let mut counts = Vec::with_capacity(TABLES.len());
+                for table in TABLES {
+                    let sql = format!("SELECT COUNT(*) FROM {table}");
+                    let rows: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
+                    counts.push((table.to_string(), rows.max(0) as u64));
+                }
+                Ok(counts)
+            }
+            StorageBackend::Postgres(pool) => {
+                let mut counts = Vec::with_capacity(TABLES.len());
+                for table in TABLES {
+                    let sql = format!("SELECT COUNT(*)::bigint AS rows FROM {table}");
+                    let row = Self::wait(sqlx::query(&sql).fetch_one(pool))?;
+                    counts.push((table.to_string(), row.get::<i64, _>("rows").max(0) as u64));
+                }
+                Ok(counts)
+            }
+        }
+    }
+
     async fn migrate_postgres(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> {
         let statements = [
             r#"

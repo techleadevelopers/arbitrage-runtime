@@ -1647,11 +1647,21 @@ struct DatabaseArtifact {
 }
 
 #[derive(Debug, Serialize)]
+struct DatabaseTableCount {
+    table: String,
+    rows: u64,
+}
+
+#[derive(Debug, Serialize)]
 struct DatabaseStatusResponse {
     ok: bool,
     storage_backend: String,
     database_url_configured: bool,
     downloadable: Vec<String>,
+    table_counts: Vec<DatabaseTableCount>,
+    recent_execution_outcomes: Vec<ExecutionOutcomeSnapshot>,
+    recent_treasury: Vec<TreasurySnapshot>,
+    toxicity_profiles: Vec<ToxicitySnapshot>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1662,6 +1672,20 @@ struct DatabaseExportResponse {
 }
 
 async fn database_status(State(dashboard): State<DashboardHandle>) -> Json<DatabaseStatusResponse> {
+    let table_counts = dashboard
+        .storage
+        .database_table_counts()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(table, rows)| DatabaseTableCount { table, rows })
+        .collect();
+    let recent_execution_outcomes = dashboard.storage.execution_outcomes(12).unwrap_or_default();
+    let recent_treasury = dashboard
+        .storage
+        .treasury_rebalance_trail(12)
+        .unwrap_or_default();
+    let toxicity_profiles = dashboard.storage.toxicity_profiles(12).unwrap_or_default();
+
     Json(DatabaseStatusResponse {
         ok: true,
         storage_backend: dashboard.storage.backend_label().to_string(),
@@ -1673,6 +1697,10 @@ async fn database_status(State(dashboard): State<DashboardHandle>) -> Json<Datab
             "toxicity_profiles.csv".to_string(),
             "realized_vs_expected.json".to_string(),
         ],
+        table_counts,
+        recent_execution_outcomes,
+        recent_treasury,
+        toxicity_profiles,
     })
 }
 
