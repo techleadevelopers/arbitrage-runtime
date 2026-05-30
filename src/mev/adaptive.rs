@@ -1921,10 +1921,14 @@ fn normalize_vector(vector: &mut ndarray::Array1<f64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, MevConfig, MonitoredTokenConfig, RpcPreference};
+    use crate::config::{
+        Config, MevConfig, MonitoredTokenConfig, OpportunityMode, OpportunityThresholds,
+        RpcPreference,
+    };
     use ethers::types::Address;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
+    use std::sync::{Arc, RwLock};
 
     fn test_config(network: &str) -> Config {
         Config {
@@ -1937,7 +1941,7 @@ mod tests {
             },
             allow_send: true,
             tenderly_rpc_only: false,
-            alchemy_keys: vec!["test".to_string()],
+            alchemy_keys: vec![("default".to_string(), "test".to_string())],
             infura_ids: Vec::new(),
             flashbots_relay: "https://relay.flashbots.net".to_string(),
             builder_relays: vec![
@@ -1966,6 +1970,13 @@ mod tests {
             mempool_ws_urls: Vec::new(),
             mev: MevConfig {
                 enabled: true,
+                opportunity_mode: Arc::new(RwLock::new(OpportunityMode::Conservative)),
+                runtime_thresholds: Arc::new(RwLock::new(OpportunityThresholds {
+                    min_large_swap_eth: 5.0,
+                    min_net_profit_eth: 0.001,
+                    min_profit_usd: 2.0,
+                    min_liquidity_eth: 10.0,
+                })),
                 capital_eth: 0.5,
                 capital_window_secs: 90,
                 max_window_exposure_eth: 1.0,
@@ -1996,6 +2007,7 @@ mod tests {
                 gas_overpay_revert_extra_bps: 1_200,
                 gas_overpay_submit_failure_extra_bps: 1_500,
                 gas_overpay_max_extra_bps: 5_000,
+                finality_confirmations: 0,
                 stop_loss_consecutive_losses: 3,
                 stop_loss_freeze_secs: 300,
                 context_stop_loss_consecutive_losses: 2,

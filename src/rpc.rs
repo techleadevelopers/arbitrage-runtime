@@ -746,9 +746,13 @@ fn decay_failure_counters(state: &mut RpcEndpointState, now: Instant) {
     }
     state.last_failure_decay_at += Duration::from_secs(FAILURE_DECAY_SECS * steps as u64);
     state.failures = state.failures.saturating_sub(steps.saturating_mul(2));
-    state.timeout_failures = state.timeout_failures.saturating_sub(steps.saturating_mul(2));
+    state.timeout_failures = state
+        .timeout_failures
+        .saturating_sub(steps.saturating_mul(2));
     state.stale_failures = state.stale_failures.saturating_sub(steps.saturating_mul(2));
-    state.rate_limit_failures = state.rate_limit_failures.saturating_sub(steps.saturating_mul(4));
+    state.rate_limit_failures = state
+        .rate_limit_failures
+        .saturating_sub(steps.saturating_mul(4));
 }
 
 fn burst_load_units(state: &RpcEndpointState, now: Instant) -> u32 {

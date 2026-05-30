@@ -86,6 +86,7 @@ pub struct MevConfig {
     pub gas_overpay_revert_extra_bps: u64,
     pub gas_overpay_submit_failure_extra_bps: u64,
     pub gas_overpay_max_extra_bps: u64,
+    pub finality_confirmations: u64,
     pub stop_loss_consecutive_losses: u32,
     pub stop_loss_freeze_secs: u64,
     pub context_stop_loss_consecutive_losses: u32,
@@ -397,6 +398,9 @@ impl Config {
             .parse::<u64>()?,
             gas_overpay_max_extra_bps: env::var("MEV_GAS_OVERPAY_MAX_EXTRA_BPS")
                 .unwrap_or_else(|_| "5000".to_string())
+                .parse::<u64>()?,
+            finality_confirmations: env::var("MEV_FINALITY_CONFIRMATIONS")
+                .unwrap_or_else(|_| default_finality_confirmations(&network).to_string())
                 .parse::<u64>()?,
             stop_loss_consecutive_losses: env::var("MEV_STOP_LOSS_CONSECUTIVE_LOSSES")
                 .unwrap_or_else(|_| "3".to_string())
@@ -961,6 +965,13 @@ fn alchemy_ws_url_for_network(network: &str, key: &str) -> Option<String> {
     }
 }
 
+fn default_finality_confirmations(network: &str) -> u64 {
+    match network {
+        "polygon" | "bsc" | "bnb" => 1,
+        _ => 0,
+    }
+}
+
 fn supports_default_alchemy_mempool_ws(network: &str) -> bool {
     matches!(network, "ethereum" | "arbitrum" | "polygon")
 }
@@ -1041,16 +1052,20 @@ fn rpc_provider_filter(network: &str) -> Option<Vec<String>> {
 
 fn rpc_name_matches_filter(name: &str, providers: &[String]) -> bool {
     let lower = name.to_ascii_lowercase();
-    providers.iter().any(|provider| {
-        lower == *provider || lower.starts_with(&format!("{provider}-"))
-    })
+    providers
+        .iter()
+        .any(|provider| lower == *provider || lower.starts_with(&format!("{provider}-")))
 }
 
 fn rpc_name_allowed_for_network(network: &str, name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     match network {
         "bsc" | "bnb" => lower.starts_with("getblock-"),
-        "polygon" => lower.starts_with("alchemy-") || lower.starts_with("getblock-") || lower.starts_with("rpc-"),
+        "polygon" => {
+            lower.starts_with("alchemy-")
+                || lower.starts_with("getblock-")
+                || lower.starts_with("rpc-")
+        }
         _ => true,
     }
 }

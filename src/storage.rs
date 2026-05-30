@@ -9,8 +9,8 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 use std::env;
-use std::future::Future;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -44,6 +44,13 @@ impl Storage {
         }
 
         let conn = Connection::open(path)?;
+        conn.execute_batch(
+            r#"
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA busy_timeout = 5000;
+            "#,
+        )?;
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS events (
@@ -349,8 +356,8 @@ impl Storage {
         match &self.backend {
             StorageBackend::Sqlite(conn) => {
                 let conn = conn.lock().map_err(|_| "storage lock poisoned")?;
-                let mut stmt =
-                    conn.prepare("SELECT at, level, message FROM events ORDER BY id DESC LIMIT ?1")?;
+                let mut stmt = conn
+                    .prepare("SELECT at, level, message FROM events ORDER BY id DESC LIMIT ?1")?;
                 let rows = stmt.query_map([limit as i64], |row| {
                     Ok(DashboardEvent {
                         at: row.get(0)?,
@@ -489,10 +496,10 @@ impl Storage {
                 )?;
                 for row in rows {
                     summary.insert(
-                            row.get::<String, _>("stage"),
-                            (
-                                row.get::<i64, _>("samples") as u64,
-                                0,
+                        row.get::<String, _>("stage"),
+                        (
+                            row.get::<i64, _>("samples") as u64,
+                            0,
                             row.try_get::<Option<f64>, _>("avg_ms")?.unwrap_or(0.0) as u128,
                             row.get::<i64, _>("max_ms") as u128,
                         ),
@@ -1305,14 +1312,8 @@ impl Storage {
                 for row in rows {
                     let profile = HistoricalOutcomeProfile {
                         hour_utc: row.get::<i32, _>("hour_utc") as u8,
-                        pair: row
-                            .get::<String, _>("pair")
-                            .parse()
-                            .unwrap_or_default(),
-                        router: row
-                            .get::<String, _>("router")
-                            .parse()
-                            .unwrap_or_default(),
+                        pair: row.get::<String, _>("pair").parse().unwrap_or_default(),
+                        router: row.get::<String, _>("router").parse().unwrap_or_default(),
                         samples: row.get::<i64, _>("samples") as u64,
                         success_rate: row.get("success_rate"),
                         accepted_not_included_rate: row.get("miss_rate"),

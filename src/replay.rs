@@ -535,8 +535,7 @@ async fn run_replay_cases(
             &config.monitored_tokens,
             min_large_swap_wei,
             config.mev.opportunity_mode(),
-        )
-        else {
+        ) else {
             report.bump("decode_reject");
             latency_trace.total_internal_us = Some(elapsed_us(case_started));
             report.observe_latency(&latency_trace);

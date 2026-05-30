@@ -318,7 +318,12 @@ impl ScavengerObserver {
         let healthy_rpc = state
             .rpc_endpoints
             .iter()
-            .filter(|endpoint| !endpoint.disabled && endpoint.cooldown_remaining_secs == 0 && endpoint.rate_limit_failures == 0 && endpoint.failures == 0)
+            .filter(|endpoint| {
+                !endpoint.disabled
+                    && endpoint.cooldown_remaining_secs == 0
+                    && endpoint.rate_limit_failures == 0
+                    && endpoint.failures == 0
+            })
             .count() as u64;
         let active_rpc = state
             .rpc_endpoints
@@ -333,7 +338,10 @@ impl ScavengerObserver {
         let penalized_rpc = state
             .rpc_endpoints
             .iter()
-            .filter(|endpoint| !endpoint.disabled && (endpoint.cooldown_remaining_secs > 0 || endpoint.rate_limit_failures > 0))
+            .filter(|endpoint| {
+                !endpoint.disabled
+                    && (endpoint.cooldown_remaining_secs > 0 || endpoint.rate_limit_failures > 0)
+            })
             .count() as u64;
         let max_block_age_secs = state
             .rpc_endpoints
@@ -361,11 +369,7 @@ impl ScavengerObserver {
             .unwrap_or(false)
             && self.samples.len() >= 2
         {
-            self.last_completed = Some(build_scavenger_report(
-                &self.samples,
-                "completed",
-                None,
-            ));
+            self.last_completed = Some(build_scavenger_report(&self.samples, "completed", None));
             self.samples.clear();
             self.current_started_at = Some(now);
             self.samples.push_back(sample);
@@ -376,9 +380,7 @@ impl ScavengerObserver {
         build_scavenger_report(
             &self.samples,
             "current",
-            self.last_completed
-                .clone()
-                .map(Box::new),
+            self.last_completed.clone().map(Box::new),
         )
     }
 }
@@ -423,12 +425,24 @@ fn build_scavenger_report(
         .max()
         .unwrap_or_default();
 
-    let pending_delta = delta(last.funnel.pending_hashes_received, first.funnel.pending_hashes_received);
-    let lookup_ok_delta = delta(last.funnel.tx_lookup_success, first.funnel.tx_lookup_success);
+    let pending_delta = delta(
+        last.funnel.pending_hashes_received,
+        first.funnel.pending_hashes_received,
+    );
+    let lookup_ok_delta = delta(
+        last.funnel.tx_lookup_success,
+        first.funnel.tx_lookup_success,
+    );
     let lookup_miss_delta = delta(last.funnel.tx_lookup_miss, first.funnel.tx_lookup_miss);
-    let lookup_shed_delta = delta(last.funnel.tx_lookup_throttled, first.funnel.tx_lookup_throttled);
+    let lookup_shed_delta = delta(
+        last.funnel.tx_lookup_throttled,
+        first.funnel.tx_lookup_throttled,
+    );
     let decode_pass_delta = delta(last.funnel.decode_pass, first.funnel.decode_pass);
-    let block_fail_delta = delta(last.funnel.block_lookup_fail, first.funnel.block_lookup_fail);
+    let block_fail_delta = delta(
+        last.funnel.block_lookup_fail,
+        first.funnel.block_lookup_fail,
+    );
     let payload_reject_delta = delta(last.funnel.payload_reject, first.funnel.payload_reject);
     let edge_samples_delta = delta(last.edge_sample_count, first.edge_sample_count);
 
@@ -436,13 +450,19 @@ fn build_scavenger_report(
     let lookup_hit_rate_pct = pct(lookup_ok_delta, lookup_attempts);
     let shed_rate_pct = pct(lookup_shed_delta, pending_delta);
     let decode_pass_rate_pct = pct(decode_pass_delta, lookup_ok_delta);
-    let block_total = delta(last.funnel.block_lookup_success, first.funnel.block_lookup_success)
-        .saturating_add(block_fail_delta);
+    let block_total = delta(
+        last.funnel.block_lookup_success,
+        first.funnel.block_lookup_success,
+    )
+    .saturating_add(block_fail_delta);
     let block_fail_rate_pct = pct(block_fail_delta, block_total);
 
     let mut notes = Vec::new();
     if observed_secs < 15 * 60 {
-        notes.push(format!("warming up current cycle: {}s observed, target 900s", observed_secs));
+        notes.push(format!(
+            "warming up current cycle: {}s observed, target 900s",
+            observed_secs
+        ));
     }
     if last.healthy_rpc == 0 {
         notes.push("no healthy rpc at last sample".to_string());
@@ -454,7 +474,10 @@ fn build_scavenger_report(
         notes.push(format!("{} rpc in cooldown/rate-limit", last.penalized_rpc));
     }
     if block_fail_rate_pct > 5.0 {
-        notes.push(format!("block lookup fail rate high: {:.1}%", block_fail_rate_pct));
+        notes.push(format!(
+            "block lookup fail rate high: {:.1}%",
+            block_fail_rate_pct
+        ));
     }
     if shed_rate_pct < 25.0 && pending_delta > 1_000 {
         notes.push("shed rate low for high pending flow; rpc may be over-reading".to_string());
@@ -488,10 +511,15 @@ fn build_scavenger_report(
     .to_string();
 
     let recommendation = match status.as_str() {
-        "READY" => "current cycle stable for contract deploy test; keep low capital and fanout=1".to_string(),
-        "WATCH" => "current cycle improved; continue one more clean 15m cycle before live execution".to_string(),
+        "READY" => "current cycle stable for contract deploy test; keep low capital and fanout=1"
+            .to_string(),
+        "WATCH" => {
+            "current cycle improved; continue one more clean 15m cycle before live execution"
+                .to_string()
+        }
         "WARMING" => "new clean 15m cycle running; wait for this cycle to close".to_string(),
-        _ => "do not deploy live execution yet; reduce lookup budget or disable degraded rpc".to_string(),
+        _ => "do not deploy live execution yet; reduce lookup budget or disable degraded rpc"
+            .to_string(),
     };
 
     ScavengerObserverReport {
@@ -741,10 +769,22 @@ impl DashboardHandle {
                 vault_address: format!("{:?}", config.vault_address),
                 executor_address: format!("{:?}", config.executor_address),
                 profit_address: format!("{:?}", config.profit_address),
-                min_candidate_eth: config.mev.runtime_thresholds().min_large_swap_eth.to_string(),
-                min_net_profit_eth: config.mev.runtime_thresholds().min_net_profit_eth.to_string(),
+                min_candidate_eth: config
+                    .mev
+                    .runtime_thresholds()
+                    .min_large_swap_eth
+                    .to_string(),
+                min_net_profit_eth: config
+                    .mev
+                    .runtime_thresholds()
+                    .min_net_profit_eth
+                    .to_string(),
                 min_profit_usd: config.mev.runtime_thresholds().min_profit_usd.to_string(),
-                min_liquidity_eth: config.mev.runtime_thresholds().min_liquidity_eth.to_string(),
+                min_liquidity_eth: config
+                    .mev
+                    .runtime_thresholds()
+                    .min_liquidity_eth
+                    .to_string(),
                 executor_min_buffer_eth: format!("{:.4}", config.mev.executor_min_buffer_eth),
                 executor_target_buffer_eth: format!("{:.4}", config.mev.executor_target_buffer_eth),
                 executor_max_buffer_eth: format!("{:.4}", config.mev.executor_max_buffer_eth),
@@ -852,7 +892,9 @@ impl DashboardHandle {
             state.min_liquidity_eth = thresholds.min_liquidity_eth.to_string();
         }
         state.latency_risk = build_latency_risk(
-            self.storage.telemetry_window_summary(300).unwrap_or_default(),
+            self.storage
+                .telemetry_window_summary(300)
+                .unwrap_or_default(),
             &state.rpc_endpoints,
         );
         state.scavenger_observer = self.observe_scavenger_window(&state);
@@ -973,7 +1015,8 @@ impl DashboardHandle {
                 funnel.adaptive_preflight_pass = funnel.adaptive_preflight_pass.saturating_add(1)
             }
             "adaptive_preflight_reject" => {
-                funnel.adaptive_preflight_reject = funnel.adaptive_preflight_reject.saturating_add(1)
+                funnel.adaptive_preflight_reject =
+                    funnel.adaptive_preflight_reject.saturating_add(1)
             }
             "payload_built" => funnel.payload_built = funnel.payload_built.saturating_add(1),
             "payload_reject" => funnel.payload_reject = funnel.payload_reject.saturating_add(1),
@@ -1312,7 +1355,10 @@ pub async fn run_server(
         .route("/api/runtime/pause", post(set_runtime_paused))
         .route("/api/events/clear", post(clear_events))
         .route("/api/opportunity-mode/:mode", post(set_opportunity_mode))
-        .route("/api/opportunity-thresholds", post(set_opportunity_thresholds))
+        .route(
+            "/api/opportunity-thresholds",
+            post(set_opportunity_thresholds),
+        )
         .with_state(dashboard)
         .layer(CorsLayer::permissive());
 
@@ -1376,13 +1422,16 @@ async fn set_rpc_enabled(
     Path(endpoint_id): Path<usize>,
     Json(payload): Json<RpcToggleRequest>,
 ) -> impl IntoResponse {
-    match dashboard.rpc_fleet.set_endpoint_enabled(
-        endpoint_id,
-        payload.enabled,
-        payload.reason,
-    ) {
+    match dashboard
+        .rpc_fleet
+        .set_endpoint_enabled(endpoint_id, payload.enabled, payload.reason)
+    {
         Ok(()) => {
-            let status = if payload.enabled { "enabled" } else { "disabled" };
+            let status = if payload.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
             dashboard.event(
                 "warn",
                 format!("rpc endpoint {endpoint_id} {status} from dashboard"),

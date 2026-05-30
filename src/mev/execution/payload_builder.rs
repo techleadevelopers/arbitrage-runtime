@@ -276,7 +276,10 @@ impl PayloadBuilder {
             status: "payload_built".to_string(),
             reason: "selected positive gross edge".to_string(),
             route_kind: "v2".to_string(),
-            path: swap_path.iter().map(|address| format!("{address:?}")).collect(),
+            path: swap_path
+                .iter()
+                .map(|address| format!("{address:?}"))
+                .collect(),
             hops: swap_path.len().saturating_sub(1) as u64,
             impacted_pools: route_pools
                 .iter()
@@ -390,7 +393,10 @@ impl PayloadBuilder {
                 status: "blocked".to_string(),
                 reason: "v3 repayment model not unit-safe yet".to_string(),
                 route_kind: "v3".to_string(),
-                path: vec![format!("{:?}", input.token_out), format!("{:?}", input.token_in)],
+                path: vec![
+                    format!("{:?}", input.token_out),
+                    format!("{:?}", input.token_in),
+                ],
                 hops: 1,
                 impacted_pools: vec![format!("{:?}", input.pair)],
                 slippage_window_score: 0.0,
@@ -547,7 +553,10 @@ impl PayloadBuilder {
             status: "payload_built".to_string(),
             reason: "selected positive v3 gross edge".to_string(),
             route_kind: "v3".to_string(),
-            path: vec![format!("{:?}", input.token_out), format!("{:?}", input.token_in)],
+            path: vec![
+                format!("{:?}", input.token_out),
+                format!("{:?}", input.token_in),
+            ],
             hops: 1,
             impacted_pools: vec![format!("{:?}", input.pair)],
             slippage_window_score: 0.0,
@@ -715,7 +724,10 @@ fn best_v2_edge_metadata(
             status: status.to_string(),
             reason: reason.to_string(),
             route_kind: "v2".to_string(),
-            path: route_path.iter().map(|address| format!("{address:?}")).collect(),
+            path: route_path
+                .iter()
+                .map(|address| format!("{address:?}"))
+                .collect(),
             hops: route_path.len().saturating_sub(1) as u64,
             impacted_pools: route_pools
                 .iter()
@@ -775,14 +787,19 @@ fn best_v3_edge_metadata(
     status: &str,
     reason: &str,
 ) -> Option<EdgeMetadata> {
-    let candidate = candidates.iter().max_by_key(|candidate| candidate.gross_profit_wei)?;
+    let candidate = candidates
+        .iter()
+        .max_by_key(|candidate| candidate.gross_profit_wei)?;
     Some(EdgeMetadata {
         victim_tx: String::new(),
         selector: String::new(),
         status: status.to_string(),
         reason: reason.to_string(),
         route_kind: "v3".to_string(),
-        path: vec![format!("{:?}", input.token_out), format!("{:?}", input.token_in)],
+        path: vec![
+            format!("{:?}", input.token_out),
+            format!("{:?}", input.token_in),
+        ],
         hops: 1,
         impacted_pools: vec![format!("{:?}", input.pair)],
         slippage_window_score: 0.0,

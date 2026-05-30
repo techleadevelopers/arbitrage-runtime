@@ -8,10 +8,10 @@ use crate::mev::adaptive::{
 use crate::mev::amm::uniswap_v2::{amount_out_exact_in, V2PoolState};
 use crate::mev::amm::uniswap_v3::V3PoolState;
 use crate::mev::cache::pool_cache::PoolCache;
-use crate::mev::execution::payload_builder::{EdgeMetadata, ExecutionPayload};
 use crate::mev::execution::payload_builder::{
     AmmRouteKind, FeeExtractionBuildInput, PayloadBuilder,
 };
+use crate::mev::execution::payload_builder::{EdgeMetadata, ExecutionPayload};
 use crate::mev::execution::ExecutionEngine;
 use crate::mev::opportunity::{roi_bps, wei_to_eth_f64, MevOpportunity};
 use crate::mev::simulation::state_simulator::{
@@ -149,11 +149,13 @@ impl MicroBatcher {
                 .max_by(|(_, left), (_, right)| {
                     left.ranking_score().total_cmp(&right.ranking_score())
                 })?;
-        let dropped = self.candidates.len().saturating_sub(1);
         let best = self.candidates.swap_remove(best_index);
-        self.candidates.clear();
-        self.opened_at = None;
-        Some((best, dropped))
+        if self.candidates.is_empty() {
+            self.opened_at = None;
+        } else {
+            self.opened_at = Some(Instant::now());
+        }
+        Some((best, self.candidates.len()))
     }
 }
 
@@ -247,6 +249,7 @@ impl CandidateLatencyTrace {
 struct PendingHashTask {
     tx_hash: H256,
     candidate_started: Instant,
+    enqueued_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -300,8 +303,7 @@ impl PendingLookupBackpressure {
             self.window_started = now;
             self.accepted_in_window = 0;
         }
-        if now.saturating_duration_since(self.pressure_refreshed_at) >= Duration::from_millis(900)
-        {
+        if now.saturating_duration_since(self.pressure_refreshed_at) >= Duration::from_millis(900) {
             self.pressure = rpc_lookup_pressure(rpc_fleet);
             self.pressure_refreshed_at = now;
         }
@@ -319,7 +321,11 @@ impl PendingLookupBackpressure {
         if now.saturating_duration_since(self.last_event_at) >= Duration::from_secs(5) {
             dashboard.record_reject_reason(
                 "pending_lookup",
-                if queue_soft_full { "queue_backpressure" } else { "rpc_budget" },
+                if queue_soft_full {
+                    "queue_backpressure"
+                } else {
+                    "rpc_budget"
+                },
             );
             dashboard.event(
                 "warn",
@@ -404,7 +410,10 @@ pub async fn run(
         return Err("fee extraction runtime requires MEMPOOL websocket URL".into());
     }
     if !config.allow_send {
-        return Err("fee extraction runtime requires ALLOW_SEND=true".into());
+        dashboard.event(
+            "warn",
+            "fee extraction runtime is in observation mode: ALLOW_SEND=false disables submit",
+        );
     }
 
     let pool_cache = Arc::new(PoolCache::new(config.mev.pool_state_cache_ttl_ms));
@@ -423,9 +432,10 @@ pub async fn run(
     );
     let lookup_decode_workers = worker_count(LOOKUP_DECODE_WORKERS_MAX);
     let eval_workers = worker_count(EVAL_WORKERS_MAX);
-    let (lookup_decode_tx, lookup_decode_rx) = mpsc::channel(LOOKUP_DECODE_QUEUE_CAPACITY);
-    let (eval_tx, eval_rx) = mpsc::channel(EVAL_QUEUE_CAPACITY);
-    let (ready_tx, mut ready_rx) = mpsc::channel(EVAL_QUEUE_CAPACITY);
+    let (lookup_decode_tx, lookup_decode_rx) =
+        mpsc::channel::<PendingHashTask>(LOOKUP_DECODE_QUEUE_CAPACITY);
+    let (eval_tx, eval_rx) = mpsc::channel::<LookupDecodedCandidate>(EVAL_QUEUE_CAPACITY);
+    let (ready_tx, mut ready_rx) = mpsc::channel::<PendingExecutionCandidate>(EVAL_QUEUE_CAPACITY);
     let lookup_decode_rx = Arc::new(Mutex::new(lookup_decode_rx));
     let eval_rx = Arc::new(Mutex::new(eval_rx));
     let mut last_profile_refresh = Instant::now();
@@ -459,6 +469,12 @@ pub async fn run(
                 if dashboard.runtime_paused() {
                     continue;
                 }
+                dashboard.record_latency(
+                    "queue_wait",
+                    elapsed_ms_ceil(task.enqueued_at),
+                    None,
+                    Some("lookup_decode"),
+                );
                 if let Some(decoded) = process_lookup_decode_task(
                     task,
                     config.clone(),
@@ -524,6 +540,7 @@ pub async fn run(
     loop {
         tokio::select! {
             Some(tx_hash) = tx_hash_stream.recv() => {
+                let scan_started = Instant::now();
                 if dashboard.runtime_paused() {
                     continue;
                 }
@@ -539,15 +556,39 @@ pub async fn run(
                         lookup_decode_tx.capacity(),
                         &dashboard,
                     ) {
+                        dashboard.record_latency(
+                            "scan_cycle",
+                            elapsed_ms_ceil(scan_started),
+                            None,
+                            Some("mempool_hash_shed"),
+                        );
                         continue;
                     }
-                    let _ = lookup_decode_tx
+                    let enqueue_started = Instant::now();
+                    let task_started = Instant::now();
+                    let send_result = lookup_decode_tx
                         .send(PendingHashTask {
                             tx_hash,
-                            candidate_started: Instant::now(),
+                            candidate_started: task_started,
+                            enqueued_at: Instant::now(),
                         })
                         .await;
+                    dashboard.record_latency(
+                        "enqueue_latency",
+                        elapsed_ms_ceil(enqueue_started),
+                        None,
+                        Some("lookup_decode"),
+                    );
+                    if send_result.is_err() {
+                        break;
+                    }
                 }
+                dashboard.record_latency(
+                    "scan_cycle",
+                    elapsed_ms_ceil(scan_started),
+                    None,
+                    Some("mempool_hash"),
+                );
             }
             Some(candidate) = ready_rx.recv() => {
                 batcher.push(candidate);
@@ -811,10 +852,22 @@ async fn process_lookup_decode_task(
                     name
                 ),
             );
-            latency_trace.emit(&config, &dashboard, task.tx_hash, "reject", "aggregator_decode_missing");
+            latency_trace.emit(
+                &config,
+                &dashboard,
+                task.tx_hash,
+                "reject",
+                "aggregator_decode_missing",
+            );
         } else {
             dashboard.record_reject_reason("decode", "not_relevant_or_below_min");
-            latency_trace.emit(&config, &dashboard, task.tx_hash, "reject", "decode_no_signal");
+            latency_trace.emit(
+                &config,
+                &dashboard,
+                task.tx_hash,
+                "reject",
+                "decode_no_signal",
+            );
         }
         return None;
     };
@@ -839,16 +892,35 @@ async fn process_lookup_decode_task(
         dashboard.record_opportunity_funnel("decode_reject");
         dashboard.record_reject_reason("decode", "zero_gas_price");
         latency_trace.total_internal_us = Some(elapsed_us(task.candidate_started));
-        latency_trace.emit(&config, &dashboard, task.tx_hash, "reject", "zero_gas_price");
+        latency_trace.emit(
+            &config,
+            &dashboard,
+            task.tx_hash,
+            "reject",
+            "zero_gas_price",
+        );
         return None;
     }
 
+    let block_fetch_started = Instant::now();
     let Some(block_number) = get_current_block_parallel(rpc_fleet.clone()).await else {
+        dashboard.record_latency(
+            "block_fetch",
+            elapsed_ms_ceil(block_fetch_started),
+            None,
+            Some("lookup_decode_fail"),
+        );
         dashboard.record_opportunity_funnel("block_lookup_fail");
         latency_trace.total_internal_us = Some(elapsed_us(task.candidate_started));
         latency_trace.emit(&config, &dashboard, task.tx_hash, "reject", "block_lookup");
         return None;
     };
+    dashboard.record_latency(
+        "block_fetch",
+        elapsed_ms_ceil(block_fetch_started),
+        None,
+        Some("lookup_decode"),
+    );
     dashboard.record_opportunity_funnel("block_lookup_success");
 
     let cluster = ClusterKey {
@@ -929,7 +1001,11 @@ fn effective_pending_lookup_budget(config: &Config, pressure: RpcLookupPressure)
         1.0
     };
 
-    let floor = if pressure.available_readers == 0 { 4.0 } else { 10.0 };
+    let floor = if pressure.available_readers == 0 {
+        4.0
+    } else {
+        10.0
+    };
     ((base as f64) * pressure_multiplier).round().max(floor) as u64
 }
 
@@ -948,7 +1024,8 @@ async fn get_current_block_parallel(rpc_fleet: Arc<RpcFleet>) -> Option<u64> {
                     Some(block)
                 }
                 Err(err) => {
-                    rpc_fleet.record_failure(handle.id, RpcFleet::classify_failure(&err.to_string()));
+                    rpc_fleet
+                        .record_failure(handle.id, RpcFleet::classify_failure(&err.to_string()));
                     None
                 }
             }
@@ -1051,10 +1128,9 @@ async fn process_evaluation_task(
     pool_cache: Arc<PoolCache>, // NOVO PARÂMETRO
 ) -> Option<PendingExecutionCandidate> {
     let tx_hash = candidate.tx.hash;
-    let min_large_swap_wei = ethers::utils::parse_ether(
-        config.mev.effective_min_large_swap_eth().to_string(),
-    )
-    .unwrap_or(min_large_swap_wei);
+    let min_large_swap_wei =
+        ethers::utils::parse_ether(config.mev.effective_min_large_swap_eth().to_string())
+            .unwrap_or(min_large_swap_wei);
     let min_profit_wei =
         ethers::utils::parse_ether(config.mev.effective_min_net_profit_eth().to_string())
             .unwrap_or(min_profit_wei);
@@ -1131,12 +1207,14 @@ async fn process_evaluation_task(
         } else {
             return None;
         };
-        candidate.latency_trace.adaptive_preflight_us = Some(elapsed_us(adaptive_preflight_started));
+        candidate.latency_trace.adaptive_preflight_us =
+            Some(elapsed_us(adaptive_preflight_started));
         dashboard.set_market_regime(preflight.regime.as_str());
 
         let preflight_override = should_override_preflight_reject(&config, &preflight);
         if !preflight.should_continue && !preflight_override {
-            candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+            candidate.latency_trace.total_internal_us =
+                Some(elapsed_us(candidate.candidate_started));
             dashboard.record_opportunity_funnel("adaptive_preflight_reject");
             if let Some(reason) = preflight.reject_reason {
                 dashboard.record_reject_reason("preflight", reason);
@@ -1212,9 +1290,11 @@ async fn process_evaluation_task(
         dashboard.record_opportunity_funnel("payload_reject");
         dashboard.record_reject_reason("payload_build", "scavenger_dust_edge_shadow_only");
     }
-    if let Some(mut sample) = payload.edge_metadata.clone().map(|sample| {
-        enrich_edge_explainer_sample(sample, tx_hash, &candidate.signal, &fast_gate)
-    }) {
+    if let Some(mut sample) = payload
+        .edge_metadata
+        .clone()
+        .map(|sample| enrich_edge_explainer_sample(sample, tx_hash, &candidate.signal, &fast_gate))
+    {
         if !economic_payload {
             sample.status = "shadow_candidate".to_string();
             sample.reason = "dust edge below economic floor".to_string();
@@ -1306,17 +1386,25 @@ async fn process_evaluation_task(
     if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
         if !economic_payload {
             candidate.latency_trace.ev_gate_us = Some(0);
-            candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+            candidate.latency_trace.total_internal_us =
+                Some(elapsed_us(candidate.candidate_started));
             dashboard.record_opportunity_funnel("ev_gate_reject");
-            candidate
-                .latency_trace
-                .emit(&config, &dashboard, tx_hash, "reject", "scavenger_dust_edge");
+            candidate.latency_trace.emit(
+                &config,
+                &dashboard,
+                tx_hash,
+                "reject",
+                "scavenger_dust_edge",
+            );
             return None;
         }
         let sanity_started = Instant::now();
-        if let Err(reason) = passes_scavenger_sanity_gate(&config, &payload, candidate.lookup_latency) {
+        if let Err(reason) =
+            passes_scavenger_sanity_gate(&config, &payload, candidate.lookup_latency)
+        {
             candidate.latency_trace.ev_gate_us = Some(elapsed_us(sanity_started));
-            candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+            candidate.latency_trace.total_internal_us =
+                Some(elapsed_us(candidate.candidate_started));
             dashboard.record_opportunity_funnel("ev_gate_reject");
             dashboard.record_reject_reason("scavenger_sanity", reason);
             candidate
@@ -1553,7 +1641,10 @@ fn should_override_preflight_reject(
     }
 }
 
-fn should_override_adaptive_reject(config: &Config, quote: &crate::mev::adaptive::AdaptiveQuote) -> bool {
+fn should_override_adaptive_reject(
+    config: &Config,
+    quote: &crate::mev::adaptive::AdaptiveQuote,
+) -> bool {
     match config.mev.opportunity_mode() {
         crate::config::OpportunityMode::Conservative => false,
         crate::config::OpportunityMode::Aggressive => {
@@ -1608,7 +1699,13 @@ fn passes_scavenger_sanity_gate(
         return Err("scavenger_price_impact_above_cap");
     }
     if lookup_latency.as_millis()
-        > u128::from(config.mev.effective_max_pending_age_ms().saturating_mul(3).max(1))
+        > u128::from(
+            config
+                .mev
+                .effective_max_pending_age_ms()
+                .saturating_mul(3)
+                .max(1),
+        )
     {
         return Err("scavenger_lookup_stale");
     }
@@ -1629,8 +1726,8 @@ fn scavenger_payload_has_economic_edge(
         .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(250)
         .clamp(1, 10_000);
-    let min_edge_wei = gas_cost_wei.saturating_mul(U256::from(min_gas_fraction_bps))
-        / U256::from(10_000u64);
+    let min_edge_wei =
+        gas_cost_wei.saturating_mul(U256::from(min_gas_fraction_bps)) / U256::from(10_000u64);
     let min_edge_usd = std::env::var("MEV_SCAVENGER_MIN_ECONOMIC_EDGE_USD")
         .ok()
         .and_then(|value| value.trim().parse::<f64>().ok())
@@ -1778,7 +1875,7 @@ async fn flush_candidate_batch(
         dashboard.event(
             "info",
             format!(
-                "microbatch selected best candidate and dropped {} lower-ranked candidates score={:.4} ev_real={:.2}usd p={:.2}",
+                "microbatch selected best candidate and kept {} lower-ranked candidates pending score={:.4} ev_real={:.2}usd p={:.2}",
                 dropped,
                 best.ranking_score(),
                 best.ev_real_usd,
@@ -2062,7 +2159,11 @@ fn enrich_edge_explainer_sample(
         signal.selector[0], signal.selector[1], signal.selector[2], signal.selector[3]
     );
     if sample.path.is_empty() {
-        sample.path = signal.path.iter().map(|address| format!("{address:?}")).collect();
+        sample.path = signal
+            .path
+            .iter()
+            .map(|address| format!("{address:?}"))
+            .collect();
     }
     if sample.hops == 0 {
         sample.hops = signal.path_len().saturating_sub(1) as u64;
@@ -2188,23 +2289,24 @@ pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
     };
 
     let capital_available_wei = contextual_capital_available_wei(config, context_signal)?;
-    let (v2_swap_path, v2_swap_pools) = if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
-        best_scavenger_v2_reverse_route(
-            provider.clone(),
-            config,
-            signal,
-            token_in,
-            token_out,
-            pair,
-            capital_available_wei,
-            pool_cache,
-            block_number,
-        )
-        .await
-        .unwrap_or_else(|| (vec![token_out, token_in], vec![pool]))
-    } else {
-        (vec![token_out, token_in], vec![pool])
-    };
+    let (v2_swap_path, v2_swap_pools) =
+        if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
+            best_scavenger_v2_reverse_route(
+                provider.clone(),
+                config,
+                signal,
+                token_in,
+                token_out,
+                pair,
+                capital_available_wei,
+                pool_cache,
+                block_number,
+            )
+            .await
+            .unwrap_or_else(|| (vec![token_out, token_in], vec![pool]))
+        } else {
+            (vec![token_out, token_in], vec![pool])
+        };
 
     PayloadBuilder::build_fee_extraction_v2(
         config,
@@ -2278,9 +2380,8 @@ async fn best_scavenger_v2_reverse_route<M: Middleware + 'static>(
     pool_cache: &PoolCache,
     block_number: u64,
 ) -> Option<(Vec<Address>, Vec<V2PoolState>)> {
-    let probe_amount = capital_available_wei
-        .saturating_mul(U256::from(25u64))
-        / U256::from(10_000u64);
+    let probe_amount =
+        capital_available_wei.saturating_mul(U256::from(25u64)) / U256::from(10_000u64);
     if probe_amount.is_zero() {
         return None;
     }
@@ -2704,9 +2805,7 @@ pub(crate) fn decode_relevant_swap(
         _ => return None,
     };
 
-    let notional_wei = estimate_notional_wei(&signal, monitored_tokens).or_else(|| {
-        (mode == OpportunityMode::Scavenger).then_some(min_large_swap_wei)
-    })?;
+    let notional_wei = estimate_notional_wei(&signal, monitored_tokens)?;
     if signal.path.len() < 2 {
         return None;
     }
@@ -2903,9 +3002,7 @@ fn selector(tx: &Transaction) -> Option<[u8; 4]> {
 
 fn aggregator_name_from_tx(tx: &Transaction) -> Option<&'static str> {
     match selector(tx)? {
-        UNIVERSAL_ROUTER_EXECUTE | UNIVERSAL_ROUTER_EXECUTE_NO_DEADLINE => {
-            Some("universal_router")
-        }
+        UNIVERSAL_ROUTER_EXECUTE | UNIVERSAL_ROUTER_EXECUTE_NO_DEADLINE => Some("universal_router"),
         ZERO_EX_TRANSFORM_ERC20 | ZERO_EX_SELL_TO_UNISWAP => Some("0x_matcha"),
         ONE_INCH_SWAP | ONE_INCH_UNOSWAP => Some("1inch"),
         PARASWAP_SIMPLE_SWAP => Some("paraswap"),
@@ -2971,7 +3068,10 @@ fn aggregator_intelligence_sample(
         self_slippage_bps: 0,
         pool: "unknown".to_string(),
         factory: "aggregator".to_string(),
-        router: tx.to.map(|address| format!("{address:?}")).unwrap_or_else(|| "unknown".to_string()),
+        router: tx
+            .to
+            .map(|address| format!("{address:?}"))
+            .unwrap_or_else(|| "unknown".to_string()),
         token_in: "unknown".to_string(),
         token_out: "unknown".to_string(),
     }
@@ -3020,7 +3120,10 @@ fn universal_router_intel(tx: &Transaction) -> Option<AggregatorRouteIntel> {
     )
     .or_else(|_| {
         abi::decode(
-            &[ParamType::Bytes, ParamType::Array(Box::new(ParamType::Bytes))],
+            &[
+                ParamType::Bytes,
+                ParamType::Array(Box::new(ParamType::Bytes)),
+            ],
             args,
         )
     })
@@ -3068,8 +3171,8 @@ fn universal_router_intel(tx: &Transaction) -> Option<AggregatorRouteIntel> {
     };
     let complexity_score = (command_count as f64 / 8.0).clamp(0.0, 1.0);
     let split_score = (split_ratio_bps as f64 / 10_000.0).clamp(0.0, 1.0);
-    let route_inefficiency_score = (0.35 + complexity_score * 0.35 + split_score * 0.30)
-        .clamp(0.0, 1.0);
+    let route_inefficiency_score =
+        (0.35 + complexity_score * 0.35 + split_score * 0.30).clamp(0.0, 1.0);
     let liquidity_distortion_score =
         (0.25 + split_score * 0.45 + (wraps as f64 * 0.04) + (permit2 as f64 * 0.03))
             .clamp(0.0, 1.0);
@@ -3218,7 +3321,11 @@ fn scavenger_slippage_window_hint(signal: &SwapSignal) -> f64 {
     }
 }
 
-fn scavenger_impact_imbalance_hint(notional_eth: f64, min_large_swap_eth: f64, path_len: usize) -> f64 {
+fn scavenger_impact_imbalance_hint(
+    notional_eth: f64,
+    min_large_swap_eth: f64,
+    path_len: usize,
+) -> f64 {
     let size_pressure = (notional_eth / min_large_swap_eth.max(0.000_001) / 3.0).clamp(0.0, 1.0);
     let simple_pool_bonus = if path_len <= 2 { 0.22 } else { 0.08 };
     (size_pressure * 0.78 + simple_pool_bonus).clamp(0.0, 1.0)
@@ -3305,6 +3412,10 @@ fn wei_to_gwei_f64(value: U256) -> f64 {
 
 fn elapsed_us(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn elapsed_ms_ceil(started: Instant) -> u128 {
+    started.elapsed().as_micros().div_ceil(1_000).max(1)
 }
 
 fn push_stage_pair(

@@ -13,6 +13,7 @@ use crate::mev::simulation::state_simulator::{
 use crate::rpc::{RpcFleet, RpcHandle};
 use ethers::contract::abigen;
 use ethers::prelude::*;
+use ethers::types::transaction::eip1559::Eip1559TransactionRequest;
 use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers_flashbots::{BundleRequest, FlashbotsMiddleware};
 use std::collections::HashMap;
@@ -47,6 +48,7 @@ struct SendContext {
     hot_balance: U256,
     chain_nonce: U256,
     gas_price: U256,
+    base_fee_per_gas: Option<U256>,
     block: U64,
 }
 
@@ -194,7 +196,14 @@ impl ExecutionEngine {
         opportunity: MevOpportunity,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if !self.config.allow_send {
-            return Err("fee extraction runtime requires ALLOW_SEND=true".into());
+            self.dashboard.event(
+                "warn",
+                format!(
+                    "execution skipped victim={:?}: ALLOW_SEND=false observation mode",
+                    opportunity.victim_tx
+                ),
+            );
+            return Ok(());
         }
 
         if opportunity.age_ms() > u128::from(self.config.mev.max_pending_age_ms.max(1)) {
@@ -456,9 +465,11 @@ impl ExecutionEngine {
         }
         payload.tx = sign_executor_transaction(
             &wallet,
+            &self.config,
             &payload,
             send_context.chain_nonce,
             gas_price_to_use,
+            send_context.base_fee_per_gas,
         )
         .await?;
         if !ranked_submit_paths.is_empty() {
@@ -566,6 +577,7 @@ impl ExecutionEngine {
                                 submit_latency_ms,
                             )
                             .await?;
+                        self.release_budget(opportunity.victim_tx);
                         self.record_result(
                             &realized,
                             Some(payload.pair),
@@ -613,6 +625,7 @@ impl ExecutionEngine {
             }
 
             if let Some(path) = ranked_submit_paths.first() {
+                self.release_budget(opportunity.victim_tx);
                 self.record_result(
                     &ExecutionResult {
                         realized_profit: 0.0,
@@ -722,6 +735,7 @@ impl ExecutionEngine {
                             submit_latency_ms,
                         )
                         .await?;
+                    self.release_budget(opportunity.victim_tx);
                     self.record_result(
                         &realized,
                         Some(payload.pair),
@@ -774,6 +788,7 @@ impl ExecutionEngine {
             }
         }
 
+        self.release_budget(opportunity.victim_tx);
         self.record_result(
             &ExecutionResult {
                 realized_profit: 0.0,
@@ -826,6 +841,12 @@ impl ExecutionEngine {
                 let Some(receipt) = receipt else {
                     continue;
                 };
+                if !self
+                    .receipt_has_required_confirmations(handle.provider.clone(), &receipt)
+                    .await
+                {
+                    continue;
+                }
                 self.rpc_fleet
                     .record_success(handle.id, receipt_started.elapsed(), None);
                 let gas_used = receipt.gas_used.unwrap_or_default().as_u64();
@@ -975,6 +996,33 @@ impl ExecutionEngine {
         })
     }
 
+    async fn receipt_has_required_confirmations(
+        &self,
+        provider: Arc<Provider<Http>>,
+        receipt: &TransactionReceipt,
+    ) -> bool {
+        let required = self.config.mev.finality_confirmations;
+        if required == 0 {
+            return true;
+        }
+        let Some(receipt_block) = receipt.block_number.map(|block| block.as_u64()) else {
+            return false;
+        };
+        match provider.get_block_number().await {
+            Ok(current) => current.as_u64() >= receipt_block.saturating_add(required),
+            Err(err) => {
+                self.dashboard.event(
+                    "warn",
+                    format!(
+                        "confirmation check failed tx={:?}: {}",
+                        receipt.transaction_hash, err
+                    ),
+                );
+                false
+            }
+        }
+    }
+
     async fn realized_profit_eth(
         &self,
         provider: Arc<Provider<Http>>,
@@ -1015,7 +1063,7 @@ impl ExecutionEngine {
             self.rpc_fleet.reserve_send_selection(endpoint.id);
             let started = std::time::Instant::now();
             let result = async {
-                let (hot_balance, chain_nonce, gas_price, block) = tokio::try_join!(
+                let (hot_balance, chain_nonce, gas_price, latest_block) = tokio::try_join!(
                     endpoint
                         .provider
                         .get_balance(wallet_address, Some(BlockNumber::Pending.into())),
@@ -1023,15 +1071,21 @@ impl ExecutionEngine {
                         .provider
                         .get_transaction_count(wallet_address, Some(BlockNumber::Pending.into())),
                     endpoint.provider.get_gas_price(),
-                    endpoint.provider.get_block_number(),
+                    endpoint.provider.get_block(BlockNumber::Latest),
                 )
                 .map_err(|err| err.to_string())?;
+                let latest_block =
+                    latest_block.ok_or_else(|| "latest block unavailable".to_string())?;
+                let block = latest_block
+                    .number
+                    .ok_or_else(|| "latest block number unavailable".to_string())?;
 
                 Ok::<_, String>(SendContext {
                     endpoint: endpoint.clone(),
                     hot_balance,
                     chain_nonce,
                     gas_price,
+                    base_fee_per_gas: latest_block.base_fee_per_gas,
                     block,
                 })
             }
@@ -1452,6 +1506,12 @@ impl ExecutionEngine {
         )
     }
 
+    fn release_budget(&self, victim_tx: H256) {
+        if let Ok(mut budget) = self.capital_budget.lock() {
+            budget.release(victim_tx);
+        }
+    }
+
     fn record_execution_outcome(
         &self,
         relay: &str,
@@ -1660,6 +1720,7 @@ struct BudgetReservation {
     reserved_at: std::time::Instant,
     cluster: ClusterKey,
     pair: Address,
+    victim_tx: H256,
     capital_eth: f64,
 }
 
@@ -1725,6 +1786,7 @@ impl CapitalBudget {
                 reserved_at: std::time::Instant::now(),
                 cluster,
                 pair,
+                victim_tx: _victim_tx,
                 capital_eth,
             });
         }
@@ -1746,6 +1808,11 @@ impl CapitalBudget {
         ) {
             self.reservations.pop_front();
         }
+    }
+
+    fn release(&mut self, victim_tx: H256) {
+        self.reservations
+            .retain(|reservation| reservation.victim_tx != victim_tx);
     }
 }
 
@@ -1872,19 +1939,38 @@ fn ewma_f64(current: f64, sample: f64, alpha: f64) -> f64 {
 
 async fn sign_executor_transaction(
     wallet: &LocalWallet,
+    config: &Config,
     payload: &crate::mev::execution::payload_builder::ExecutionPayload,
     nonce: U256,
     gas_price: U256,
+    base_fee_per_gas: Option<U256>,
 ) -> Result<Bytes, Box<dyn std::error::Error>> {
-    let tx: TypedTransaction = TransactionRequest::new()
-        .to(payload.target_contract)
-        .data(payload.calldata.clone())
-        .value(payload.value)
-        .gas(payload.gas_limit)
-        .gas_price(gas_price)
-        .nonce(nonce)
-        .from(wallet.address())
-        .into();
+    let tx: TypedTransaction = if let Some(base_fee) = base_fee_per_gas {
+        let min_priority = gas_price / U256::from(4u64);
+        let priority_fee = gas_price.saturating_sub(base_fee).max(min_priority);
+        let max_fee = base_fee.saturating_add(priority_fee).max(gas_price);
+        Eip1559TransactionRequest::new()
+            .to(payload.target_contract)
+            .data(payload.calldata.clone())
+            .value(payload.value)
+            .gas(payload.gas_limit)
+            .max_fee_per_gas(max_fee)
+            .max_priority_fee_per_gas(priority_fee)
+            .nonce(nonce)
+            .from(wallet.address())
+            .chain_id(config.chain_id)
+            .into()
+    } else {
+        TransactionRequest::new()
+            .to(payload.target_contract)
+            .data(payload.calldata.clone())
+            .value(payload.value)
+            .gas(payload.gas_limit)
+            .gas_price(gas_price)
+            .nonce(nonce)
+            .from(wallet.address())
+            .into()
+    };
     let signature = wallet.sign_transaction(&tx).await?;
     Ok(tx.rlp_signed(&signature))
 }
@@ -1892,9 +1978,13 @@ async fn sign_executor_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, MevConfig, MonitoredTokenConfig, RpcPreference};
+    use crate::config::{
+        Config, MevConfig, MonitoredTokenConfig, OpportunityMode, OpportunityThresholds,
+        RpcPreference,
+    };
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
+    use std::sync::{Arc, RwLock};
 
     fn test_config(network: &str) -> Config {
         Config {
@@ -1907,7 +1997,7 @@ mod tests {
             },
             allow_send: true,
             tenderly_rpc_only: false,
-            alchemy_keys: vec!["test".to_string()],
+            alchemy_keys: vec![("default".to_string(), "test".to_string())],
             infura_ids: Vec::new(),
             flashbots_relay: if network == "ethereum" {
                 "https://relay.flashbots.net".to_string()
@@ -1941,6 +2031,13 @@ mod tests {
             mempool_ws_urls: Vec::new(),
             mev: MevConfig {
                 enabled: true,
+                opportunity_mode: Arc::new(RwLock::new(OpportunityMode::Conservative)),
+                runtime_thresholds: Arc::new(RwLock::new(OpportunityThresholds {
+                    min_large_swap_eth: 5.0,
+                    min_net_profit_eth: 0.001,
+                    min_profit_usd: 2.0,
+                    min_liquidity_eth: 10.0,
+                })),
                 capital_eth: 0.5,
                 capital_window_secs: 90,
                 max_window_exposure_eth: 0.30,
@@ -1971,6 +2068,7 @@ mod tests {
                 gas_overpay_revert_extra_bps: 1_200,
                 gas_overpay_submit_failure_extra_bps: 1_500,
                 gas_overpay_max_extra_bps: 5_000,
+                finality_confirmations: 0,
                 stop_loss_consecutive_losses: 3,
                 stop_loss_freeze_secs: 300,
                 context_stop_loss_consecutive_losses: 2,
