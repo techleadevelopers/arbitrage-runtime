@@ -57,6 +57,7 @@ const ONE_INCH_UNOSWAP: [u8; 4] = [0x2e, 0x95, 0xb6, 0xc8];
 const PARASWAP_SIMPLE_SWAP: [u8; 4] = [0x54, 0xe3, 0xf3, 0x1b];
 const ODOS_SWAP_COMPACT: [u8; 4] = [0x83, 0xbd, 0x37, 0xf9];
 const KYBER_SWAP: [u8; 4] = [0x3f, 0x2d, 0x5c, 0xf5];
+const SAFE_EXEC_TRANSACTION: [u8; 4] = [0x6a, 0x76, 0x12, 0x02];
 
 #[derive(Debug, Clone)]
 pub(crate) enum SwapKind {
@@ -3629,7 +3630,35 @@ pub(crate) fn decode_relevant_swap(
     let router = tx.to?;
     let args = &tx.input.as_ref()[4..];
 
-    let mut signal = match selector {
+    let mut signal = decode_swap_signal(selector, router, tx.value, args, monitored_tokens)?;
+
+    let notional_wei = estimate_notional_wei(&signal, monitored_tokens).or_else(|| {
+        if mode == OpportunityMode::Scavenger
+            && path_contains_monitored_token(&signal.path, monitored_tokens)
+        {
+            Some(min_large_swap_wei.max(U256::one()))
+        } else {
+            None
+        }
+    })?;
+    if signal.path.len() < 2 {
+        return None;
+    }
+    if mode != OpportunityMode::Scavenger && notional_wei < min_large_swap_wei {
+        return None;
+    }
+    signal.notional_wei = notional_wei;
+    Some(signal)
+}
+
+fn decode_swap_signal(
+    selector: [u8; 4],
+    router: Address,
+    value: U256,
+    args: &[u8],
+    monitored_tokens: &[MonitoredTokenConfig],
+) -> Option<SwapSignal> {
+    let signal = match selector {
         SWAP_EXACT_ETH_FOR_TOKENS | SWAP_EXACT_ETH_FOR_TOKENS_SUPPORTING_FEE => {
             let decoded = abi::decode(
                 &[
@@ -3643,9 +3672,9 @@ pub(crate) fn decode_relevant_swap(
             .ok()?;
             SwapSignal {
                 selector,
-                amount_in: tx.value,
+                amount_in: value,
                 amount_out_min: decoded.first().and_then(token_as_uint),
-                notional_wei: tx.value,
+                notional_wei: value,
                 path: decoded.get(1).and_then(token_as_address_vec)?,
                 router,
                 kind: SwapKind::V2,
@@ -3760,26 +3789,51 @@ pub(crate) fn decode_relevant_swap(
                 .or_else(|| decode_universal_router_swap(selector, router, args))?
         }
         ZERO_EX_SELL_TO_UNISWAP => decode_zero_ex_sell_to_uniswap(selector, router, args)?,
+        SAFE_EXEC_TRANSACTION => decode_safe_exec_transaction_swap(router, args, monitored_tokens)?,
         _ => return None,
     };
-
-    let notional_wei = estimate_notional_wei(&signal, monitored_tokens).or_else(|| {
-        if mode == OpportunityMode::Scavenger
-            && path_contains_monitored_token(&signal.path, monitored_tokens)
-        {
-            Some(min_large_swap_wei.max(U256::one()))
-        } else {
-            None
-        }
-    })?;
-    if signal.path.len() < 2 {
-        return None;
-    }
-    if mode != OpportunityMode::Scavenger && notional_wei < min_large_swap_wei {
-        return None;
-    }
-    signal.notional_wei = notional_wei;
     Some(signal)
+}
+
+fn decode_safe_exec_transaction_swap(
+    _safe: Address,
+    args: &[u8],
+    monitored_tokens: &[MonitoredTokenConfig],
+) -> Option<SwapSignal> {
+    let decoded = abi::decode(
+        &[
+            ParamType::Address,
+            ParamType::Uint(256),
+            ParamType::Bytes,
+            ParamType::Uint(8),
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Address,
+            ParamType::Address,
+            ParamType::Bytes,
+        ],
+        args,
+    )
+    .ok()?;
+    let target = token_as_address(decoded.first()?)?;
+    let value = token_as_uint(decoded.get(1)?)?;
+    let inner = match decoded.get(2)? {
+        Token::Bytes(value) => value.as_slice(),
+        _ => return None,
+    };
+    let operation = token_as_uint(decoded.get(3)?)?;
+    if !operation.is_zero() || inner.len() < 4 {
+        return None;
+    }
+    let inner_selector = [inner[0], inner[1], inner[2], inner[3]];
+    decode_swap_signal(
+        inner_selector,
+        target,
+        value,
+        &inner[4..],
+        monitored_tokens,
+    )
 }
 
 fn decode_universal_router_swap(

@@ -30,7 +30,11 @@ This snapshot includes the latest Polygon runtime hardening work:
 - **Adaptive gas cap curve:** positive `ev_upper` now raises the adaptive gas cap more aggressively near the configured hard cap; `ev_upper >= 0.02` can reach `95%` and `ev_upper >= 0.14` can reach `98%` of `MEV_MAX_GAS_PRICE_GWEI_*`.
 - **Decode reject telemetry:** decode failures are split into actionable reasons such as unsupported selector, unsupported Universal Router command, failed subplan extraction, invalid monitored-token path, and amount below the active minimum.
 - **Payload reject telemetry:** payload failures now emit structured `payload_build_detail` categories and edge samples with amount, repayment, gross edge, gas/pool hints, route kind, fee tier, and path.
+- **EV/quality gate telemetry:** post-payload rejects now emit `ev_gate_reject` or `quality_gate_reject` samples with gate reason, expected profit, gas cost/floor, ROI, impact, pool, route, and selector context.
 - **RPC pressure-aware lookup budget:** an explicit `MEV_PENDING_LOOKUP_MAX_PER_SEC` remains honored when the RPC fleet is healthy, but the runtime now backs off during rate-limit/failure pressure instead of holding the configured rate blindly.
+- **I/O-bound lookup workers:** lookup/decode and evaluation worker counts are no longer capped by CPU count by default; they can be controlled with `MEV_LOOKUP_DECODE_WORKERS` and `MEV_EVAL_WORKERS`.
+- **Scavenger monitored-token shadow decode:** in `scavenger`, routes with a monitored token anywhere in the decoded path can continue into shadow payload analysis even when the input token itself has no configured price.
+- **Storage hardening:** Postgres storage can fall back to SQLite when `STORAGE_POSTGRES_REQUIRED=false`, and runtime `events`/`telemetry` tables now have automatic retention pruning.
 - **Historical profile refresh:** profile refresh moved out of the hot path into a background refresher.
 - **Factory/env cleanup:** Polygon deployments should set `MEV_UNISWAP_V2_FACTORY`, `MEV_UNISWAP_V3_FACTORY`, `MEV_EXECUTOR_ADDRESS`, and `MEV_EXECUTOR_V3_ADDRESS` explicitly.
 
@@ -1225,6 +1229,19 @@ For BNB Chain configuration, use the `_BSC` suffix as the canonical operator-fac
 - `MEMPOOL_WS_URL_BSC`
 - `MEMPOOL_WS_URL_POLYGON`
 - `STORAGE_PATH`
+- `DATABASE_URL`
+- `STORAGE_POSTGRES_REQUIRED`
+- `STORAGE_EVENTS_RETENTION_HOURS`
+- `STORAGE_TELEMETRY_RETENTION_HOURS`
+
+If `DATABASE_URL` is set, the storage layer attempts Postgres first. With `STORAGE_POSTGRES_REQUIRED=true`, any Postgres connection or migration failure is fatal. With `STORAGE_POSTGRES_REQUIRED=false` or unset, the runtime falls back to SQLite at `STORAGE_PATH` if Postgres is unavailable, which is useful during database disk-pressure incidents.
+
+Runtime-only storage is pruned automatically:
+
+- `STORAGE_EVENTS_RETENTION_HOURS`: event feed retention, default `24`.
+- `STORAGE_TELEMETRY_RETENTION_HOURS`: latency telemetry retention, default `6`.
+
+Execution outcomes, relay metrics, toxicity profiles, and treasury records are not part of this short runtime prune. They remain the evidence layer for historical calibration.
 
 ### RPC and execution path
 
@@ -1241,12 +1258,16 @@ For BNB Chain configuration, use the `_BSC` suffix as the canonical operator-fac
 - `RPC_SEND_PREFERENCE`
 - `MEV_PENDING_LOOKUP_FANOUT`
 - `MEV_PENDING_LOOKUP_MAX_PER_SEC`
+- `MEV_LOOKUP_DECODE_WORKERS`
+- `MEV_EVAL_WORKERS`
 - `MEV_BLOCK_LOOKUP_FANOUT`
 - `MEV_PAYLOAD_BUILD_FANOUT`
 
 `MEV_PENDING_LOOKUP_FANOUT` controls how many read RPC endpoints are queried for each pending transaction hash before decode. The default is `1`. Raising it to `2` or `3` can improve pending transaction hit rate, but it multiplies paid RPC usage and can trigger provider rate limits.
 
 `MEV_PENDING_LOOKUP_MAX_PER_SEC` caps how many pending hashes are accepted into the lookup/decode queue each second. When configured, the runtime uses that value while read RPCs are healthy. It still backs off under real RPC pressure: if all readers are unavailable, rate-limited, or failing, the effective budget is reduced until the fleet recovers. In scavenger shadow runs this prevents a configured high intake rate from continuing to fill the queue while the only usable RPC endpoint is in cooldown.
+
+`MEV_LOOKUP_DECODE_WORKERS` and `MEV_EVAL_WORKERS` control the async worker counts for the lookup/decode and evaluation stages. Defaults are tuned for I/O-heavy mempool processing (`6` lookup/decode workers and `4` evaluation workers) rather than CPU count. Keep lookup workers below the level that causes provider rate limits.
 
 `MEV_BLOCK_LOOKUP_FANOUT` controls how many read RPC endpoints are queried for the current block once a transaction already decoded into a relevant candidate. The default is `1`. Block lookup intentionally happens after decode so irrelevant transactions do not spend extra RPC.
 
@@ -1333,8 +1354,11 @@ Decode rejects are intentionally granular. The main reasons to watch are:
 - `universal_router_abi_decode_failed`: Universal Router selector matched, but commands/inputs could not be decoded.
 - `universal_router_path_invalid`: a swap command was present, but the resulting route was not executable by the current V2/V3 payload path.
 - `monitored_token_not_in_path`: aggregator route decoded, but it did not include a configured monitored token.
+- `monitored_token_not_input`: a monitored token is present in the decoded path, but the path input token is not priced in `MONITORED_TOKENS_*`.
 - `token_monitored_path_invalid`: monitored token bytes were present, but no valid priced path/notional could be produced.
 - `amount_in_below_min`: a swap decoded, but its notional was below the active mode threshold.
+
+In `scavenger`, `monitored_token_not_input` routes are allowed to continue as shadow candidates with a conservative notional floor so payload telemetry can reveal whether the route is economically useful. In stricter modes, the input token still needs a configured price to pass normal notional gating.
 
 Universal Router telemetry includes command names, input sizes, nested subplan status, swap count, hop count, unsupported commands, and route graph hints. Treat `permit2_*`, wrap/unwrap, sweep, transfer, and balance-check commands as context commands; they are not payload hops by themselves.
 
@@ -1352,6 +1376,21 @@ Payload rejects also emit `payload_build_detail`. The key categories are:
 - `economic_profit_below_floor`: simulated profit was below configured minimums.
 
 Edge telemetry samples for decode and payload rejects carry route context so the next tuning pass can be based on evidence: selector, route kind, token path, amount in, amount out or minimum out, repayment, gross edge, gas estimate, pool/factory hints, fee tier, and hop notes.
+
+After payload construction, EV and quality gate rejects are also sampled. Watch for:
+
+- `ev_lookup_stale`: pending transaction lookup was too old for the active age window.
+- `ev_zero_expected_profit`: payload has no positive expected profit.
+- `ev_gas_limit_above_cap`: payload gas exceeds `MEV_MAX_GAS_PER_TX`.
+- `ev_notional_below_min`: decoded notional is below the active minimum.
+- `ev_price_impact_too_low`: impact is too small for the deterministic edge gate.
+- `ev_profit_below_min_wei`: expected profit is below the native-unit floor.
+- `ev_profit_below_min_usd`: expected profit is below the USD floor.
+- `ev_scavenger_edge_below_floor`: scavenger gross edge is below the configured gas-fraction/USD floor.
+- `quality_roi_below_min`: ROI is below the active ROI floor.
+- `quality_price_impact_above_cap` or `quality_impact_score_above_cap`: payload impact is above the quality cap.
+
+These samples include `expected_profit_wei`, `execution_cost_wei`, `min_profit_or_floor_wei`, `net_ev_usd`, `roi_bps`, gas limit, price impact, pool, router, selector, and path.
 
 For low-capital farelo runs, use `MEV_OPPORTUNITY_MODE=scavenger` first. Keep `conservative` for larger capital, bad market conditions, expensive RPC, or when the priority is avoiding false positives over execution frequency.
 
