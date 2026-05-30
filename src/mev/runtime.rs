@@ -4503,7 +4503,12 @@ fn diagnose_decode_reject(
                 },
                 tx.input.as_ref().len()
             ),
-            hints: vec![format!("unsupported selector {selector_text}")],
+            hints: vec![format!(
+                "unsupported selector {selector_text} target={}",
+                tx.to
+                    .map(|address| format!("{address:?}"))
+                    .unwrap_or_else(|| "unknown".to_string())
+            )],
         };
     }
 
@@ -4669,7 +4674,7 @@ fn diagnose_safe_exec_decode(
             }
         ),
         hints: vec![format!(
-            "safe execTransaction inner selector {inner_selector_text}"
+            "safe execTransaction target={target} operation={operation} inner selector {inner_selector_text}"
         )],
     }
 }
