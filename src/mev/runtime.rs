@@ -3058,6 +3058,34 @@ fn selector_hex(selector: [u8; 4]) -> String {
     )
 }
 
+fn address_hex(address: Address) -> String {
+    format!("{address:?}")
+}
+
+fn known_target_label(address: Address) -> Option<&'static str> {
+    let value = address_hex(address).to_ascii_lowercase();
+    match value.as_str() {
+        "0x07964f135f276412b3182a3b2407b8dd45000000" => Some("transit_swap_router_v5"),
+        "0x4337084d9e255ff0702461cf8895ce9e3b5ff108" => Some("entrypoint_v0_8"),
+        "0x00000000000fb5c9adea0298d729a0cb3823cc07" => Some("aggregator_or_permit_router"),
+        "0xd216153c06e857cd7f72665e0af1d7d82172f494" => {
+            Some("unknown_high_frequency_polygon_target")
+        }
+        "0xada100db00ca00073811820692005400218fce1f" => Some("safe_inner_target"),
+        _ => None,
+    }
+}
+
+fn format_target(address: Option<Address>) -> String {
+    let Some(address) = address else {
+        return "unknown".to_string();
+    };
+    match known_target_label(address) {
+        Some(label) => format!("{}({})", address_hex(address), label),
+        None => address_hex(address),
+    }
+}
+
 fn contextual_capital_available_wei(
     config: &Config,
     context_signal: ContextSignal,
@@ -4493,9 +4521,7 @@ fn diagnose_decode_reject(
                 "tx={} selector={} to={} monitored_token_hint={} input_bytes={}",
                 short_hash(tx_hash),
                 selector_text,
-                tx.to
-                    .map(|address| format!("{address:?}"))
-                    .unwrap_or_else(|| "unknown".to_string()),
+                format_target(tx.to),
                 if path_hint.is_empty() {
                     "none".to_string()
                 } else {
@@ -4505,9 +4531,7 @@ fn diagnose_decode_reject(
             ),
             hints: vec![format!(
                 "unsupported selector {selector_text} target={}",
-                tx.to
-                    .map(|address| format!("{address:?}"))
-                    .unwrap_or_else(|| "unknown".to_string())
+                format_target(tx.to)
             )],
         };
     }
@@ -4636,7 +4660,7 @@ fn diagnose_safe_exec_decode(
     let target = decoded
         .first()
         .and_then(token_as_address)
-        .map(|address| format!("{address:?}"))
+        .map(|address| format_target(Some(address)))
         .unwrap_or_else(|| "unknown".to_string());
     let operation = decoded
         .get(3)

@@ -1264,6 +1264,8 @@ For raw investigation, enable lightweight file telemetry instead of writing high
 - `MEV_DECODE_REJECT_SAMPLE_RATE=20`: writes every new decode-reject key and then samples repeated decode rejects.
 - `MEV_FILE_LATENCY_TELEMETRY_ENABLED=false`: latency JSONL is disabled by default because it is high-volume.
 
+Unsupported selector telemetry also annotates known high-frequency targets when possible. Current labels include `transit_swap_router_v5` for `0x07964f135f276412b3182a3b2407b8dd45000000`, `entrypoint_v0_8` for `0x4337084d9e255ff0702461cf8895ce9e3b5ff108`, and common unknown aggregator/permit-router targets seen in Polygon shadow runs. Use these labels to decide whether the next decoder patch should unwrap an aggregator route or simply suppress account-abstraction noise.
+
 ### RPC and execution path
 
 - `RPC_URL`
