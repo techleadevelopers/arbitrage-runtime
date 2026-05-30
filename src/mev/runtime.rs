@@ -981,6 +981,9 @@ fn effective_pending_lookup_budget(config: &Config, pressure: RpcLookupPressure)
     let configured = std::env::var("MEV_PENDING_LOOKUP_MAX_PER_SEC")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok());
+    if let Some(configured) = configured {
+        return configured.clamp(1, 1_000);
+    }
     let base = configured.unwrap_or_else(|| match config.mev.opportunity_mode() {
         OpportunityMode::Conservative => 60,
         OpportunityMode::Aggressive => 90,
