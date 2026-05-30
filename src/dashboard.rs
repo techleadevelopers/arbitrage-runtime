@@ -2,10 +2,11 @@ use crate::config::{parse_opportunity_mode, Config, OpportunityMode, Opportunity
 use crate::mev::execution::payload_builder::EdgeMetadata;
 use crate::rpc::{RpcEndpointSnapshot, RpcFleet};
 use crate::storage::Storage;
-use axum::extract::{Path, State};
-use axum::http::header::CONTENT_TYPE;
+use axum::extract::{Path, Query, State};
+use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
+use axum::http::HeaderValue;
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
@@ -1561,6 +1562,12 @@ pub async fn run_server(
         .route("/js/radar.js", get(js_radar))
         .route("/api/status", get(status))
         .route("/api/export", get(status))
+        .route("/api/database", get(database_status))
+        .route("/api/database/export", post(database_export))
+        .route(
+            "/api/database/download/:artifact",
+            get(database_download),
+        )
         .route("/api/rpc/:id/enabled", post(set_rpc_enabled))
         .route("/api/rpc/only-getblock", post(only_getblock))
         .route("/api/runtime/pause", post(set_runtime_paused))
@@ -1626,6 +1633,138 @@ async fn js_radar() -> impl IntoResponse {
 
 async fn status(State(dashboard): State<DashboardHandle>) -> Json<DashboardState> {
     Json(dashboard.snapshot())
+}
+
+#[derive(Debug, Deserialize)]
+struct DatabaseExportQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct DatabaseArtifact {
+    name: String,
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DatabaseStatusResponse {
+    ok: bool,
+    storage_backend: String,
+    database_url_configured: bool,
+    downloadable: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DatabaseExportResponse {
+    ok: bool,
+    message: String,
+    artifacts: Vec<DatabaseArtifact>,
+}
+
+async fn database_status(State(dashboard): State<DashboardHandle>) -> Json<DatabaseStatusResponse> {
+    Json(DatabaseStatusResponse {
+        ok: true,
+        storage_backend: dashboard.storage.backend_label().to_string(),
+        database_url_configured: std::env::var("DATABASE_URL")
+            .ok()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false),
+        downloadable: vec![
+            "toxicity_profiles.csv".to_string(),
+            "realized_vs_expected.json".to_string(),
+        ],
+    })
+}
+
+async fn database_export(
+    State(dashboard): State<DashboardHandle>,
+    Query(query): Query<DatabaseExportQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(512).clamp(1, 10_000);
+    match dashboard.storage.export_evidence_artifacts(limit) {
+        Ok(paths) => (
+            StatusCode::OK,
+            Json(DatabaseExportResponse {
+                ok: true,
+                message: format!("exported {} database artifacts", paths.len()),
+                artifacts: paths
+                    .into_iter()
+                    .map(|path| DatabaseArtifact {
+                        name: path
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .unwrap_or("artifact")
+                            .to_string(),
+                        path: path.display().to_string(),
+                    })
+                    .collect(),
+            }),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(DatabaseExportResponse {
+                ok: false,
+                message: err.to_string(),
+                artifacts: Vec::new(),
+            }),
+        ),
+    }
+}
+
+async fn database_download(
+    State(dashboard): State<DashboardHandle>,
+    Path(artifact): Path<String>,
+    Query(query): Query<DatabaseExportQuery>,
+) -> Response {
+    let limit = query.limit.unwrap_or(512).clamp(1, 10_000);
+    let export = match artifact.as_str() {
+        "toxicity_profiles.csv" => dashboard.storage.export_toxicity_profiles_csv(limit),
+        "realized_vs_expected.json" => dashboard.storage.export_realized_vs_expected_json(limit),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                [(CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "unknown database artifact".to_string(),
+            )
+                .into_response()
+        }
+    };
+
+    let path = match export {
+        Ok(path) => path,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(CONTENT_TYPE, "text/plain; charset=utf-8")],
+                err.to_string(),
+            )
+                .into_response()
+        }
+    };
+    let body = match fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(CONTENT_TYPE, "text/plain; charset=utf-8")],
+                err.to_string(),
+            )
+                .into_response()
+        }
+    };
+    let content_type = if artifact.ends_with(".csv") {
+        "text/csv; charset=utf-8"
+    } else {
+        "application/json; charset=utf-8"
+    };
+    let mut response = (StatusCode::OK, body).into_response();
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{}\"", artifact)) {
+        response.headers_mut().insert(CONTENT_DISPOSITION, value);
+    }
+    response
 }
 
 async fn set_rpc_enabled(

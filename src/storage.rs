@@ -192,6 +192,13 @@ impl Storage {
         self
     }
 
+    pub fn backend_label(&self) -> &'static str {
+        match &self.backend {
+            StorageBackend::Sqlite(_) => "sqlite",
+            StorageBackend::Postgres(_) => "postgres",
+        }
+    }
+
     async fn migrate_postgres(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> {
         let statements = [
             r#"
