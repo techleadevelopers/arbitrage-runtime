@@ -118,6 +118,7 @@ pub struct RpcEndpointSnapshot {
     pub block_age_secs: Option<u64>,
     pub recent_burst_units: u32,
     pub burst_capacity_units: u32,
+    pub read_capacity_per_sec: u64,
 }
 
 impl RpcFleet {
@@ -381,6 +382,7 @@ impl RpcFleet {
                     .map(|duration| duration.as_secs())
                     .unwrap_or(0);
 
+                let burst_capacity_units = endpoint_burst_capacity_units(endpoint.kind, false);
                 RpcEndpointSnapshot {
                     id: endpoint.id,
                     name: endpoint.name.clone(),
@@ -399,7 +401,8 @@ impl RpcFleet {
                         .last_block_at
                         .map(|instant| instant.elapsed().as_secs()),
                     recent_burst_units: burst_load_units(&state, now),
-                    burst_capacity_units: endpoint_burst_capacity_units(endpoint.kind, false),
+                    burst_capacity_units,
+                    read_capacity_per_sec: endpoint_read_capacity_per_sec(endpoint.kind),
                 }
             })
             .collect()
@@ -811,4 +814,14 @@ fn endpoint_burst_cost_units(kind: RpcKind, send_mode: bool) -> u32 {
         (RpcKind::Generic, false) => 2,
         (RpcKind::Generic, true) => 6,
     }
+}
+
+fn endpoint_read_capacity_per_sec(kind: RpcKind) -> u64 {
+    let capacity = endpoint_burst_capacity_units(kind, false) as u64;
+    let cost = endpoint_burst_cost_units(kind, false).max(1) as u64;
+    capacity
+        .saturating_mul(1_000)
+        .saturating_div(BURST_WINDOW_MS)
+        .saturating_div(cost)
+        .max(1)
 }

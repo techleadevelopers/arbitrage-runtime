@@ -401,6 +401,20 @@ pub struct EdgeTelemetrySnapshot {
     pub blocked_count: u64,
     pub last_sample: Option<EdgeSampleSnapshot>,
     pub samples: VecDeque<EdgeSampleSnapshot>,
+    pub unsupported_selectors: Vec<UnsupportedSelectorSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UnsupportedSelectorSnapshot {
+    pub selector: String,
+    pub target: String,
+    pub monitored_token_hint: String,
+    pub input_bytes: u64,
+    pub count: u64,
+    pub first_seen: String,
+    pub last_seen: String,
+    pub sample_tx: String,
+    pub sample_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1282,6 +1296,7 @@ impl DashboardHandle {
         while state.edge_telemetry.samples.len() > 50 {
             state.edge_telemetry.samples.pop_back();
         }
+        record_unsupported_selector(&mut state.edge_telemetry, &file_snapshot);
         let sample_count = state.edge_telemetry.sample_count;
         if sample_count <= 3 || sample_count % 25 == 0 {
             push_event(
@@ -1503,6 +1518,102 @@ impl DashboardHandle {
     }
 }
 
+fn record_unsupported_selector(telemetry: &mut EdgeTelemetrySnapshot, sample: &EdgeSampleSnapshot) {
+    if sample.status != "decode_reject" {
+        return;
+    }
+    let reason = sample.reason.to_ascii_lowercase();
+    if !reason.contains("selector_unsupported") && !reason.contains("unsupported selector") {
+        return;
+    }
+
+    let selector = if sample.selector.trim().is_empty() {
+        "unknown".to_string()
+    } else {
+        sample.selector.clone()
+    };
+    let target = reason_field(&sample.reason, "target")
+        .or_else(|| reason_field(&sample.reason, "to"))
+        .unwrap_or_else(|| sample.router.clone());
+    let monitored_token_hint = sample
+        .path
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let input_bytes = reason_field(&sample.reason, "input_bytes")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            sample
+                .route_complexity
+                .saturating_mul(128)
+                .saturating_add(4)
+        });
+    let now = sample.observed_at.clone();
+
+    if let Some(existing) = telemetry
+        .unsupported_selectors
+        .iter_mut()
+        .find(|item| item.selector == selector && item.target == target)
+    {
+        existing.count = existing.count.saturating_add(1);
+        existing.last_seen = now;
+        existing.sample_tx = sample.victim_tx.clone();
+        existing.sample_reason = compact_dashboard_text(&sample.reason, 180);
+        if existing.monitored_token_hint == "unknown" && monitored_token_hint != "unknown" {
+            existing.monitored_token_hint = monitored_token_hint;
+        }
+        if existing.input_bytes == 0 {
+            existing.input_bytes = input_bytes;
+        }
+    } else {
+        telemetry
+            .unsupported_selectors
+            .push(UnsupportedSelectorSnapshot {
+                selector,
+                target,
+                monitored_token_hint,
+                input_bytes,
+                count: 1,
+                first_seen: now.clone(),
+                last_seen: now,
+                sample_tx: sample.victim_tx.clone(),
+                sample_reason: compact_dashboard_text(&sample.reason, 180),
+            });
+    }
+
+    telemetry.unsupported_selectors.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then(left.selector.cmp(&right.selector))
+    });
+    telemetry.unsupported_selectors.truncate(20);
+}
+
+fn reason_field(reason: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    reason
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix(&prefix))
+        .map(|value| {
+            value
+                .trim_matches(|ch: char| ch == ',' || ch == ';' || ch == ')' || ch == '(')
+                .to_string()
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn compact_dashboard_text(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for ch in value.chars().take(max_chars) {
+        out.push(ch);
+    }
+    if value.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
+}
+
 pub struct RelaySnapshotUpdate<'a> {
     pub relay: &'a str,
     pub accepted: bool,
@@ -1564,10 +1675,7 @@ pub async fn run_server(
         .route("/api/export", get(status))
         .route("/api/database", get(database_status))
         .route("/api/database/export", post(database_export))
-        .route(
-            "/api/database/download/:artifact",
-            get(database_download),
-        )
+        .route("/api/database/download/:artifact", get(database_download))
         .route("/api/rpc/:id/enabled", post(set_rpc_enabled))
         .route("/api/rpc/only-getblock", post(only_getblock))
         .route("/api/runtime/pause", post(set_runtime_paused))

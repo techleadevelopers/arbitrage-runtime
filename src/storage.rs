@@ -199,9 +199,7 @@ impl Storage {
         }
     }
 
-    pub fn database_table_counts(
-        &self,
-    ) -> Result<Vec<(String, u64)>, Box<dyn std::error::Error>> {
+    pub fn database_table_counts(&self) -> Result<Vec<(String, u64)>, Box<dyn std::error::Error>> {
         const TABLES: [&str; 7] = [
             "events",
             "telemetry",

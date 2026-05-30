@@ -261,6 +261,7 @@ struct PendingHashTask {
 #[derive(Debug, Clone, Copy)]
 struct RpcLookupPressure {
     available_readers: usize,
+    available_read_capacity_per_sec: u64,
     rate_limited_readers: usize,
     failing_readers: usize,
 }
@@ -269,6 +270,7 @@ impl Default for RpcLookupPressure {
     fn default() -> Self {
         Self {
             available_readers: 1,
+            available_read_capacity_per_sec: 25,
             rate_limited_readers: 0,
             failing_readers: 0,
         }
@@ -336,10 +338,11 @@ impl PendingLookupBackpressure {
             dashboard.event(
                 "warn",
                 format!(
-                    "pending lookup backpressure shed={} budget_per_sec={} available_rpc={} rate_limited_rpc={} failing_rpc={} queue_remaining={}",
+                    "pending lookup backpressure shed={} budget_per_sec={} available_rpc={} rpc_capacity_per_sec={} rate_limited_rpc={} failing_rpc={} queue_remaining={}",
                     self.dropped_since_event,
                     max_per_sec,
                     self.pressure.available_readers,
+                    self.pressure.available_read_capacity_per_sec,
                     self.pressure.rate_limited_readers,
                     self.pressure.failing_readers,
                     queue_remaining,
@@ -1114,6 +1117,7 @@ fn u256_max(left: U256, right: U256) -> U256 {
 fn rpc_lookup_pressure(rpc_fleet: &RpcFleet) -> RpcLookupPressure {
     let mut pressure = RpcLookupPressure::default();
     pressure.available_readers = 0;
+    pressure.available_read_capacity_per_sec = 0;
     for endpoint in rpc_fleet.snapshot() {
         if endpoint.disabled {
             continue;
@@ -1126,6 +1130,9 @@ fn rpc_lookup_pressure(rpc_fleet: &RpcFleet) -> RpcLookupPressure {
         }
         if endpoint.cooldown_remaining_secs == 0 && endpoint.rate_limit_failures == 0 {
             pressure.available_readers = pressure.available_readers.saturating_add(1);
+            pressure.available_read_capacity_per_sec = pressure
+                .available_read_capacity_per_sec
+                .saturating_add(endpoint.read_capacity_per_sec);
         }
     }
     pressure
@@ -1148,13 +1155,13 @@ fn effective_pending_lookup_budget_for_mode(
         OpportunityMode::Aggressive => 90,
         OpportunityMode::Scavenger => 25,
     });
-    let healthy_reader_cap = match mode {
-        OpportunityMode::Scavenger => pressure.available_readers.max(1) as u64 * 25,
-        OpportunityMode::Aggressive => pressure.available_readers.max(1) as u64 * 60,
-        OpportunityMode::Conservative => pressure.available_readers.max(1) as u64 * 40,
-    };
+    let healthy_reader_cap = pressure.available_read_capacity_per_sec.max(match mode {
+        OpportunityMode::Scavenger => 4,
+        OpportunityMode::Aggressive => 10,
+        OpportunityMode::Conservative => 8,
+    });
     let base = if configured.is_some() {
-        base.clamp(1, 1_000)
+        base.clamp(1, 1_000).min(healthy_reader_cap)
     } else {
         base.min(healthy_reader_cap)
     };
@@ -5901,15 +5908,32 @@ mod tests {
     fn configured_pending_lookup_budget_holds_when_rpc_is_healthy() {
         let budget = effective_pending_lookup_budget_for_mode(
             OpportunityMode::Scavenger,
-            Some(85),
+            Some(40),
             RpcLookupPressure {
-                available_readers: 1,
+                available_readers: 2,
+                available_read_capacity_per_sec: 40,
                 rate_limited_readers: 0,
                 failing_readers: 0,
             },
         );
 
-        assert_eq!(budget, 85);
+        assert_eq!(budget, 40);
+    }
+
+    #[test]
+    fn configured_pending_lookup_budget_is_capped_by_reader_capacity() {
+        let budget = effective_pending_lookup_budget_for_mode(
+            OpportunityMode::Scavenger,
+            Some(85),
+            RpcLookupPressure {
+                available_readers: 1,
+                available_read_capacity_per_sec: 25,
+                rate_limited_readers: 0,
+                failing_readers: 0,
+            },
+        );
+
+        assert_eq!(budget, 25);
     }
 
     #[test]
@@ -5919,6 +5943,7 @@ mod tests {
             Some(85),
             RpcLookupPressure {
                 available_readers: 0,
+                available_read_capacity_per_sec: 0,
                 rate_limited_readers: 1,
                 failing_readers: 1,
             },

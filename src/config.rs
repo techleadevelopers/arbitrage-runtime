@@ -1345,8 +1345,14 @@ mod tests {
             env::remove_var("MEMPOOL_WS_URL_POLYGON3");
             env::remove_var("MEMPOOL_WS_DISABLE_DEFAULT_ALCHEMY");
             env::set_var("MEMPOOL_WS_URL_POLYGON", "wss://polygon-primary.example");
-            env::set_var("MEMPOOL_WS_URL_POLYGON_2", "wss://polygon-fallback-2.example");
-            env::set_var("MEMPOOL_WS_URL_POLYGON3", "wss://polygon-fallback-3.example");
+            env::set_var(
+                "MEMPOOL_WS_URL_POLYGON_2",
+                "wss://polygon-fallback-2.example",
+            );
+            env::set_var(
+                "MEMPOOL_WS_URL_POLYGON3",
+                "wss://polygon-fallback-3.example",
+            );
         }
 
         let urls = parse_mempool_ws_urls("polygon", false, &[]);
@@ -1383,7 +1389,10 @@ mod tests {
 
         let urls = parse_mempool_ws_urls("polygon", false, &[]);
 
-        assert_eq!(urls, vec!["wss://shared.us-east-1.getblock.io/new".to_string()]);
+        assert_eq!(
+            urls,
+            vec!["wss://shared.us-east-1.getblock.io/new".to_string()]
+        );
 
         unsafe {
             env::remove_var("MEMPOOL_WS_URL");
