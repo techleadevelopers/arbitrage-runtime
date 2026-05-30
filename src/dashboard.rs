@@ -1,7 +1,7 @@
 use crate::config::{parse_opportunity_mode, Config, OpportunityMode, OpportunityThresholds};
 use crate::mev::execution::payload_builder::EdgeMetadata;
 use crate::rpc::{RpcEndpointSnapshot, RpcFleet};
-use crate::storage::Storage;
+use crate::storage::{Storage, UnsupportedSelectorRecord};
 use axum::extract::{Path, Query, State};
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::HeaderValue;
@@ -43,6 +43,7 @@ struct PendingStorageWrites {
     relay_updates: Vec<PendingRelayUpdate>,
     treasury_updates: Vec<PendingTreasuryUpdate>,
     execution_outcomes: Vec<PendingExecutionOutcome>,
+    unsupported_selectors: Vec<UnsupportedSelectorRecord>,
 }
 
 struct PendingLatency {
@@ -1296,7 +1297,8 @@ impl DashboardHandle {
         while state.edge_telemetry.samples.len() > 50 {
             state.edge_telemetry.samples.pop_back();
         }
-        record_unsupported_selector(&mut state.edge_telemetry, &file_snapshot);
+        let unsupported_selector =
+            record_unsupported_selector(&mut state.edge_telemetry, &file_snapshot);
         let sample_count = state.edge_telemetry.sample_count;
         if sample_count <= 3 || sample_count % 25 == 0 {
             push_event(
@@ -1306,6 +1308,11 @@ impl DashboardHandle {
             );
         }
         drop(state);
+        if let Some(record) = unsupported_selector {
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.unsupported_selectors.push(record);
+            }
+        }
         self.file_telemetry.record_edge_sample(&file_snapshot);
     }
 
@@ -1515,16 +1522,23 @@ impl DashboardHandle {
                 outcome.finalization_latency_ms,
             );
         }
+
+        for unsupported in pending.unsupported_selectors {
+            self.storage.record_unsupported_selector(&unsupported);
+        }
     }
 }
 
-fn record_unsupported_selector(telemetry: &mut EdgeTelemetrySnapshot, sample: &EdgeSampleSnapshot) {
+fn record_unsupported_selector(
+    telemetry: &mut EdgeTelemetrySnapshot,
+    sample: &EdgeSampleSnapshot,
+) -> Option<UnsupportedSelectorRecord> {
     if sample.status != "decode_reject" {
-        return;
+        return None;
     }
     let reason = sample.reason.to_ascii_lowercase();
     if !reason.contains("selector_unsupported") && !reason.contains("unsupported selector") {
-        return;
+        return None;
     }
 
     let selector = if sample.selector.trim().is_empty() {
@@ -1535,10 +1549,18 @@ fn record_unsupported_selector(telemetry: &mut EdgeTelemetrySnapshot, sample: &E
     let target = reason_field(&sample.reason, "target")
         .or_else(|| reason_field(&sample.reason, "to"))
         .unwrap_or_else(|| sample.router.clone());
+    let inner_selector = reason_field(&sample.reason, "inner_selector")
+        .or_else(|| reason_field(&sample.reason, "inner"))
+        .unwrap_or_default();
     let monitored_token_hint = sample
         .path
-        .first()
+        .iter()
+        .take(6)
         .cloned()
+        .collect::<Vec<_>>()
+        .join(",");
+    let monitored_token_hint = (!monitored_token_hint.is_empty())
+        .then_some(monitored_token_hint)
         .unwrap_or_else(|| "unknown".to_string());
     let input_bytes = reason_field(&sample.reason, "input_bytes")
         .and_then(|value| value.parse::<u64>().ok())
@@ -1560,7 +1582,7 @@ fn record_unsupported_selector(telemetry: &mut EdgeTelemetrySnapshot, sample: &E
         existing.sample_tx = sample.victim_tx.clone();
         existing.sample_reason = compact_dashboard_text(&sample.reason, 180);
         if existing.monitored_token_hint == "unknown" && monitored_token_hint != "unknown" {
-            existing.monitored_token_hint = monitored_token_hint;
+            existing.monitored_token_hint = monitored_token_hint.clone();
         }
         if existing.input_bytes == 0 {
             existing.input_bytes = input_bytes;
@@ -1569,9 +1591,9 @@ fn record_unsupported_selector(telemetry: &mut EdgeTelemetrySnapshot, sample: &E
         telemetry
             .unsupported_selectors
             .push(UnsupportedSelectorSnapshot {
-                selector,
-                target,
-                monitored_token_hint,
+                selector: selector.clone(),
+                target: target.clone(),
+                monitored_token_hint: monitored_token_hint.clone(),
                 input_bytes,
                 count: 1,
                 first_seen: now.clone(),
@@ -1588,6 +1610,24 @@ fn record_unsupported_selector(telemetry: &mut EdgeTelemetrySnapshot, sample: &E
             .then(left.selector.cmp(&right.selector))
     });
     telemetry.unsupported_selectors.truncate(20);
+
+    Some(UnsupportedSelectorRecord {
+        target,
+        selector,
+        inner_selector,
+        token_hints: monitored_token_hint,
+        input_bytes,
+        sample_tx: sample.victim_tx.clone(),
+        sample_calldata_prefix: reason_field(&sample.reason, "calldata_prefix")
+            .unwrap_or_else(|| "unknown".to_string()),
+        route_hint: sample
+            .hop_profitability_rank
+            .iter()
+            .take(4)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" | "),
+    })
 }
 
 fn reason_field(reason: &str, key: &str) -> Option<String> {

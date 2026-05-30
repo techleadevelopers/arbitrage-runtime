@@ -58,7 +58,11 @@ const PARASWAP_SIMPLE_SWAP: [u8; 4] = [0x54, 0xe3, 0xf3, 0x1b];
 const ODOS_SWAP_COMPACT: [u8; 4] = [0x83, 0xbd, 0x37, 0xf9];
 const KYBER_SWAP: [u8; 4] = [0x3f, 0x2d, 0x5c, 0xf5];
 const SAFE_EXEC_TRANSACTION: [u8; 4] = [0x6a, 0x76, 0x12, 0x02];
-// const TRANSIT_SWAP_V5: [u8; 4] = [0x??, 0x??, 0x??, 0x??]; // Pegue o selector do log - DESABILITADO
+const TRANSIT_SWAP_V5: [u8; 4] = [0xd8, 0x08, 0xd8, 0x89];
+const AGGREGATOR_SELECTOR_0A2B8F36: [u8; 4] = [0x0a, 0x2b, 0x8f, 0x36];
+const AGGREGATOR_SELECTOR_F2881E21: [u8; 4] = [0xf2, 0x88, 0x1e, 0x21];
+const SAFE_INNER_SELECTOR_8CC7104F: [u8; 4] = [0x8c, 0xc7, 0x10, 0x4f];
+const SAFE_INNER_SELECTOR_9E7212AD: [u8; 4] = [0x9e, 0x72, 0x12, 0xad];
 
 #[derive(Debug, Clone)]
 pub(crate) enum SwapKind {
@@ -3086,6 +3090,14 @@ fn selector_hex(selector: [u8; 4]) -> String {
     )
 }
 
+fn calldata_prefix_hex(input: &[u8]) -> String {
+    let mut out = String::from("0x");
+    for byte in input.iter().take(96) {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
 fn address_hex(address: Address) -> String {
     format!("{address:?}")
 }
@@ -3857,7 +3869,7 @@ fn decode_swap_signal(
         }
         ZERO_EX_SELL_TO_UNISWAP => decode_zero_ex_sell_to_uniswap(selector, router, args)?,
         SAFE_EXEC_TRANSACTION => decode_safe_exec_transaction_swap(router, args, monitored_tokens)?,
-        _ => return None,
+        _ => decode_known_aggregator_partial(selector, router, value, args, monitored_tokens)?,
     };
     Some(signal)
 }
@@ -3894,7 +3906,84 @@ fn decode_safe_exec_transaction_swap(
         return None;
     }
     let inner_selector = [inner[0], inner[1], inner[2], inner[3]];
-    decode_swap_signal(inner_selector, target, value, &inner[4..], monitored_tokens)
+    decode_swap_signal(inner_selector, target, value, &inner[4..], monitored_tokens).or_else(|| {
+        decode_safe_inner_aggregator_partial(
+            inner_selector,
+            target,
+            value,
+            &inner[4..],
+            monitored_tokens,
+        )
+    })
+}
+
+fn decode_safe_inner_aggregator_partial(
+    selector: [u8; 4],
+    target: Address,
+    value: U256,
+    args: &[u8],
+    monitored_tokens: &[MonitoredTokenConfig],
+) -> Option<SwapSignal> {
+    match selector {
+        SAFE_INNER_SELECTOR_8CC7104F | SAFE_INNER_SELECTOR_9E7212AD => {
+            decode_partial_swap_from_monitored_tokens(
+                selector,
+                target,
+                value,
+                args,
+                monitored_tokens,
+            )
+        }
+        _ => None,
+    }
+}
+
+fn decode_known_aggregator_partial(
+    selector: [u8; 4],
+    router: Address,
+    value: U256,
+    args: &[u8],
+    monitored_tokens: &[MonitoredTokenConfig],
+) -> Option<SwapSignal> {
+    match selector {
+        TRANSIT_SWAP_V5 | AGGREGATOR_SELECTOR_0A2B8F36 | AGGREGATOR_SELECTOR_F2881E21 => {
+            decode_partial_swap_from_monitored_tokens(
+                selector,
+                router,
+                value,
+                args,
+                monitored_tokens,
+            )
+        }
+        _ => None,
+    }
+}
+
+fn decode_partial_swap_from_monitored_tokens(
+    selector: [u8; 4],
+    router: Address,
+    value: U256,
+    args: &[u8],
+    monitored_tokens: &[MonitoredTokenConfig],
+) -> Option<SwapSignal> {
+    let path = monitored_token_addresses_in_input(monitored_tokens, args);
+    if path.len() < 2 {
+        return None;
+    }
+    let amount_in = if value > U256::zero() {
+        value
+    } else {
+        amount_hint_from_calldata(args).unwrap_or_else(U256::one)
+    };
+    Some(SwapSignal {
+        selector,
+        amount_in,
+        amount_out_min: None,
+        notional_wei: U256::zero(),
+        path,
+        router,
+        kind: SwapKind::V2,
+    })
 }
 
 fn decode_universal_router_swap(
@@ -4551,7 +4640,7 @@ fn diagnose_decode_reject(
         return DecodeRejectDiagnostic {
             reason: unsupported_reason,
             detail: format!(
-                "tx={} selector={} to={} monitored_token_hint={} input_bytes={}",
+                "tx={} selector={} to={} monitored_token_hint={} input_bytes={} calldata_prefix={}",
                 short_hash(tx_hash),
                 selector_text,
                 format_target(tx.to),
@@ -4560,7 +4649,8 @@ fn diagnose_decode_reject(
                 } else {
                     path_hint.join(",")
                 },
-                tx.input.as_ref().len()
+                tx.input.as_ref().len(),
+                calldata_prefix_hex(tx.input.as_ref())
             ),
             hints: vec![if unsupported_reason == "account_abstraction_noise" {
                 format!(
@@ -4725,7 +4815,7 @@ fn diagnose_safe_exec_decode(
     DecodeRejectDiagnostic {
         reason,
         detail: format!(
-            "tx={} selector={} target={} operation={} inner_selector={} monitored_token_hint={}",
+            "tx={} selector={} target={} operation={} inner_selector={} monitored_token_hint={} calldata_prefix={}",
             short_hash(tx_hash),
             selector_text,
             target,
@@ -4735,7 +4825,8 @@ fn diagnose_safe_exec_decode(
                 "none".to_string()
             } else {
                 path_hint.join(",")
-            }
+            },
+            calldata_prefix_hex(tx.input.as_ref())
         ),
         hints: vec![format!(
             "safe execTransaction target={target} operation={operation} inner selector {inner_selector_text}"
@@ -5630,19 +5721,43 @@ fn universal_router_hop_rank(
 }
 
 fn monitored_token_path_hint(config: &Config, input: &[u8]) -> Vec<String> {
-    let mut out = Vec::new();
-    for token in &config.monitored_tokens {
-        if input
+    monitored_token_addresses_in_input(&config.monitored_tokens, input)
+        .into_iter()
+        .map(|address| format!("{address:?}"))
+        .collect()
+}
+
+fn monitored_token_addresses_in_input(
+    monitored_tokens: &[MonitoredTokenConfig],
+    input: &[u8],
+) -> Vec<Address> {
+    let mut matches = Vec::new();
+    for token in monitored_tokens {
+        if let Some(position) = input
             .windows(20)
-            .any(|window| window == token.address.as_bytes())
+            .position(|window| window == token.address.as_bytes())
         {
-            out.push(format!("{:?}", token.address));
-        }
-        if out.len() >= 6 {
-            break;
+            matches.push((position, token.address));
         }
     }
-    out
+    matches.sort_by_key(|(position, _)| *position);
+    matches
+        .into_iter()
+        .map(|(_, address)| address)
+        .take(6)
+        .collect()
+}
+
+fn amount_hint_from_calldata(input: &[u8]) -> Option<U256> {
+    let min = U256::from(10_000u64);
+    let max = U256::from_dec_str("1000000000000000000000000000000").ok()?;
+    input
+        .chunks_exact(32)
+        .filter_map(|word| {
+            let value = U256::from_big_endian(word);
+            (value >= min && value <= max).then_some(value)
+        })
+        .max()
 }
 
 fn aggregator_slippage_hint(source: &str, tx: &Transaction) -> f64 {

@@ -15,6 +15,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::warn;
 
+#[derive(Debug, Clone)]
+pub struct UnsupportedSelectorRecord {
+    pub target: String,
+    pub selector: String,
+    pub inner_selector: String,
+    pub token_hints: String,
+    pub input_bytes: u64,
+    pub sample_tx: String,
+    pub sample_calldata_prefix: String,
+    pub route_hint: String,
+}
+
 #[derive(Clone)]
 pub struct Storage {
     backend: StorageBackend,
@@ -163,6 +175,22 @@ impl Storage {
                 submit_latency_ms REAL NOT NULL DEFAULT 0,
                 finalization_latency_ms REAL NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS unsupported_selectors (
+                network TEXT NOT NULL DEFAULT 'unknown',
+                target TEXT NOT NULL,
+                selector TEXT NOT NULL,
+                inner_selector TEXT NOT NULL DEFAULT '',
+                token_hints TEXT NOT NULL DEFAULT '',
+                input_bytes INTEGER NOT NULL DEFAULT 0,
+                count INTEGER NOT NULL DEFAULT 0,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                sample_tx TEXT NOT NULL DEFAULT '',
+                sample_calldata_prefix TEXT NOT NULL DEFAULT '',
+                route_hint TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (network, target, selector, inner_selector, token_hints)
+            );
             "#,
         )?;
         let _ = conn.execute(
@@ -200,7 +228,7 @@ impl Storage {
     }
 
     pub fn database_table_counts(&self) -> Result<Vec<(String, u64)>, Box<dyn std::error::Error>> {
-        const TABLES: [&str; 7] = [
+        const TABLES: [&str; 8] = [
             "events",
             "telemetry",
             "sweeps",
@@ -208,6 +236,7 @@ impl Storage {
             "relay_metrics",
             "treasury_rebalance",
             "execution_outcomes",
+            "unsupported_selectors",
         ];
 
         match &self.backend {
@@ -332,6 +361,23 @@ impl Storage {
                 finalization_latency_ms DOUBLE PRECISION NOT NULL DEFAULT 0
             )
             "#,
+            r#"
+            CREATE TABLE IF NOT EXISTS unsupported_selectors (
+                network TEXT NOT NULL DEFAULT 'unknown',
+                target TEXT NOT NULL,
+                selector TEXT NOT NULL,
+                inner_selector TEXT NOT NULL DEFAULT '',
+                token_hints TEXT NOT NULL DEFAULT '',
+                input_bytes BIGINT NOT NULL DEFAULT 0,
+                count BIGINT NOT NULL DEFAULT 0,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                sample_tx TEXT NOT NULL DEFAULT '',
+                sample_calldata_prefix TEXT NOT NULL DEFAULT '',
+                route_hint TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (network, target, selector, inner_selector, token_hints)
+            )
+            "#,
         ];
 
         for statement in statements {
@@ -452,6 +498,75 @@ impl Storage {
                     .bind(duration_ms as i64)
                     .bind(wallet.map(str::to_string))
                     .bind(note.map(str::to_string))
+                    .execute(pool),
+                );
+            }
+        }
+    }
+
+    pub fn record_unsupported_selector(&self, record: &UnsupportedSelectorRecord) {
+        let now = Utc::now().to_rfc3339();
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                if let Ok(conn) = conn.lock() {
+                    let _ = conn.execute(
+                        r#"
+                        INSERT INTO unsupported_selectors (
+                            network, target, selector, inner_selector, token_hints, input_bytes,
+                            count, first_seen, last_seen, sample_tx, sample_calldata_prefix, route_hint
+                        )
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7, ?8, ?9, ?10)
+                        ON CONFLICT(network, target, selector, inner_selector, token_hints) DO UPDATE SET
+                            count = count + 1,
+                            input_bytes = excluded.input_bytes,
+                            last_seen = excluded.last_seen,
+                            sample_tx = excluded.sample_tx,
+                            sample_calldata_prefix = excluded.sample_calldata_prefix,
+                            route_hint = excluded.route_hint
+                        "#,
+                        params![
+                            self.network.as_str(),
+                            record.target.as_str(),
+                            record.selector.as_str(),
+                            record.inner_selector.as_str(),
+                            record.token_hints.as_str(),
+                            record.input_bytes as i64,
+                            now,
+                            record.sample_tx.as_str(),
+                            record.sample_calldata_prefix.as_str(),
+                            record.route_hint.as_str(),
+                        ],
+                    );
+                }
+            }
+            StorageBackend::Postgres(pool) => {
+                let _ = Self::wait(
+                    sqlx::query(
+                        r#"
+                        INSERT INTO unsupported_selectors (
+                            network, target, selector, inner_selector, token_hints, input_bytes,
+                            count, first_seen, last_seen, sample_tx, sample_calldata_prefix, route_hint
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $7, $8, $9, $10)
+                        ON CONFLICT(network, target, selector, inner_selector, token_hints) DO UPDATE SET
+                            count = unsupported_selectors.count + 1,
+                            input_bytes = EXCLUDED.input_bytes,
+                            last_seen = EXCLUDED.last_seen,
+                            sample_tx = EXCLUDED.sample_tx,
+                            sample_calldata_prefix = EXCLUDED.sample_calldata_prefix,
+                            route_hint = EXCLUDED.route_hint
+                        "#,
+                    )
+                    .bind(self.network.clone())
+                    .bind(record.target.clone())
+                    .bind(record.selector.clone())
+                    .bind(record.inner_selector.clone())
+                    .bind(record.token_hints.clone())
+                    .bind(record.input_bytes as i64)
+                    .bind(now)
+                    .bind(record.sample_tx.clone())
+                    .bind(record.sample_calldata_prefix.clone())
+                    .bind(record.route_hint.clone())
                     .execute(pool),
                 );
             }
