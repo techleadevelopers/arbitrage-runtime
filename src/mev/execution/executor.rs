@@ -153,6 +153,9 @@ impl ExecutionEngine {
         if let Some(executor) = self.config.mev.mev_executor {
             state_overrides.insert(executor, AccountState::empty());
         }
+        if let Some(executor) = self.config.mev.mev_executor_v3 {
+            state_overrides.insert(executor, AccountState::empty());
+        }
 
         // Add profit recipient balance tracking
         state_overrides.insert(self.config.profit_address, AccountState::empty());
@@ -2081,6 +2084,7 @@ mod tests {
                 uniswap_v2_factory: Some(Address::from_low_u64_be(20)),
                 uniswap_v3_factory: Some(Address::from_low_u64_be(22)),
                 mev_executor: Some(Address::from_low_u64_be(21)),
+                mev_executor_v3: Some(Address::from_low_u64_be(23)),
             },
         }
     }

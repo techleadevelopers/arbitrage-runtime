@@ -99,6 +99,7 @@ pub struct MevConfig {
     pub uniswap_v2_factory: Option<Address>,
     pub uniswap_v3_factory: Option<Address>,
     pub mev_executor: Option<Address>,
+    pub mev_executor_v3: Option<Address>,
 }
 
 #[derive(Debug, Clone)]
@@ -447,6 +448,10 @@ impl Config {
             )?,
             mev_executor: parse_optional_address_env(
                 "MEV_EXECUTOR_ADDRESS",
+                runtime_load_test_mode,
+            )?,
+            mev_executor_v3: parse_optional_address_env(
+                "MEV_EXECUTOR_V3_ADDRESS",
                 runtime_load_test_mode,
             )?,
         };

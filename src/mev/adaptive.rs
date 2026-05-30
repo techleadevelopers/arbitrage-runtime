@@ -2020,6 +2020,7 @@ mod tests {
                 uniswap_v2_factory: Some(Address::from_low_u64_be(20)),
                 uniswap_v3_factory: Some(Address::from_low_u64_be(22)),
                 mev_executor: Some(Address::from_low_u64_be(21)),
+                mev_executor_v3: Some(Address::from_low_u64_be(23)),
             },
         }
     }

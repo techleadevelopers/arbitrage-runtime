@@ -49,6 +49,7 @@ const V3_EXACT_INPUT_SINGLE: [u8; 4] = [0x41, 0x4b, 0xf3, 0x89];
 const V3_EXACT_INPUT: [u8; 4] = [0xc0, 0x4b, 0x8d, 0x59];
 const UNIVERSAL_ROUTER_EXECUTE: [u8; 4] = [0x35, 0x93, 0x56, 0x4c];
 const UNIVERSAL_ROUTER_EXECUTE_NO_DEADLINE: [u8; 4] = [0x24, 0x85, 0x6b, 0xc3];
+const UNIVERSAL_ROUTER_COMMAND_MASK: u8 = 0x7f;
 const ZERO_EX_TRANSFORM_ERC20: [u8; 4] = [0x41, 0x55, 0x65, 0xb0];
 const ZERO_EX_SELL_TO_UNISWAP: [u8; 4] = [0xd9, 0x62, 0x7a, 0xa4];
 const ONE_INCH_SWAP: [u8; 4] = [0x12, 0xaa, 0x3c, 0x6a];
@@ -1201,6 +1202,11 @@ async fn validate_with_evm_preflight(
     }
 
     if let Some(executor) = config.mev.mev_executor {
+        account_states
+            .entry(executor)
+            .or_insert_with(AccountState::empty);
+    }
+    if let Some(executor) = config.mev.mev_executor_v3 {
         account_states
             .entry(executor)
             .or_insert_with(AccountState::empty);
@@ -3204,7 +3210,7 @@ fn decode_universal_router_parts(
             Some(_) => continue,
             None => break,
         };
-        match command & 0x3f {
+        match command & UNIVERSAL_ROUTER_COMMAND_MASK {
             0x00 => {
                 if let Some(signal) = decode_universal_router_v3_exact_in(selector, router, input) {
                     signals.push(signal);
@@ -3505,6 +3511,27 @@ struct AggregatorRouteIntel {
     hop_profitability_rank: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct UniversalRouterRouteGraph {
+    command_count: u64,
+    swap_command_count: u64,
+    hops: Vec<UniversalRouterHop>,
+    unsupported_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct UniversalRouterHop {
+    dex: &'static str,
+    command: &'static str,
+    token_in: Address,
+    token_out: Address,
+    amount_in: Option<U256>,
+    amount_out: Option<U256>,
+    fee_tier: Option<u32>,
+    exact_out: bool,
+    depth: usize,
+}
+
 fn aggregator_intelligence_sample(
     config: &Config,
     tx: &Transaction,
@@ -3635,6 +3662,9 @@ fn decode_reject_edge_sample(
 
 fn aggregator_route_intel(config: &Config, tx: &Transaction, source: &str) -> AggregatorRouteIntel {
     if source == "universal_router" {
+        if let Some(intel) = universal_router_graph_intel(tx) {
+            return intel;
+        }
         if let Some(intel) = universal_router_intel(tx) {
             return intel;
         }
@@ -3662,6 +3692,62 @@ fn aggregator_route_intel(config: &Config, tx: &Transaction, source: &str) -> Ag
             "hop_2: decode aggregator inputs next".to_string(),
         ],
     }
+}
+
+fn universal_router_graph_intel(tx: &Transaction) -> Option<AggregatorRouteIntel> {
+    let graph = universal_router_route_graph(tx.input.as_ref().get(4..)?)?;
+    if graph.hops.is_empty() && graph.unsupported_commands.is_empty() {
+        return None;
+    }
+
+    let mut path = Vec::new();
+    for hop in &graph.hops {
+        let token_in = format!("{:?}", hop.token_in);
+        let token_out = format!("{:?}", hop.token_out);
+        if !path.contains(&token_in) {
+            path.push(token_in);
+        }
+        if !path.contains(&token_out) {
+            path.push(token_out);
+        }
+    }
+
+    let mut dex_sequence = graph
+        .hops
+        .iter()
+        .map(|hop| hop.command.to_string())
+        .collect::<Vec<_>>();
+    if dex_sequence.is_empty() {
+        dex_sequence.push("universal_router".to_string());
+    }
+    for command in graph.unsupported_commands.iter().take(3) {
+        dex_sequence.push(format!("unsupported:{command}"));
+    }
+
+    let split_ratio_bps = if graph.swap_command_count > 1 {
+        ((graph.swap_command_count - 1) * 2_000).min(8_000)
+    } else {
+        0
+    };
+    let complexity_score = (graph.command_count as f64 / 10.0).clamp(0.0, 1.0);
+    let split_score = (split_ratio_bps as f64 / 10_000.0).clamp(0.0, 1.0);
+    let unsupported_score = (graph.unsupported_commands.len() as f64 / 6.0).clamp(0.0, 1.0);
+    let route_inefficiency_score =
+        (0.24 + complexity_score * 0.28 + split_score * 0.34 + unsupported_score * 0.14)
+            .clamp(0.0, 1.0);
+    let liquidity_distortion_score =
+        (0.20 + graph.hops.len() as f64 * 0.06 + split_score * 0.40).clamp(0.0, 1.0);
+
+    Some(AggregatorRouteIntel {
+        command_count: graph.command_count,
+        swap_command_count: graph.swap_command_count,
+        split_ratio_bps,
+        dex_sequence,
+        path,
+        route_inefficiency_score,
+        liquidity_distortion_score,
+        hop_profitability_rank: universal_router_graph_hop_rank(&graph, route_inefficiency_score),
+    })
 }
 
 fn universal_router_intel(tx: &Transaction) -> Option<AggregatorRouteIntel> {
@@ -3694,7 +3780,7 @@ fn universal_router_intel(tx: &Transaction) -> Option<AggregatorRouteIntel> {
     let mut wraps = 0u64;
     let mut permit2 = 0u64;
     for command in commands {
-        let opcode = command & 0x3f;
+        let opcode = command & UNIVERSAL_ROUTER_COMMAND_MASK;
         match opcode {
             0x00 => {
                 swap_command_count += 1;
@@ -3748,6 +3834,231 @@ fn universal_router_intel(tx: &Transaction) -> Option<AggregatorRouteIntel> {
     })
 }
 
+fn universal_router_route_graph(args: &[u8]) -> Option<UniversalRouterRouteGraph> {
+    let decoded = abi::decode(
+        &[
+            ParamType::Bytes,
+            ParamType::Array(Box::new(ParamType::Bytes)),
+            ParamType::Uint(256),
+        ],
+        args,
+    )
+    .or_else(|_| {
+        abi::decode(
+            &[
+                ParamType::Bytes,
+                ParamType::Array(Box::new(ParamType::Bytes)),
+            ],
+            args,
+        )
+    })
+    .ok()?;
+    let commands = match decoded.first()? {
+        Token::Bytes(value) => value.as_slice(),
+        _ => return None,
+    };
+    let inputs = match decoded.get(1)? {
+        Token::Array(values) => values.as_slice(),
+        _ => return None,
+    };
+    let mut graph = UniversalRouterRouteGraph {
+        command_count: 0,
+        swap_command_count: 0,
+        hops: Vec::new(),
+        unsupported_commands: Vec::new(),
+    };
+    collect_universal_router_graph(commands, inputs, 0, &mut graph);
+    Some(graph)
+}
+
+fn collect_universal_router_graph(
+    commands: &[u8],
+    inputs: &[Token],
+    depth: usize,
+    graph: &mut UniversalRouterRouteGraph,
+) {
+    if depth > 3 {
+        graph
+            .unsupported_commands
+            .push("subplan_depth_limit".to_string());
+        return;
+    }
+
+    for (idx, command) in commands.iter().copied().enumerate() {
+        graph.command_count = graph.command_count.saturating_add(1);
+        let opcode = command & UNIVERSAL_ROUTER_COMMAND_MASK;
+        let input = match inputs.get(idx) {
+            Some(Token::Bytes(value)) => value.as_slice(),
+            Some(_) => {
+                graph.unsupported_commands.push(format!(
+                    "{}:input_not_bytes",
+                    universal_router_command_name(opcode)
+                ));
+                continue;
+            }
+            None => {
+                graph.unsupported_commands.push(format!(
+                    "{}:missing_input",
+                    universal_router_command_name(opcode)
+                ));
+                break;
+            }
+        };
+
+        match opcode {
+            0x00 => {
+                graph.swap_command_count = graph.swap_command_count.saturating_add(1);
+                graph
+                    .hops
+                    .extend(universal_router_v3_hops(input, false, depth));
+            }
+            0x01 => {
+                graph.swap_command_count = graph.swap_command_count.saturating_add(1);
+                graph
+                    .hops
+                    .extend(universal_router_v3_hops(input, true, depth));
+            }
+            0x08 => {
+                graph.swap_command_count = graph.swap_command_count.saturating_add(1);
+                graph
+                    .hops
+                    .extend(universal_router_v2_hops(input, false, depth));
+            }
+            0x09 => {
+                graph.swap_command_count = graph.swap_command_count.saturating_add(1);
+                graph
+                    .hops
+                    .extend(universal_router_v2_hops(input, true, depth));
+            }
+            0x21 => {
+                if let Some((sub_commands, sub_inputs)) = decode_universal_router_sub_plan(input) {
+                    collect_universal_router_graph(&sub_commands, &sub_inputs, depth + 1, graph);
+                } else {
+                    graph
+                        .unsupported_commands
+                        .push("execute_sub_plan:decode_failed".to_string());
+                }
+            }
+            0x10 | 0x40 => {
+                graph
+                    .unsupported_commands
+                    .push(universal_router_command_name(opcode).to_string());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn universal_router_v2_hops(
+    input: &[u8],
+    exact_out: bool,
+    depth: usize,
+) -> Vec<UniversalRouterHop> {
+    let decoded = match abi::decode(
+        &[
+            ParamType::Address,
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Array(Box::new(ParamType::Address)),
+            ParamType::Bool,
+        ],
+        input,
+    ) {
+        Ok(decoded) => decoded,
+        Err(_) => return Vec::new(),
+    };
+    let amount_primary = decoded.get(1).and_then(token_as_uint);
+    let amount_secondary = decoded.get(2).and_then(token_as_uint);
+    let path = match decoded.get(3).and_then(token_as_address_vec) {
+        Some(path) => path,
+        None => return Vec::new(),
+    };
+    path.windows(2)
+        .map(|tokens| UniversalRouterHop {
+            dex: "v2",
+            command: if exact_out {
+                "v2_exact_out"
+            } else {
+                "v2_exact_in"
+            },
+            token_in: tokens[0],
+            token_out: tokens[1],
+            amount_in: if exact_out {
+                amount_secondary
+            } else {
+                amount_primary
+            },
+            amount_out: if exact_out {
+                amount_primary
+            } else {
+                amount_secondary
+            },
+            fee_tier: None,
+            exact_out,
+            depth,
+        })
+        .collect()
+}
+
+fn universal_router_v3_hops(
+    input: &[u8],
+    exact_out: bool,
+    depth: usize,
+) -> Vec<UniversalRouterHop> {
+    let decoded = match abi::decode(
+        &[
+            ParamType::Address,
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Bytes,
+            ParamType::Bool,
+        ],
+        input,
+    ) {
+        Ok(decoded) => decoded,
+        Err(_) => return Vec::new(),
+    };
+    let amount_primary = decoded.get(1).and_then(token_as_uint);
+    let amount_secondary = decoded.get(2).and_then(token_as_uint);
+    let path = match decoded.get(3) {
+        Some(Token::Bytes(value)) => value.as_slice(),
+        _ => return Vec::new(),
+    };
+    let segments = parse_v3_path_segments(path);
+    if exact_out {
+        segments
+            .into_iter()
+            .rev()
+            .map(|segment| UniversalRouterHop {
+                dex: "v3",
+                command: "v3_exact_out",
+                token_in: segment.token_out,
+                token_out: segment.token_in,
+                amount_in: amount_secondary,
+                amount_out: amount_primary,
+                fee_tier: Some(segment.fee_tier),
+                exact_out,
+                depth,
+            })
+            .collect()
+    } else {
+        segments
+            .into_iter()
+            .map(|segment| UniversalRouterHop {
+                dex: "v3",
+                command: "v3_exact_in",
+                token_in: segment.token_in,
+                token_out: segment.token_out,
+                amount_in: amount_primary,
+                amount_out: amount_secondary,
+                fee_tier: Some(segment.fee_tier),
+                exact_out,
+                depth,
+            })
+            .collect()
+    }
+}
+
 fn universal_router_decode_hints(tx: &Transaction) -> Vec<String> {
     let Some(args) = tx.input.as_ref().get(4..) else {
         return vec!["decode: calldata shorter than selector".to_string()];
@@ -3783,7 +4094,7 @@ fn universal_router_decode_hints(tx: &Transaction) -> Vec<String> {
 
     let mut hints = Vec::new();
     for (idx, command) in commands.iter().copied().enumerate().take(8) {
-        let opcode = command & 0x3f;
+        let opcode = command & UNIVERSAL_ROUTER_COMMAND_MASK;
         let input = match inputs.get(idx) {
             Some(Token::Bytes(value)) => value.as_slice(),
             Some(_) => {
@@ -3838,9 +4149,59 @@ fn universal_router_command_name(opcode: u8) -> &'static str {
         0x0b => "wrap_eth",
         0x0c => "unwrap_weth",
         0x0d => "permit2_transfer_from_batch",
+        0x0e => "balance_check_erc20",
+        0x10 => "v4_swap",
         0x21 => "execute_sub_plan",
+        0x40 => "across_v4_deposit_v3",
         _ => "unknown",
     }
+}
+
+fn universal_router_graph_hop_rank(
+    graph: &UniversalRouterRouteGraph,
+    route_inefficiency_score: f64,
+) -> Vec<String> {
+    if graph.hops.is_empty() {
+        let mut rank = vec!["no executable v2/v3 hop extracted".to_string()];
+        for command in graph.unsupported_commands.iter().take(4) {
+            rank.push(format!("unsupported command: {command}"));
+        }
+        return rank;
+    }
+
+    let mut rank = graph
+        .hops
+        .iter()
+        .enumerate()
+        .map(|(idx, hop)| {
+            let amount = hop
+                .amount_in
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let fee = hop
+                .fee_tier
+                .map(|fee| format!(" fee={fee}"))
+                .unwrap_or_default();
+            let score = ((route_inefficiency_score * 100.0) + idx as f64 * 4.0).round() as u64;
+            format!(
+                "candidate_hop_{}: {} {} {:?}->{:?} amount_in={} score={} depth={}{} exact_out={}",
+                idx + 1,
+                hop.dex,
+                hop.command,
+                hop.token_in,
+                hop.token_out,
+                amount,
+                score,
+                hop.depth,
+                fee,
+                hop.exact_out
+            )
+        })
+        .collect::<Vec<_>>();
+    for command in graph.unsupported_commands.iter().take(3) {
+        rank.push(format!("unsupported command: {command}"));
+    }
+    rank
 }
 
 fn universal_router_v2_swap_status(input: &[u8], exact_out: bool) -> String {
@@ -4088,6 +4449,13 @@ struct ParsedV3Path {
     hops: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct V3PathSegment {
+    token_in: Address,
+    token_out: Address,
+    fee_tier: u32,
+}
+
 fn parse_v3_path(path: &[u8]) -> Option<ParsedV3Path> {
     if path.len() < 43 {
         return None;
@@ -4102,6 +4470,33 @@ fn parse_v3_path(path: &[u8]) -> Option<ParsedV3Path> {
         first_fee_tier,
         hops,
     })
+}
+
+fn parse_v3_path_segments(path: &[u8]) -> Vec<V3PathSegment> {
+    if path.len() < 43 {
+        return Vec::new();
+    }
+    let hop_count = (path.len().saturating_sub(20)) / 23;
+    let mut segments = Vec::with_capacity(hop_count);
+    for hop in 0..hop_count {
+        let token_in_offset = hop * 23;
+        let fee_offset = token_in_offset + 20;
+        let token_out_offset = fee_offset + 3;
+        if token_out_offset + 20 > path.len() {
+            break;
+        }
+        segments.push(V3PathSegment {
+            token_in: Address::from_slice(&path[token_in_offset..token_in_offset + 20]),
+            token_out: Address::from_slice(&path[token_out_offset..token_out_offset + 20]),
+            fee_tier: u32::from_be_bytes([
+                0,
+                path[fee_offset],
+                path[fee_offset + 1],
+                path[fee_offset + 2],
+            ]),
+        });
+    }
+    segments
 }
 
 fn parse_v3_exact_out_path(path: &[u8]) -> Option<ParsedV3Path> {
@@ -4318,6 +4713,45 @@ mod tests {
         assert_eq!(signal.amount_in, U256::from(2u64) * unit);
         assert_eq!(signal.path, vec![monitored_in, monitored_out]);
         assert_eq!(signal.notional_wei, U256::from(2u64) * unit);
+    }
+
+    #[test]
+    fn universal_router_graph_extracts_hop_candidates() {
+        let token_a = Address::from_low_u64_be(1);
+        let token_b = Address::from_low_u64_be(2);
+        let token_c = Address::from_low_u64_be(3);
+        let v3_path = [
+            encode_v3_path(token_a, 500, token_b).to_vec(),
+            vec![0x00, 0x0b, 0xb8],
+            token_c.as_bytes().to_vec(),
+        ]
+        .concat();
+        let swap_input = encode(&[
+            Token::Address(Address::from_low_u64_be(99)),
+            Token::Uint(U256::from(25u64)),
+            Token::Uint(U256::from(20u64)),
+            Token::Bytes(v3_path),
+            Token::Bool(true),
+        ]);
+        let args = encode(&[
+            Token::Bytes(vec![0x00, 0x10]),
+            Token::Array(vec![Token::Bytes(swap_input), Token::Bytes(vec![0u8; 32])]),
+        ]);
+
+        let graph = universal_router_route_graph(&args).unwrap();
+
+        assert_eq!(graph.swap_command_count, 1);
+        assert_eq!(graph.hops.len(), 2);
+        assert_eq!(graph.hops[0].token_in, token_a);
+        assert_eq!(graph.hops[0].token_out, token_b);
+        assert_eq!(graph.hops[0].fee_tier, Some(500));
+        assert_eq!(graph.hops[1].token_in, token_b);
+        assert_eq!(graph.hops[1].token_out, token_c);
+        assert_eq!(graph.hops[1].fee_tier, Some(3000));
+        assert!(graph
+            .unsupported_commands
+            .iter()
+            .any(|cmd| cmd == "v4_swap"));
     }
 }
 
