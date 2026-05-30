@@ -781,6 +781,12 @@ fn parse_mempool_ws_urls(
             "MEMPOOL_WS_URL_BSC",
             "MEMPOOL_WS_URL_BNB",
             "MEMPOOL_WS_URL_POLYGON",
+            "MEMPOOL_WS_URL_POLYGON_2",
+            "MEMPOOL_WS_URL_POLYGON_3",
+            "MEMPOOL_WS_URL_POLYGON_4",
+            "MEMPOOL_WS_URL_POLYGON2",
+            "MEMPOOL_WS_URL_POLYGON3",
+            "MEMPOOL_WS_URL_POLYGON4",
         ],
     ) {
         if let Ok(value) = env::var(key) {
@@ -1189,7 +1195,7 @@ fn prioritized_network_keys<'a>(network: &str, keys: &'a [&'a str]) -> Vec<&'a s
 
     for suffix in suffixes {
         for key in keys {
-            if key.ends_with(suffix) && !prioritized.contains(key) {
+            if key.contains(suffix) && !prioritized.contains(key) {
                 prioritized.push(*key);
             }
         }
