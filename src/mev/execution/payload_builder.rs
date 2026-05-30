@@ -1030,8 +1030,7 @@ mod tests {
             flashbots_relay: String::new(),
             builder_relays: Vec::new(),
             executor_private_key:
-                "0x59c6995e998f97a5a0044966f0945382d7a7d4f6d8f1f0db6b90e6a2f17d5f52"
-                    .to_string(),
+                "0x59c6995e998f97a5a0044966f0945382d7a7d4f6d8f1f0db6b90e6a2f17d5f52".to_string(),
             executor_address: Address::from_low_u64_be(10),
             vault_address: Address::from_low_u64_be(11),
             profit_address: Address::from_low_u64_be(12),

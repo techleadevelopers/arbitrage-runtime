@@ -1093,6 +1093,14 @@ impl DashboardHandle {
         while state.edge_telemetry.samples.len() > 50 {
             state.edge_telemetry.samples.pop_back();
         }
+        let sample_count = state.edge_telemetry.sample_count;
+        if sample_count <= 3 || sample_count % 25 == 0 {
+            push_event(
+                &mut state.recent_events,
+                "info",
+                format!("edge telemetry sample recorded count={sample_count}"),
+            );
+        }
     }
 
     pub fn set_relay_rankings(&self, relays: Vec<RelaySnapshot>) {

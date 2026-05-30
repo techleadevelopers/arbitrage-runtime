@@ -838,12 +838,9 @@ async fn process_lookup_decode_task(
         dashboard.record_opportunity_funnel("decode_reject");
         if let Some(name) = aggregator_name_from_tx(&tx) {
             dashboard.record_reject_reason("aggregator_decode", name);
-            dashboard.record_edge_sample(aggregator_intelligence_sample(
-                &config,
-                &tx,
-                task.tx_hash,
-                name,
-            ));
+            if let Some(sample) = aggregator_intelligence_sample(&config, &tx, task.tx_hash, name) {
+                dashboard.record_edge_sample(sample);
+            }
             dashboard.event(
                 "warn",
                 format!(
@@ -861,6 +858,11 @@ async fn process_lookup_decode_task(
             );
         } else {
             dashboard.record_reject_reason("decode", "not_relevant_or_below_min");
+            if let Some(sample) =
+                decode_reject_edge_sample(&config, &tx, task.tx_hash, "not_relevant_or_below_min")
+            {
+                dashboard.record_edge_sample(sample);
+            }
             latency_trace.emit(
                 &config,
                 &dashboard,
@@ -3113,9 +3115,12 @@ fn aggregator_intelligence_sample(
     tx: &Transaction,
     tx_hash: H256,
     source: &str,
-) -> EdgeMetadata {
+) -> Option<EdgeMetadata> {
     let selector = selector(tx).unwrap_or([0, 0, 0, 0]);
     let intel = aggregator_route_intel(config, tx, source);
+    if source == "universal_router" && intel.swap_command_count == 0 {
+        return None;
+    }
     let decode_hints = if source == "universal_router" {
         universal_router_decode_hints(tx)
     } else {
@@ -3129,7 +3134,7 @@ fn aggregator_intelligence_sample(
             decode_hints.join(" | ")
         )
     };
-    EdgeMetadata {
+    Some(EdgeMetadata {
         victim_tx: short_hash(tx_hash),
         selector: format!(
             "0x{:02x}{:02x}{:02x}{:02x}",
@@ -3175,7 +3180,62 @@ fn aggregator_intelligence_sample(
             .unwrap_or_else(|| "unknown".to_string()),
         token_in: "unknown".to_string(),
         token_out: "unknown".to_string(),
+    })
+}
+
+fn decode_reject_edge_sample(
+    config: &Config,
+    tx: &Transaction,
+    tx_hash: H256,
+    reason: &str,
+) -> Option<EdgeMetadata> {
+    let selector = selector(tx)?;
+    let path_hint = monitored_token_path_hint(config, tx.input.as_ref());
+    if path_hint.is_empty() {
+        return None;
     }
+    Some(EdgeMetadata {
+        victim_tx: short_hash(tx_hash),
+        selector: format!(
+            "0x{:02x}{:02x}{:02x}{:02x}",
+            selector[0], selector[1], selector[2], selector[3]
+        ),
+        status: "decode_reject".to_string(),
+        reason: reason.to_string(),
+        route_kind: "unknown".to_string(),
+        path: path_hint,
+        hops: 0,
+        impacted_pools: Vec::new(),
+        slippage_window_score: 0.0,
+        pool_imbalance_score: 0.0,
+        cross_dex_deviation_bps: 0,
+        gas_estimate: tx.gas.as_u64(),
+        simulated_extraction_native: 0.0,
+        aggregator_type: "unknown".to_string(),
+        route_complexity: (tx.input.as_ref().len().saturating_sub(4) / 128).max(1) as u64,
+        split_ratio_bps: 0,
+        dex_sequence: vec!["decode_reject".to_string()],
+        route_inefficiency_score: 0.0,
+        liquidity_distortion_score: 0.0,
+        hop_profitability_rank: vec!["decode rejected after monitored token hint".to_string()],
+        best_size_bps: 0,
+        amount_in_wei: tx.value.to_string(),
+        amount_out_wei: "0".to_string(),
+        gross_edge_wei: "0".to_string(),
+        gross_edge_native: 0.0,
+        repayment_wei: "0".to_string(),
+        repayment_native: 0.0,
+        price_impact_bps: 0,
+        self_slippage_bps: 0,
+        pool: "unknown".to_string(),
+        factory: "unknown".to_string(),
+        router: tx
+            .to
+            .map(|address| format!("{address:?}"))
+            .unwrap_or_else(|| "unknown".to_string()),
+        token_in: "unknown".to_string(),
+        token_out: "unknown".to_string(),
+    })
 }
 
 fn aggregator_route_intel(config: &Config, tx: &Transaction, source: &str) -> AggregatorRouteIntel {
@@ -3360,7 +3420,10 @@ fn universal_router_decode_hints(tx: &Transaction) -> Vec<String> {
         ));
     }
     if commands.len() > 8 {
-        hints.push(format!("{} additional commands omitted", commands.len() - 8));
+        hints.push(format!(
+            "{} additional commands omitted",
+            commands.len() - 8
+        ));
     }
     hints
 }
@@ -3463,7 +3526,10 @@ fn universal_router_v3_exact_out_status(input: &[u8]) -> String {
                     parsed.first_fee_tier,
                     path.len()
                 ),
-                Some(parsed) => format!("decoded but unsupported multi_hop_exact_out hops={}", parsed.hops),
+                Some(parsed) => format!(
+                    "decoded but unsupported multi_hop_exact_out hops={}",
+                    parsed.hops
+                ),
                 None => format!("invalid v3 path {}b", path.len()),
             }
         }
