@@ -42,7 +42,8 @@ impl Storage {
                             return Ok(Self {
                                 backend: StorageBackend::Postgres(pool),
                                 network: network.to_string(),
-                            });
+                            }
+                            .with_runtime_prune());
                         }
                         Err(err) if postgres_storage_required() => return Err(err),
                         Err(err) => {
@@ -180,7 +181,15 @@ impl Storage {
         Ok(Self {
             backend: StorageBackend::Sqlite(Arc::new(Mutex::new(conn))),
             network: network.to_string(),
-        })
+        }
+        .with_runtime_prune())
+    }
+
+    fn with_runtime_prune(self) -> Self {
+        if let Err(err) = self.prune_runtime_tables() {
+            warn!("storage runtime prune skipped: {}", err);
+        }
+        self
     }
 
     async fn migrate_postgres(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> {
@@ -331,6 +340,45 @@ impl Storage {
             }
             StorageBackend::Postgres(pool) => {
                 Self::wait(sqlx::query("DELETE FROM events").execute(pool))?;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn prune_runtime_tables(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let events_cutoff = (Utc::now()
+            - chrono::Duration::hours(runtime_retention_hours(
+                "STORAGE_EVENTS_RETENTION_HOURS",
+                24,
+            )))
+        .to_rfc3339();
+        let telemetry_cutoff = (Utc::now()
+            - chrono::Duration::hours(runtime_retention_hours(
+                "STORAGE_TELEMETRY_RETENTION_HOURS",
+                6,
+            )))
+        .to_rfc3339();
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                let conn = conn.lock().map_err(|_| "storage lock poisoned")?;
+                conn.execute("DELETE FROM events WHERE at < ?1", [events_cutoff.as_str()])?;
+                conn.execute(
+                    "DELETE FROM telemetry WHERE at < ?1",
+                    [telemetry_cutoff.as_str()],
+                )?;
+                Ok(())
+            }
+            StorageBackend::Postgres(pool) => {
+                Self::wait(
+                    sqlx::query("DELETE FROM events WHERE at < $1")
+                        .bind(events_cutoff)
+                        .execute(pool),
+                )?;
+                Self::wait(
+                    sqlx::query("DELETE FROM telemetry WHERE at < $1")
+                        .bind(telemetry_cutoff)
+                        .execute(pool),
+                )?;
                 Ok(())
             }
         }
@@ -1596,6 +1644,14 @@ fn postgres_storage_required() -> bool {
         .unwrap_or_else(|_| "false".to_string())
         .trim()
         .eq_ignore_ascii_case("true")
+}
+
+fn runtime_retention_hours(env_name: &str, default_hours: i64) -> i64 {
+    env::var(env_name)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(default_hours)
+        .clamp(1, 24 * 30)
 }
 
 #[derive(Debug, Clone, Serialize)]

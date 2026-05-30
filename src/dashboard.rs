@@ -27,6 +27,7 @@ pub struct DashboardHandle {
     runtime_paused: Arc<AtomicBool>,
     pending: Arc<Mutex<PendingStorageWrites>>,
     observer: Arc<Mutex<ScavengerObserver>>,
+    last_storage_prune: Arc<Mutex<Instant>>,
 }
 
 #[derive(Default)]
@@ -828,6 +829,11 @@ impl DashboardHandle {
             runtime_paused: Arc::new(AtomicBool::new(false)),
             pending: Arc::new(Mutex::new(PendingStorageWrites::default())),
             observer: Arc::new(Mutex::new(ScavengerObserver::default())),
+            last_storage_prune: Arc::new(Mutex::new(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(120))
+                    .unwrap_or_else(Instant::now),
+            )),
         }
     }
 
@@ -1261,6 +1267,15 @@ impl DashboardHandle {
                 relay.accept_rate,
                 relay.inclusion_rate,
             );
+        }
+
+        if let Ok(mut last_prune) = self.last_storage_prune.lock() {
+            if last_prune.elapsed() >= Duration::from_secs(60) {
+                if let Err(err) = self.storage.prune_runtime_tables() {
+                    tracing::warn!("storage runtime prune failed: {}", err);
+                }
+                *last_prune = Instant::now();
+            }
         }
 
         for treasury in pending.treasury_updates {

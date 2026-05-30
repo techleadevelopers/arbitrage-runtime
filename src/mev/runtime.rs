@@ -882,7 +882,7 @@ async fn process_lookup_decode_task(
                 aggregator_intelligence_sample(&config, &tx, task.tx_hash, name)
             {
                 sample.status = "decode_reject".to_string();
-                sample.reason = decode_reject.detail.clone();
+                sample.reason = format!("{} {}", decode_reject.reason, decode_reject.detail);
                 if !decode_reject.hints.is_empty() {
                     sample.hop_profitability_rank = decode_reject.hints.clone();
                 }
@@ -4691,7 +4691,7 @@ fn decode_reject_edge_sample(
             selector[0], selector[1], selector[2], selector[3]
         ),
         status: "decode_reject".to_string(),
-        reason: diagnostic.detail.clone(),
+        reason: format!("{} {}", diagnostic.reason, diagnostic.detail),
         route_kind: "unknown".to_string(),
         path: path_hint,
         hops: 0,
