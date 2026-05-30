@@ -58,6 +58,7 @@ const PARASWAP_SIMPLE_SWAP: [u8; 4] = [0x54, 0xe3, 0xf3, 0x1b];
 const ODOS_SWAP_COMPACT: [u8; 4] = [0x83, 0xbd, 0x37, 0xf9];
 const KYBER_SWAP: [u8; 4] = [0x3f, 0x2d, 0x5c, 0xf5];
 const SAFE_EXEC_TRANSACTION: [u8; 4] = [0x6a, 0x76, 0x12, 0x02];
+// const TRANSIT_SWAP_V5: [u8; 4] = [0x??, 0x??, 0x??, 0x??]; // Pegue o selector do log - DESABILITADO
 
 #[derive(Debug, Clone)]
 pub(crate) enum SwapKind {
@@ -717,10 +718,22 @@ fn connect_mempool_fan_in(
                     }
                     Err(err) => {
                         reconnect_failures = reconnect_failures.saturating_add(1);
+                        let capacity_exhausted = is_provider_capacity_exhausted(&err.to_string());
                         dashboard.event(
                             "warn",
                             format!("mempool ws connect failed {}: {}", ws_url, err),
                         );
+                        if capacity_exhausted {
+                            dashboard.event(
+                                "warn",
+                                format!(
+                                    "mempool ws provider capacity exhausted; long backoff {}",
+                                    ws_url
+                                ),
+                            );
+                            tokio::time::sleep(Duration::from_secs(30 * 60)).await;
+                            continue;
+                        }
                     }
                 }
                 let delay = mempool_ws_reconnect_delay(&ws_url, reconnect_failures);
@@ -740,6 +753,14 @@ fn connect_mempool_fan_in(
         });
     }
     rx
+}
+
+fn is_provider_capacity_exhausted(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("monthly capacity limit exceeded")
+        || lower.contains("capacity limit exceeded")
+        || lower.contains("quota exceeded")
+        || lower.contains("billing")
 }
 
 fn mempool_ws_reconnect_delay(ws_url: &str, failures: u32) -> Duration {
@@ -4515,8 +4536,13 @@ fn diagnose_decode_reject(
     }
 
     if !supported_selector {
+        let unsupported_reason = if tx.to.and_then(known_target_label) == Some("entrypoint_v0_8") {
+            "account_abstraction_noise"
+        } else {
+            "selector_unsupported"
+        };
         return DecodeRejectDiagnostic {
-            reason: "selector_unsupported",
+            reason: unsupported_reason,
             detail: format!(
                 "tx={} selector={} to={} monitored_token_hint={} input_bytes={}",
                 short_hash(tx_hash),
@@ -4529,10 +4555,17 @@ fn diagnose_decode_reject(
                 },
                 tx.input.as_ref().len()
             ),
-            hints: vec![format!(
-                "unsupported selector {selector_text} target={}",
-                format_target(tx.to)
-            )],
+            hints: vec![if unsupported_reason == "account_abstraction_noise" {
+                format!(
+                    "account abstraction entrypoint selector {selector_text} target={}",
+                    format_target(tx.to)
+                )
+            } else {
+                format!(
+                    "unsupported selector {selector_text} target={}",
+                    format_target(tx.to)
+                )
+            }],
         };
     }
 

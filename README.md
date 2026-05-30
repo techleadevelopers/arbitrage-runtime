@@ -1274,6 +1274,7 @@ Unsupported selector telemetry also annotates known high-frequency targets when 
 - `RPC_URL_4`
 - `RPC_URL_BSC`
 - `RPC_URL_POLYGON`
+- `GETBLOCK_BNB_FOR_POLYGON`
 - `ALCHEMY_KEY`
 - `FLASHBOTS_RELAY`
 - `BUILDER_RELAYS`
@@ -1281,6 +1282,8 @@ Unsupported selector telemetry also annotates known high-frequency targets when 
 - `RPC_SEND_PREFERENCE`
 - `MEV_PENDING_LOOKUP_FANOUT`
 - `MEV_PENDING_LOOKUP_MAX_PER_SEC`
+
+`GETBLOCK_BNB_FOR_POLYGON=true` allows the runtime to reuse `GETBLOCK_BNB` / `GETBLOCK_RPC_URL_BNB` as an additional Polygon read RPC candidate. This is only a transport fallback; it does not create a Polygon mempool websocket. If Alchemy websocket quota is exhausted and no explicit `MEMPOOL_WS_URL_POLYGON` is available, set `MEMPOOL_WS_DISABLE_DEFAULT_ALCHEMY=true` to stop the automatic Alchemy WS fallback and avoid repeated `429` reconnects.
 - `MEV_LOOKUP_DECODE_WORKERS`
 - `MEV_EVAL_WORKERS`
 - `MEV_BLOCK_LOOKUP_FANOUT`

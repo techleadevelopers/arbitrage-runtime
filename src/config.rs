@@ -800,7 +800,11 @@ fn parse_mempool_ws_urls(
         }
     }
 
-    if urls.is_empty() && !tenderly_rpc_only && supports_default_alchemy_mempool_ws(network) {
+    if urls.is_empty()
+        && !tenderly_rpc_only
+        && supports_default_alchemy_mempool_ws(network)
+        && !env_flag("MEMPOOL_WS_DISABLE_DEFAULT_ALCHEMY")
+    {
         for (_, key) in alchemy_keys {
             if let Some(ws_url) = alchemy_ws_url_for_network(network, key) {
                 urls.push(ws_url);
@@ -858,7 +862,45 @@ fn parse_rpc_urls(network: &str) -> Vec<(String, String)> {
         ],
         &mut urls,
     );
+    push_polygon_getblock_bnb_alias(network, &mut urls);
     urls
+}
+
+fn push_polygon_getblock_bnb_alias(network: &str, urls: &mut Vec<(String, String)>) {
+    if network != "polygon" || !env_flag("GETBLOCK_BNB_FOR_POLYGON") {
+        return;
+    }
+    for key in [
+        "GETBLOCK_BNB",
+        "GETBLOCK_BSC",
+        "GETBLOCK_RPC_URL_BNB",
+        "GETBLOCK_RPC_URL_BSC",
+    ] {
+        let Ok(value) = env::var(key) else {
+            continue;
+        };
+        for item in value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if urls
+                .iter()
+                .any(|(_, existing)| existing.eq_ignore_ascii_case(item))
+            {
+                continue;
+            }
+            let label_index = urls
+                .iter()
+                .filter(|(name, _)| name.starts_with("getblock"))
+                .count()
+                + 1;
+            urls.push((
+                format!("getblock-polygon-bnb-alias-{label_index}"),
+                item.to_string(),
+            ));
+        }
+    }
 }
 
 fn push_rpc_url_entries(

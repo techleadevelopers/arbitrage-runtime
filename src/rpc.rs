@@ -35,6 +35,7 @@ impl RpcKind {
 pub enum RpcFailureKind {
     Timeout,
     RateLimited,
+    CapacityExhausted,
     Stale,
     Transport,
     Remote,
@@ -291,6 +292,15 @@ impl RpcFleet {
                 state.rate_limit_failures = state.rate_limit_failures.saturating_add(1);
                 Duration::from_secs((2u64.saturating_pow(state.rate_limit_failures.min(4))) * 2)
             }
+            RpcFailureKind::CapacityExhausted => {
+                state.rate_limit_failures = state.rate_limit_failures.saturating_add(10);
+                state.disabled = true;
+                state.disabled_reason = Some(
+                    "provider monthly capacity exhausted; rotate key or re-enable manually"
+                        .to_string(),
+                );
+                Duration::from_secs(24 * 60 * 60)
+            }
             RpcFailureKind::Timeout => {
                 state.timeout_failures = state.timeout_failures.saturating_add(1);
                 Duration::from_millis(
@@ -315,7 +325,13 @@ impl RpcFleet {
 
     pub fn classify_failure(error: &str) -> RpcFailureKind {
         let lower = error.to_ascii_lowercase();
-        if lower.contains("429")
+        if lower.contains("monthly capacity limit exceeded")
+            || lower.contains("capacity limit exceeded")
+            || lower.contains("quota exceeded")
+            || lower.contains("billing")
+        {
+            RpcFailureKind::CapacityExhausted
+        } else if lower.contains("429")
             || lower.contains("rate limit")
             || lower.contains("too many requests")
             || lower.contains("throughput limit")
