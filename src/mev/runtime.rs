@@ -1091,12 +1091,20 @@ fn effective_pending_lookup_budget(config: &Config, pressure: RpcLookupPressure)
     let configured = std::env::var("MEV_PENDING_LOOKUP_MAX_PER_SEC")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok());
-    let base = configured.unwrap_or_else(|| match config.mev.opportunity_mode() {
+    effective_pending_lookup_budget_for_mode(config.mev.opportunity_mode(), configured, pressure)
+}
+
+fn effective_pending_lookup_budget_for_mode(
+    mode: OpportunityMode,
+    configured: Option<u64>,
+    pressure: RpcLookupPressure,
+) -> u64 {
+    let base = configured.unwrap_or_else(|| match mode {
         OpportunityMode::Conservative => 60,
         OpportunityMode::Aggressive => 90,
         OpportunityMode::Scavenger => 25,
     });
-    let healthy_reader_cap = match config.mev.opportunity_mode() {
+    let healthy_reader_cap = match mode {
         OpportunityMode::Scavenger => pressure.available_readers.max(1) as u64 * 25,
         OpportunityMode::Aggressive => pressure.available_readers.max(1) as u64 * 60,
         OpportunityMode::Conservative => pressure.available_readers.max(1) as u64 * 40,
@@ -4709,6 +4717,36 @@ mod tests {
 
         assert!(cap < 950.0);
         assert!(cap >= 350.0);
+    }
+
+    #[test]
+    fn configured_pending_lookup_budget_holds_when_rpc_is_healthy() {
+        let budget = effective_pending_lookup_budget_for_mode(
+            OpportunityMode::Scavenger,
+            Some(85),
+            RpcLookupPressure {
+                available_readers: 1,
+                rate_limited_readers: 0,
+                failing_readers: 0,
+            },
+        );
+
+        assert_eq!(budget, 85);
+    }
+
+    #[test]
+    fn configured_pending_lookup_budget_backs_off_under_rpc_pressure() {
+        let budget = effective_pending_lookup_budget_for_mode(
+            OpportunityMode::Scavenger,
+            Some(85),
+            RpcLookupPressure {
+                available_readers: 0,
+                rate_limited_readers: 1,
+                failing_readers: 1,
+            },
+        );
+
+        assert_eq!(budget, 4);
     }
 
     #[test]
