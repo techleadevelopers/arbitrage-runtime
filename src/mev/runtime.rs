@@ -2953,7 +2953,8 @@ pub(crate) fn decode_relevant_swap(
             }
         }
         UNIVERSAL_ROUTER_EXECUTE | UNIVERSAL_ROUTER_EXECUTE_NO_DEADLINE => {
-            decode_universal_router_swap(selector, router, args)?
+            decode_universal_router_swap_for_monitored(selector, router, args, monitored_tokens)
+                .or_else(|| decode_universal_router_swap(selector, router, args))?
         }
         ZERO_EX_SELL_TO_UNISWAP => decode_zero_ex_sell_to_uniswap(selector, router, args)?,
         _ => return None,
@@ -2975,7 +2976,34 @@ fn decode_universal_router_swap(
     router: Address,
     args: &[u8],
 ) -> Option<SwapSignal> {
-    let decoded = abi::decode(
+    decode_universal_router_swap_candidates(selector, router, args)
+        .into_iter()
+        .next()
+}
+
+fn decode_universal_router_swap_for_monitored(
+    selector: [u8; 4],
+    router: Address,
+    args: &[u8],
+    monitored_tokens: &[MonitoredTokenConfig],
+) -> Option<SwapSignal> {
+    decode_universal_router_swap_candidates(selector, router, args)
+        .into_iter()
+        .filter_map(|mut signal| {
+            let notional_wei = estimate_notional_wei(&signal, monitored_tokens)?;
+            signal.notional_wei = notional_wei;
+            Some((notional_wei, signal))
+        })
+        .max_by_key(|(notional_wei, _)| *notional_wei)
+        .map(|(_, signal)| signal)
+}
+
+fn decode_universal_router_swap_candidates(
+    selector: [u8; 4],
+    router: Address,
+    args: &[u8],
+) -> Vec<SwapSignal> {
+    let decoded = match abi::decode(
         &[
             ParamType::Bytes,
             ParamType::Array(Box::new(ParamType::Bytes)),
@@ -2991,49 +3019,99 @@ fn decode_universal_router_swap(
             ],
             args,
         )
-    })
-    .ok()?;
-    let commands = match decoded.first()? {
-        Token::Bytes(value) => value,
-        _ => return None,
+    }) {
+        Ok(decoded) => decoded,
+        Err(_) => return Vec::new(),
     };
-    let inputs = match decoded.get(1)? {
-        Token::Array(values) => values,
-        _ => return None,
+    let commands = match decoded.first() {
+        Some(Token::Bytes(value)) => value,
+        _ => return Vec::new(),
+    };
+    let inputs = match decoded.get(1) {
+        Some(Token::Array(values)) => values,
+        _ => return Vec::new(),
     };
 
-    for (idx, command) in commands.iter().enumerate() {
-        let input = match inputs.get(idx)? {
-            Token::Bytes(value) => value.as_slice(),
-            _ => continue,
+    decode_universal_router_parts(selector, router, commands, inputs, 0)
+}
+
+fn decode_universal_router_parts(
+    selector: [u8; 4],
+    router: Address,
+    commands: &[u8],
+    inputs: &[Token],
+    depth: usize,
+) -> Vec<SwapSignal> {
+    if depth > 3 {
+        return Vec::new();
+    }
+
+    let mut signals = Vec::new();
+    for (idx, command) in commands.iter().copied().enumerate() {
+        let input = match inputs.get(idx) {
+            Some(Token::Bytes(value)) => value.as_slice(),
+            Some(_) => continue,
+            None => break,
         };
-        match command & 0x1f {
+        match command & 0x3f {
             0x00 => {
                 if let Some(signal) = decode_universal_router_v3_exact_in(selector, router, input) {
-                    return Some(signal);
+                    signals.push(signal);
                 }
             }
             0x01 => {
                 if let Some(signal) = decode_universal_router_v3_exact_out(selector, router, input)
                 {
-                    return Some(signal);
+                    signals.push(signal);
                 }
             }
             0x08 => {
                 if let Some(signal) = decode_universal_router_v2_exact_in(selector, router, input) {
-                    return Some(signal);
+                    signals.push(signal);
                 }
             }
             0x09 => {
                 if let Some(signal) = decode_universal_router_v2_exact_out(selector, router, input)
                 {
-                    return Some(signal);
+                    signals.push(signal);
+                }
+            }
+            0x21 => {
+                if let Some((sub_commands, sub_inputs)) = decode_universal_router_sub_plan(input) {
+                    signals.extend(decode_universal_router_parts(
+                        selector,
+                        router,
+                        &sub_commands,
+                        &sub_inputs,
+                        depth + 1,
+                    ));
                 }
             }
             _ => {}
         }
     }
-    None
+    signals
+}
+
+fn decode_universal_router_sub_plan(input: &[u8]) -> Option<(Vec<u8>, Vec<Token>)> {
+    let decoded = abi::decode(
+        &[
+            ParamType::Bytes,
+            ParamType::Array(Box::new(ParamType::Bytes)),
+        ],
+        input,
+    )
+    .ok()?;
+    let commands = match decoded.first()? {
+        Token::Bytes(value) => value,
+        _ => return None,
+    }
+    .clone();
+    let inputs = match decoded.get(1)? {
+        Token::Array(values) => values.clone(),
+        _ => return None,
+    };
+    Some((commands, inputs))
 }
 
 fn decode_universal_router_v2_exact_in(
@@ -3467,7 +3545,7 @@ fn universal_router_intel(tx: &Transaction) -> Option<AggregatorRouteIntel> {
     let mut wraps = 0u64;
     let mut permit2 = 0u64;
     for command in commands {
-        let opcode = command & 0x1f;
+        let opcode = command & 0x3f;
         match opcode {
             0x00 => {
                 swap_command_count += 1;
@@ -3556,7 +3634,7 @@ fn universal_router_decode_hints(tx: &Transaction) -> Vec<String> {
 
     let mut hints = Vec::new();
     for (idx, command) in commands.iter().copied().enumerate().take(8) {
-        let opcode = command & 0x1f;
+        let opcode = command & 0x3f;
         let input = match inputs.get(idx) {
             Some(Token::Bytes(value)) => value.as_slice(),
             Some(_) => {
@@ -3611,6 +3689,7 @@ fn universal_router_command_name(opcode: u8) -> &'static str {
         0x0b => "wrap_eth",
         0x0c => "unwrap_weth",
         0x0d => "permit2_transfer_from_batch",
+        0x21 => "execute_sub_plan",
         _ => "unknown",
     }
 }
@@ -4007,6 +4086,86 @@ mod tests {
             }
             _ => panic!("expected v3 signal"),
         }
+    }
+
+    #[test]
+    fn universal_router_decodes_swap_inside_subplan() {
+        let router = Address::from_low_u64_be(10);
+        let token_in = Address::from_low_u64_be(1);
+        let token_out = Address::from_low_u64_be(2);
+        let swap_input = encode(&[
+            Token::Address(Address::from_low_u64_be(99)),
+            Token::Uint(U256::from(25u64)),
+            Token::Uint(U256::from(20u64)),
+            Token::Array(vec![Token::Address(token_in), Token::Address(token_out)]),
+            Token::Bool(true),
+        ]);
+        let subplan = encode(&[
+            Token::Bytes(vec![0x08]),
+            Token::Array(vec![Token::Bytes(swap_input)]),
+        ]);
+        let args = encode(&[
+            Token::Bytes(vec![0x21]),
+            Token::Array(vec![Token::Bytes(subplan)]),
+        ]);
+
+        let signal = decode_universal_router_swap(UNIVERSAL_ROUTER_EXECUTE, router, &args).unwrap();
+
+        assert_eq!(signal.amount_in, U256::from(25u64));
+        assert_eq!(signal.amount_out_min, Some(U256::from(20u64)));
+        assert_eq!(signal.path, vec![token_in, token_out]);
+        assert!(matches!(signal.kind, SwapKind::V2));
+    }
+
+    #[test]
+    fn universal_router_prefers_monitored_swap_candidate() {
+        let router = Address::from_low_u64_be(10);
+        let unmonitored_in = Address::from_low_u64_be(1);
+        let unmonitored_out = Address::from_low_u64_be(2);
+        let monitored_in = Address::from_low_u64_be(3);
+        let monitored_out = Address::from_low_u64_be(4);
+        let unit = U256::exp10(18);
+        let unmonitored_input = encode(&[
+            Token::Address(Address::from_low_u64_be(99)),
+            Token::Uint(U256::from(100u64) * unit),
+            Token::Uint(U256::from(90u64)),
+            Token::Array(vec![
+                Token::Address(unmonitored_in),
+                Token::Address(unmonitored_out),
+            ]),
+            Token::Bool(true),
+        ]);
+        let monitored_input = encode(&[
+            Token::Address(Address::from_low_u64_be(99)),
+            Token::Uint(U256::from(2u64) * unit),
+            Token::Uint(U256::from(1u64)),
+            Token::Array(vec![Token::Address(monitored_in), Token::Address(monitored_out)]),
+            Token::Bool(true),
+        ]);
+        let args = encode(&[
+            Token::Bytes(vec![0x08, 0x88]),
+            Token::Array(vec![
+                Token::Bytes(unmonitored_input),
+                Token::Bytes(monitored_input),
+            ]),
+        ]);
+        let monitored = vec![MonitoredTokenConfig {
+            address: monitored_in,
+            decimals: 18,
+            price_eth: 1.0,
+        }];
+
+        let signal = decode_universal_router_swap_for_monitored(
+            UNIVERSAL_ROUTER_EXECUTE,
+            router,
+            &args,
+            &monitored,
+        )
+        .unwrap();
+
+        assert_eq!(signal.amount_in, U256::from(2u64) * unit);
+        assert_eq!(signal.path, vec![monitored_in, monitored_out]);
+        assert_eq!(signal.notional_wei, U256::from(2u64) * unit);
     }
 }
 
