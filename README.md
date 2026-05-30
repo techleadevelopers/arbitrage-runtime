@@ -24,10 +24,13 @@ This snapshot includes the latest Polygon runtime hardening work:
 - **V3-only executor contract:** `contracts/ArbitrageRuntimeExecutorV3.sol` was added so V3 can be deployed separately from the already-working V2 executor and avoid combined-contract size pressure.
 - **Polygon V2/V3 contract setup:** runtime expects QuickSwap V2 router/factory for V2 and Uniswap V3 SwapRouter/factory for V3.
 - **Executor allowlists:** V2 requires allowed operator, router, borrow tokens, and V2 pairs; V3 requires allowed operator, router, borrow tokens, V3 pools, and fee tiers.
-- **Universal Router improvements:** the decoder now handles direct V2/V3 commands, `execute_sub_plan`, multi-swap candidate ranking, monitored-token preference, and route-graph fallback into hop-level candidates.
+- **Universal Router improvements:** the decoder now handles direct V2/V3 commands, `execute_sub_plan`, nested subplan inspection, multi-swap candidate ranking, monitored-token preference, and route-graph fallback into hop-level candidates.
 - **Executable router normalization:** Universal Router victim flow is decoded as signal source, but payload execution uses the canonical V2/V3 routers instead of trying to execute through the victim's Universal Router.
 - **Two-lane candidate handling:** post-lookup quick decode classifies small, medium, large, and universal candidates so tiny scavenger flow can be throttled without discarding medium/large flow.
-- **Adaptive gas cap curve:** positive `ev_upper` now raises the adaptive gas cap more aggressively near the configured hard cap; `ev_upper >= 0.14` can reach `98%` of `MEV_MAX_GAS_PRICE_GWEI_*`.
+- **Adaptive gas cap curve:** positive `ev_upper` now raises the adaptive gas cap more aggressively near the configured hard cap; `ev_upper >= 0.02` can reach `95%` and `ev_upper >= 0.14` can reach `98%` of `MEV_MAX_GAS_PRICE_GWEI_*`.
+- **Decode reject telemetry:** decode failures are split into actionable reasons such as unsupported selector, unsupported Universal Router command, failed subplan extraction, invalid monitored-token path, and amount below the active minimum.
+- **Payload reject telemetry:** payload failures now emit structured `payload_build_detail` categories and edge samples with amount, repayment, gross edge, gas/pool hints, route kind, fee tier, and path.
+- **RPC pressure-aware lookup budget:** an explicit `MEV_PENDING_LOOKUP_MAX_PER_SEC` remains honored when the RPC fleet is healthy, but the runtime now backs off during rate-limit/failure pressure instead of holding the configured rate blindly.
 - **Historical profile refresh:** profile refresh moved out of the hot path into a background refresher.
 - **Factory/env cleanup:** Polygon deployments should set `MEV_UNISWAP_V2_FACTORY`, `MEV_UNISWAP_V3_FACTORY`, `MEV_EXECUTOR_ADDRESS`, and `MEV_EXECUTOR_V3_ADDRESS` explicitly.
 
@@ -1237,10 +1240,13 @@ For BNB Chain configuration, use the `_BSC` suffix as the canonical operator-fac
 - `RPC_READ_PREFERENCE`
 - `RPC_SEND_PREFERENCE`
 - `MEV_PENDING_LOOKUP_FANOUT`
+- `MEV_PENDING_LOOKUP_MAX_PER_SEC`
 - `MEV_BLOCK_LOOKUP_FANOUT`
 - `MEV_PAYLOAD_BUILD_FANOUT`
 
 `MEV_PENDING_LOOKUP_FANOUT` controls how many read RPC endpoints are queried for each pending transaction hash before decode. The default is `1`. Raising it to `2` or `3` can improve pending transaction hit rate, but it multiplies paid RPC usage and can trigger provider rate limits.
+
+`MEV_PENDING_LOOKUP_MAX_PER_SEC` caps how many pending hashes are accepted into the lookup/decode queue each second. When configured, the runtime uses that value while read RPCs are healthy. It still backs off under real RPC pressure: if all readers are unavailable, rate-limited, or failing, the effective budget is reduced until the fleet recovers. In scavenger shadow runs this prevents a configured high intake rate from continuing to fill the queue while the only usable RPC endpoint is in cooldown.
 
 `MEV_BLOCK_LOOKUP_FANOUT` controls how many read RPC endpoints are queried for the current block once a transaction already decoded into a relevant candidate. The default is `1`. Block lookup intentionally happens after decode so irrelevant transactions do not spend extra RPC.
 
@@ -1318,6 +1324,34 @@ The MEV Engine panel also exposes an opportunity funnel:
 - submit attempted/succeeded/failed
 
 Use this funnel before loosening strategy logic. If `pending hashes` rises but `decode pass` stays at zero, the issue is router/token/notional coverage, not execution. If `payload built` stays at zero, the issue is state lookup, pool support, liquidity, or profit gates. If `submit attempted` stays at zero after `execution ready`, the issue is executor readiness or execution guardrails.
+
+Decode rejects are intentionally granular. The main reasons to watch are:
+
+- `selector_unsupported`: calldata selector is not one of the supported direct router or aggregator selectors.
+- `universal_router_command_unsupported`: Universal Router calldata decoded, but it used commands outside the executable V2/V3 subset.
+- `universal_router_subplan_not_extracted`: Universal Router command graph was present, but no executable hop was extracted from nested subplans.
+- `universal_router_abi_decode_failed`: Universal Router selector matched, but commands/inputs could not be decoded.
+- `universal_router_path_invalid`: a swap command was present, but the resulting route was not executable by the current V2/V3 payload path.
+- `monitored_token_not_in_path`: aggregator route decoded, but it did not include a configured monitored token.
+- `token_monitored_path_invalid`: monitored token bytes were present, but no valid priced path/notional could be produced.
+- `amount_in_below_min`: a swap decoded, but its notional was below the active mode threshold.
+
+Universal Router telemetry includes command names, input sizes, nested subplan status, swap count, hop count, unsupported commands, and route graph hints. Treat `permit2_*`, wrap/unwrap, sweep, transfer, and balance-check commands as context commands; they are not payload hops by themselves.
+
+Payload rejects also emit `payload_build_detail`. The key categories are:
+
+- `factory_wrong_or_unavailable`: no usable configured/default factory was available.
+- `v2_pair_not_found`: no V2 pair was found for the decoded token pair.
+- `v3_fee_tier_or_pool_not_found`: no V3 pool was found for the decoded token pair and fee tier.
+- `v3_routed_to_v2_pair_lookup`: a V3-shaped opportunity reached a V2 pair lookup path.
+- `path_inverted_or_pool_token_mismatch`: the pool exists, but the reverse path is not supported by the pool token ordering.
+- `pool_state_unavailable`: pair/pool was found, but live state fetch/cache lookup failed.
+- `victim_price_impact_too_high`: the victim move is too large for the configured impact cap.
+- `economic_no_positive_gross_edge`: sizing found no positive gross edge before gas.
+- `economic_no_positive_net_after_gas`: gross edge existed, but no size survived gas.
+- `economic_profit_below_floor`: simulated profit was below configured minimums.
+
+Edge telemetry samples for decode and payload rejects carry route context so the next tuning pass can be based on evidence: selector, route kind, token path, amount in, amount out or minimum out, repayment, gross edge, gas estimate, pool/factory hints, fee tier, and hop notes.
 
 For low-capital farelo runs, use `MEV_OPPORTUNITY_MODE=scavenger` first. Keep `conservative` for larger capital, bad market conditions, expensive RPC, or when the priority is avoiding false positives over execution frequency.
 

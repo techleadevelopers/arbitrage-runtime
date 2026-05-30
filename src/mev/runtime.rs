@@ -462,8 +462,9 @@ pub async fn run(
         dashboard.clone(),
         adaptive.clone(),
     );
-    let lookup_decode_workers = worker_count(LOOKUP_DECODE_WORKERS_MAX);
-    let eval_workers = worker_count(EVAL_WORKERS_MAX);
+    let lookup_decode_workers =
+        worker_count("MEV_LOOKUP_DECODE_WORKERS", LOOKUP_DECODE_WORKERS_MAX);
+    let eval_workers = worker_count("MEV_EVAL_WORKERS", EVAL_WORKERS_MAX);
     let (lookup_decode_tx, lookup_decode_rx) =
         mpsc::channel::<PendingHashTask>(LOOKUP_DECODE_QUEUE_CAPACITY);
     let (eval_tx, eval_rx) = mpsc::channel::<LookupDecodedCandidate>(EVAL_QUEUE_CAPACITY);
@@ -3362,7 +3363,15 @@ pub(crate) fn decode_relevant_swap(
         _ => return None,
     };
 
-    let notional_wei = estimate_notional_wei(&signal, monitored_tokens)?;
+    let notional_wei = estimate_notional_wei(&signal, monitored_tokens).or_else(|| {
+        if mode == OpportunityMode::Scavenger
+            && path_contains_monitored_token(&signal.path, monitored_tokens)
+        {
+            Some(min_large_swap_wei.max(U256::one()))
+        } else {
+            None
+        }
+    })?;
     if signal.path.len() < 2 {
         return None;
     }
@@ -3782,6 +3791,17 @@ fn estimate_notional_wei(
     ethers::utils::parse_ether(value_eth.to_string()).ok()
 }
 
+fn path_contains_monitored_token(
+    path: &[Address],
+    monitored_tokens: &[MonitoredTokenConfig],
+) -> bool {
+    path.iter().any(|address| {
+        monitored_tokens
+            .iter()
+            .any(|token| token.address == *address)
+    })
+}
+
 fn selector(tx: &Transaction) -> Option<[u8; 4]> {
     let input = tx.input.as_ref();
     if let Some(index) = crate::mev::decoder::simd::find_selector(input) {
@@ -4024,6 +4044,18 @@ fn diagnose_decode_reject(
         };
     }
 
+    if let Some(diagnostic) = diagnose_direct_router_decode(
+        config,
+        tx,
+        tx_hash,
+        selector,
+        selector_text.as_str(),
+        min_large_swap_wei,
+        mode,
+    ) {
+        return diagnostic;
+    }
+
     if let Some(mut signal) = decode_relevant_swap(
         tx,
         &config.monitored_tokens,
@@ -4094,6 +4126,151 @@ fn diagnose_decode_reject(
             vec!["decode rejected after monitored token hint".to_string()]
         },
     }
+}
+
+fn diagnose_direct_router_decode(
+    config: &Config,
+    tx: &Transaction,
+    tx_hash: H256,
+    selector: [u8; 4],
+    selector_text: &str,
+    min_large_swap_wei: U256,
+    mode: OpportunityMode,
+) -> Option<DecodeRejectDiagnostic> {
+    let router = tx.to?;
+    let args = tx.input.as_ref().get(4..)?;
+    let signal = decode_direct_router_signal(selector, router, tx.value, args)?;
+    if signal.path.len() < 2 {
+        return Some(DecodeRejectDiagnostic {
+            reason: "path_invalid",
+            detail: format!(
+                "tx={} selector={} decoded direct router path has <2 tokens",
+                short_hash(tx_hash),
+                selector_text
+            ),
+            hints: vec!["decoded path invalid".to_string()],
+        });
+    }
+    match estimate_notional_wei(&signal, &config.monitored_tokens) {
+        Some(notional_wei) => {
+            if mode != OpportunityMode::Scavenger && notional_wei < min_large_swap_wei {
+                return Some(DecodeRejectDiagnostic {
+                    reason: "amount_in_below_min",
+                    detail: format!(
+                        "tx={} selector={} notional_wei={} min_large_swap_wei={} path={}",
+                        short_hash(tx_hash),
+                        selector_text,
+                        notional_wei,
+                        min_large_swap_wei,
+                        format_path(&signal.path)
+                    ),
+                    hints: vec![
+                        format!("amount_in_wei={}", signal.amount_in),
+                        format!("notional_wei={notional_wei}"),
+                        format!("min_large_swap_wei={min_large_swap_wei}"),
+                    ],
+                });
+            }
+        }
+        None if path_contains_monitored_token(&signal.path, &config.monitored_tokens) => {
+            return Some(DecodeRejectDiagnostic {
+                reason: "monitored_token_not_input",
+                detail: format!(
+                    "tx={} selector={} monitored token is in path but input token is not priced amount_in={} path={}",
+                    short_hash(tx_hash),
+                    selector_text,
+                    signal.amount_in,
+                    format_path(&signal.path)
+                ),
+                hints: vec![
+                    format!("amount_in_wei={}", signal.amount_in),
+                    format!("path={}", format_path(&signal.path)),
+                    "scavenger now allows this as shadow candidate".to_string(),
+                ],
+            });
+        }
+        None => {
+            return Some(DecodeRejectDiagnostic {
+                reason: "monitored_token_not_in_path",
+                detail: format!(
+                    "tx={} selector={} no monitored token in decoded path amount_in={} path={}",
+                    short_hash(tx_hash),
+                    selector_text,
+                    signal.amount_in,
+                    format_path(&signal.path)
+                ),
+                hints: vec![format!("path={}", format_path(&signal.path))],
+            });
+        }
+    }
+    None
+}
+
+fn decode_direct_router_signal(
+    selector: [u8; 4],
+    router: Address,
+    value: U256,
+    args: &[u8],
+) -> Option<SwapSignal> {
+    match selector {
+        SWAP_EXACT_ETH_FOR_TOKENS | SWAP_EXACT_ETH_FOR_TOKENS_SUPPORTING_FEE => {
+            let decoded = abi::decode(
+                &[
+                    ParamType::Uint(256),
+                    ParamType::Array(Box::new(ParamType::Address)),
+                    ParamType::Address,
+                    ParamType::Uint(256),
+                ],
+                args,
+            )
+            .ok()?;
+            Some(SwapSignal {
+                selector,
+                amount_in: value,
+                amount_out_min: decoded.first().and_then(token_as_uint),
+                notional_wei: value,
+                path: decoded.get(1).and_then(token_as_address_vec)?,
+                router,
+                kind: SwapKind::V2,
+            })
+        }
+        SWAP_EXACT_TOKENS_FOR_TOKENS
+        | SWAP_EXACT_TOKENS_FOR_ETH
+        | SWAP_EXACT_TOKENS_FOR_TOKENS_SUPPORTING_FEE
+        | SWAP_EXACT_TOKENS_FOR_ETH_SUPPORTING_FEE => {
+            let decoded = abi::decode(
+                &[
+                    ParamType::Uint(256),
+                    ParamType::Uint(256),
+                    ParamType::Array(Box::new(ParamType::Address)),
+                    ParamType::Address,
+                    ParamType::Uint(256),
+                ],
+                args,
+            )
+            .ok()?;
+            Some(SwapSignal {
+                selector,
+                amount_in: decoded.first().and_then(token_as_uint)?,
+                amount_out_min: decoded.get(1).and_then(token_as_uint),
+                notional_wei: U256::zero(),
+                path: decoded.get(2).and_then(token_as_address_vec)?,
+                router,
+                kind: SwapKind::V2,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn format_path(path: &[Address]) -> String {
+    if path.is_empty() {
+        return "unknown".to_string();
+    }
+    path.iter()
+        .map(|address| format!("{address:?}"))
+        .collect::<Vec<_>>()
+        .join(">")
 }
 
 fn decode_reject_edge_sample(
@@ -5344,10 +5521,13 @@ fn push_stage_pair(
     }
 }
 
-fn worker_count(max_workers: usize) -> usize {
-    std::thread::available_parallelism()
-        .map(|value| value.get().min(max_workers).max(1))
-        .unwrap_or(2)
+fn worker_count(env_name: &str, max_workers: usize) -> usize {
+    if let Ok(value) = std::env::var(env_name) {
+        if let Ok(parsed) = value.trim().parse::<usize>() {
+            return parsed.clamp(1, max_workers);
+        }
+    }
+    max_workers.max(1)
 }
 
 fn token_as_uint(token: &Token) -> Option<U256> {
