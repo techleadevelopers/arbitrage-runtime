@@ -219,6 +219,20 @@ impl Storage {
                 count INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (network, bucket, stage, reason)
             );
+
+            CREATE TABLE IF NOT EXISTS selector_performance_rollups (
+                network TEXT NOT NULL DEFAULT 'unknown',
+                bucket TEXT NOT NULL,
+                selector TEXT NOT NULL,
+                target TEXT NOT NULL,
+                decode_source TEXT NOT NULL DEFAULT 'unknown',
+                stage TEXT NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                confidence_sum REAL NOT NULL DEFAULT 0,
+                gas_gwei_sum REAL NOT NULL DEFAULT 0,
+                last_seen TEXT NOT NULL,
+                PRIMARY KEY (network, bucket, selector, target, decode_source, stage)
+            );
             "#,
         )?;
         let _ = conn.execute(
@@ -256,7 +270,7 @@ impl Storage {
     }
 
     pub fn database_table_counts(&self) -> Result<Vec<(String, u64)>, Box<dyn std::error::Error>> {
-        const TABLES: [&str; 11] = [
+        const TABLES: [&str; 12] = [
             "events",
             "telemetry",
             "sweeps",
@@ -268,6 +282,7 @@ impl Storage {
             "latency_rollups",
             "funnel_rollups",
             "reject_reason_rollups",
+            "selector_performance_rollups",
         ];
 
         match &self.backend {
@@ -440,6 +455,21 @@ impl Storage {
                 PRIMARY KEY (network, bucket, stage, reason)
             )
             "#,
+            r#"
+            CREATE TABLE IF NOT EXISTS selector_performance_rollups (
+                network TEXT NOT NULL DEFAULT 'unknown',
+                bucket TEXT NOT NULL,
+                selector TEXT NOT NULL,
+                target TEXT NOT NULL,
+                decode_source TEXT NOT NULL DEFAULT 'unknown',
+                stage TEXT NOT NULL,
+                count BIGINT NOT NULL DEFAULT 0,
+                confidence_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+                gas_gwei_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+                last_seen TEXT NOT NULL,
+                PRIMARY KEY (network, bucket, selector, target, decode_source, stage)
+            )
+            "#,
         ];
 
         for statement in statements {
@@ -530,6 +560,10 @@ impl Storage {
                     "DELETE FROM reject_reason_rollups WHERE bucket < ?1",
                     [rollup_cutoff.as_str()],
                 )?;
+                conn.execute(
+                    "DELETE FROM selector_performance_rollups WHERE bucket < ?1",
+                    [rollup_cutoff.as_str()],
+                )?;
                 Ok(())
             }
             StorageBackend::Postgres(pool) => {
@@ -555,6 +589,11 @@ impl Storage {
                 )?;
                 Self::wait(
                     sqlx::query("DELETE FROM reject_reason_rollups WHERE bucket < $1")
+                        .bind(rollup_cutoff.clone())
+                        .execute(pool),
+                )?;
+                Self::wait(
+                    sqlx::query("DELETE FROM selector_performance_rollups WHERE bucket < $1")
                         .bind(rollup_cutoff)
                         .execute(pool),
                 )?;
@@ -790,6 +829,81 @@ impl Storage {
                     .bind(stage.to_string())
                     .bind(reason.to_string())
                     .bind(count as i64)
+                    .execute(pool),
+                );
+            }
+        }
+    }
+
+    pub fn record_selector_performance_rollup(
+        &self,
+        bucket: &str,
+        selector: &str,
+        target: &str,
+        decode_source: &str,
+        stage: &str,
+        count: u64,
+        confidence_sum: f64,
+        gas_gwei_sum: f64,
+    ) {
+        let now = Utc::now().to_rfc3339();
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                if let Ok(conn) = conn.lock() {
+                    let _ = conn.execute(
+                        r#"
+                        INSERT INTO selector_performance_rollups (
+                            network, bucket, selector, target, decode_source, stage,
+                            count, confidence_sum, gas_gwei_sum, last_seen
+                        )
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                        ON CONFLICT(network, bucket, selector, target, decode_source, stage) DO UPDATE SET
+                            count = count + excluded.count,
+                            confidence_sum = confidence_sum + excluded.confidence_sum,
+                            gas_gwei_sum = gas_gwei_sum + excluded.gas_gwei_sum,
+                            last_seen = excluded.last_seen
+                        "#,
+                        params![
+                            self.network.as_str(),
+                            bucket,
+                            selector,
+                            target,
+                            decode_source,
+                            stage,
+                            count as i64,
+                            confidence_sum,
+                            gas_gwei_sum,
+                            now,
+                        ],
+                    );
+                }
+            }
+            StorageBackend::Postgres(pool) => {
+                let _ = Self::wait(
+                    sqlx::query(
+                        r#"
+                        INSERT INTO selector_performance_rollups (
+                            network, bucket, selector, target, decode_source, stage,
+                            count, confidence_sum, gas_gwei_sum, last_seen
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                        ON CONFLICT(network, bucket, selector, target, decode_source, stage) DO UPDATE SET
+                            count = selector_performance_rollups.count + EXCLUDED.count,
+                            confidence_sum = selector_performance_rollups.confidence_sum + EXCLUDED.confidence_sum,
+                            gas_gwei_sum = selector_performance_rollups.gas_gwei_sum + EXCLUDED.gas_gwei_sum,
+                            last_seen = EXCLUDED.last_seen
+                        "#,
+                    )
+                    .bind(self.network.clone())
+                    .bind(bucket.to_string())
+                    .bind(selector.to_string())
+                    .bind(target.to_string())
+                    .bind(decode_source.to_string())
+                    .bind(stage.to_string())
+                    .bind(count as i64)
+                    .bind(confidence_sum)
+                    .bind(gas_gwei_sum)
+                    .bind(now)
                     .execute(pool),
                 );
             }

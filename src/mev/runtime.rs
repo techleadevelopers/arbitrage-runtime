@@ -84,6 +84,8 @@ pub(crate) struct SwapSignal {
     pub(crate) path: Vec<Address>,
     pub(crate) router: Address,
     pub(crate) kind: SwapKind,
+    pub(crate) decode_confidence: f64,
+    pub(crate) decode_source: &'static str,
 }
 
 impl SwapSignal {
@@ -92,6 +94,10 @@ impl SwapSignal {
             SwapKind::V2 => self.path.len(),
             SwapKind::V3 { hops, .. } => hops.saturating_add(1).max(self.path.len()),
         }
+    }
+
+    fn is_partial_decode(&self) -> bool {
+        self.decode_confidence < 0.99
     }
 }
 
@@ -957,6 +963,47 @@ async fn process_lookup_decode_task(
     dashboard.record_opportunity_funnel("decode_pass");
     dashboard.record_reject_reason("decode_selector_pass", &decode_reject_selector_reason(&tx));
     latency_trace.decode_swap_us = Some(elapsed_us(decode_started));
+    dashboard.record_selector_performance(
+        &selector_hex(signal.selector),
+        &address_hex(signal.router),
+        signal.decode_source,
+        "decode_pass",
+        signal.decode_confidence,
+        0.0,
+    );
+    if signal.is_partial_decode() {
+        dashboard.record_opportunity_funnel("partial_signal");
+        dashboard.record_selector_performance(
+            &selector_hex(signal.selector),
+            &address_hex(signal.router),
+            signal.decode_source,
+            "partial_signal",
+            signal.decode_confidence,
+            0.0,
+        );
+    }
+    let min_decode_confidence = min_partial_decode_confidence();
+    if signal.decode_confidence < min_decode_confidence {
+        dashboard.record_opportunity_funnel("decode_reject");
+        dashboard.record_reject_reason("decode", "partial_confidence_below_min");
+        dashboard.record_selector_performance(
+            &selector_hex(signal.selector),
+            &address_hex(signal.router),
+            signal.decode_source,
+            "confidence_reject",
+            signal.decode_confidence,
+            0.0,
+        );
+        latency_trace.total_internal_us = Some(elapsed_us(task.candidate_started));
+        latency_trace.emit(
+            &config,
+            &dashboard,
+            task.tx_hash,
+            "reject",
+            "partial_confidence",
+        );
+        return None;
+    }
 
     let hour_utc = chrono::Utc::now().hour() as u8;
     let context_started = Instant::now();
@@ -1467,6 +1514,14 @@ async fn process_evaluation_task(
         Ok(payload) => payload,
         Err(err) => {
             dashboard.record_opportunity_funnel("payload_reject");
+            dashboard.record_selector_performance(
+                &selector_hex(candidate.signal.selector),
+                &address_hex(candidate.signal.router),
+                candidate.signal.decode_source,
+                "payload_reject",
+                candidate.signal.decode_confidence,
+                gas_price_gwei(candidate.gas_price),
+            );
             let human_reason = human_payload_error(&err);
             let payload_detail = payload_error_detail(&err, &candidate.signal);
             let sample = extract_edge_sample(&err)
@@ -1508,8 +1563,35 @@ async fn process_evaluation_task(
         || scavenger_payload_has_economic_edge(&config, &payload, candidate.gas_price);
     if economic_payload {
         dashboard.record_opportunity_funnel("payload_built");
+        dashboard.record_selector_performance(
+            &selector_hex(candidate.signal.selector),
+            &address_hex(candidate.signal.router),
+            candidate.signal.decode_source,
+            "payload_built",
+            candidate.signal.decode_confidence,
+            gas_price_gwei(candidate.gas_price),
+        );
+        if !config.allow_send {
+            dashboard.record_opportunity_funnel("shadow_payload_built");
+            dashboard.record_selector_performance(
+                &selector_hex(candidate.signal.selector),
+                &address_hex(candidate.signal.router),
+                candidate.signal.decode_source,
+                "shadow_payload_built",
+                candidate.signal.decode_confidence,
+                gas_price_gwei(candidate.gas_price),
+            );
+        }
     } else {
         dashboard.record_opportunity_funnel("payload_reject");
+        dashboard.record_selector_performance(
+            &selector_hex(candidate.signal.selector),
+            &address_hex(candidate.signal.router),
+            candidate.signal.decode_source,
+            "payload_reject",
+            candidate.signal.decode_confidence,
+            gas_price_gwei(candidate.gas_price),
+        );
         dashboard.record_reject_reason("payload_build", "scavenger_dust_edge_shadow_only");
     }
     if let Some(mut sample) = payload
@@ -3098,6 +3180,18 @@ fn calldata_prefix_hex(input: &[u8]) -> String {
     out
 }
 
+fn min_partial_decode_confidence() -> f64 {
+    std::env::var("MEV_PARTIAL_DECODE_MIN_CONFIDENCE")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .unwrap_or(0.30)
+        .clamp(0.0, 1.0)
+}
+
+fn gas_price_gwei(gas_price: U256) -> f64 {
+    gas_price.to_string().parse::<f64>().unwrap_or(0.0) / 1e9
+}
+
 fn address_hex(address: Address) -> String {
     format!("{address:?}")
 }
@@ -3757,6 +3851,8 @@ fn decode_swap_signal(
                 path: decoded.get(1).and_then(token_as_address_vec)?,
                 router,
                 kind: SwapKind::V2,
+                decode_confidence: 1.0,
+                decode_source: "abi",
             }
         }
         SWAP_EXACT_TOKENS_FOR_TOKENS
@@ -3782,6 +3878,8 @@ fn decode_swap_signal(
                 path: decoded.get(2).and_then(token_as_address_vec)?,
                 router,
                 kind: SwapKind::V2,
+                decode_confidence: 1.0,
+                decode_source: "abi",
             }
         }
         V3_EXACT_INPUT_SINGLE => {
@@ -3820,6 +3918,8 @@ fn decode_swap_signal(
                     hops: 1,
                     exact_out: false,
                 },
+                decode_confidence: 1.0,
+                decode_source: "abi",
             }
         }
         V3_EXACT_INPUT => {
@@ -3861,6 +3961,8 @@ fn decode_swap_signal(
                     hops: parsed.hops,
                     exact_out: false,
                 },
+                decode_confidence: 1.0,
+                decode_source: "abi",
             }
         }
         UNIVERSAL_ROUTER_EXECUTE | UNIVERSAL_ROUTER_EXECUTE_NO_DEADLINE => {
@@ -3932,6 +4034,8 @@ fn decode_safe_inner_aggregator_partial(
                 value,
                 args,
                 monitored_tokens,
+                0.75,
+                "safe_inner_partial",
             )
         }
         _ => None,
@@ -3953,6 +4057,8 @@ fn decode_known_aggregator_partial(
                 value,
                 args,
                 monitored_tokens,
+                0.35,
+                "token_order_partial",
             )
         }
         _ => None,
@@ -3965,6 +4071,8 @@ fn decode_partial_swap_from_monitored_tokens(
     value: U256,
     args: &[u8],
     monitored_tokens: &[MonitoredTokenConfig],
+    decode_confidence: f64,
+    decode_source: &'static str,
 ) -> Option<SwapSignal> {
     let path = monitored_token_addresses_in_input(monitored_tokens, args);
     if path.len() < 2 {
@@ -3983,6 +4091,8 @@ fn decode_partial_swap_from_monitored_tokens(
         path,
         router,
         kind: SwapKind::V2,
+        decode_confidence,
+        decode_source,
     })
 }
 
@@ -4117,6 +4227,8 @@ fn universal_router_hop_to_signal(
         path,
         router,
         kind,
+        decode_confidence: 1.0,
+        decode_source: "universal_router",
     })
 }
 
@@ -4226,6 +4338,8 @@ fn decode_universal_router_v2_exact_in(
         path,
         router,
         kind: SwapKind::V2,
+        decode_confidence: 1.0,
+        decode_source: "universal_router",
     })
 }
 
@@ -4256,6 +4370,8 @@ fn decode_universal_router_v2_exact_out(
         path,
         router,
         kind: SwapKind::V2,
+        decode_confidence: 1.0,
+        decode_source: "universal_router",
     })
 }
 
@@ -4299,6 +4415,8 @@ fn decode_universal_router_v3_exact_in(
             hops: parsed.hops,
             exact_out: false,
         },
+        decode_confidence: 1.0,
+        decode_source: "universal_router",
     })
 }
 
@@ -4342,6 +4460,8 @@ fn decode_universal_router_v3_exact_out(
             hops: parsed.hops,
             exact_out: true,
         },
+        decode_confidence: 1.0,
+        decode_source: "universal_router",
     })
 }
 
@@ -4371,6 +4491,8 @@ fn decode_zero_ex_sell_to_uniswap(
         path,
         router,
         kind: SwapKind::V2,
+        decode_confidence: 1.0,
+        decode_source: "0x_uniswap",
     })
 }
 
@@ -4938,6 +5060,8 @@ fn decode_direct_router_signal(
                 path: decoded.get(1).and_then(token_as_address_vec)?,
                 router,
                 kind: SwapKind::V2,
+                decode_confidence: 1.0,
+                decode_source: "abi",
             })
         }
         SWAP_EXACT_TOKENS_FOR_TOKENS
@@ -4963,6 +5087,8 @@ fn decode_direct_router_signal(
                 path: decoded.get(2).and_then(token_as_address_vec)?,
                 router,
                 kind: SwapKind::V2,
+                decode_confidence: 1.0,
+                decode_source: "abi",
             })
         }
         _ => None,

@@ -43,6 +43,7 @@ struct PendingStorageWrites {
     latency_rollups: HashMap<String, PendingLatencyRollup>,
     funnel_rollups: HashMap<String, PendingCounterRollup>,
     reject_reason_rollups: HashMap<String, PendingRejectReasonRollup>,
+    selector_performance_rollups: HashMap<String, PendingSelectorPerformanceRollup>,
     relay_updates: Vec<PendingRelayUpdate>,
     treasury_updates: Vec<PendingTreasuryUpdate>,
     execution_outcomes: Vec<PendingExecutionOutcome>,
@@ -76,6 +77,17 @@ struct PendingRejectReasonRollup {
     stage: String,
     reason: String,
     count: u64,
+}
+
+struct PendingSelectorPerformanceRollup {
+    bucket: String,
+    selector: String,
+    target: String,
+    decode_source: String,
+    stage: String,
+    count: u64,
+    confidence_sum: f64,
+    gas_gwei_sum: f64,
 }
 
 struct PendingRelayUpdate {
@@ -410,6 +422,7 @@ pub struct OpportunityFunnelSnapshot {
     pub tx_lookup_throttled: u64,
     pub decode_pass: u64,
     pub decode_reject: u64,
+    pub partial_signal: u64,
     pub block_lookup_success: u64,
     pub block_lookup_fail: u64,
     pub fast_preflight_pass: u64,
@@ -417,6 +430,7 @@ pub struct OpportunityFunnelSnapshot {
     pub adaptive_preflight_pass: u64,
     pub adaptive_preflight_reject: u64,
     pub payload_built: u64,
+    pub shadow_payload_built: u64,
     pub payload_reject: u64,
     pub ev_gate_pass: u64,
     pub ev_gate_reject: u64,
@@ -1256,6 +1270,40 @@ impl DashboardHandle {
         state.reject_reasons.truncate(8);
     }
 
+    pub fn record_selector_performance(
+        &self,
+        selector: &str,
+        target: &str,
+        decode_source: &str,
+        stage: &str,
+        confidence: f64,
+        gas_gwei: f64,
+    ) {
+        if !storage_rollups_enabled() {
+            return;
+        }
+        if let Ok(mut pending) = self.pending.lock() {
+            let bucket = telemetry_bucket_minute();
+            let key = format!("{bucket}|{selector}|{target}|{decode_source}|{stage}");
+            let entry = pending
+                .selector_performance_rollups
+                .entry(key)
+                .or_insert_with(|| PendingSelectorPerformanceRollup {
+                    bucket,
+                    selector: selector.to_string(),
+                    target: target.to_string(),
+                    decode_source: decode_source.to_string(),
+                    stage: stage.to_string(),
+                    count: 0,
+                    confidence_sum: 0.0,
+                    gas_gwei_sum: 0.0,
+                });
+            entry.count = entry.count.saturating_add(1);
+            entry.confidence_sum += confidence.clamp(0.0, 1.0);
+            entry.gas_gwei_sum += gas_gwei.max(0.0);
+        }
+    }
+
     pub fn record_opportunity_funnel(&self, stage: &str) {
         if storage_rollups_enabled() {
             if let Ok(mut pending) = self.pending.lock() {
@@ -1288,6 +1336,7 @@ impl DashboardHandle {
             }
             "decode_pass" => funnel.decode_pass = funnel.decode_pass.saturating_add(1),
             "decode_reject" => funnel.decode_reject = funnel.decode_reject.saturating_add(1),
+            "partial_signal" => funnel.partial_signal = funnel.partial_signal.saturating_add(1),
             "block_lookup_success" => {
                 funnel.block_lookup_success = funnel.block_lookup_success.saturating_add(1)
             }
@@ -1308,6 +1357,9 @@ impl DashboardHandle {
                     funnel.adaptive_preflight_reject.saturating_add(1)
             }
             "payload_built" => funnel.payload_built = funnel.payload_built.saturating_add(1),
+            "shadow_payload_built" => {
+                funnel.shadow_payload_built = funnel.shadow_payload_built.saturating_add(1)
+            }
             "payload_reject" => funnel.payload_reject = funnel.payload_reject.saturating_add(1),
             "ev_gate_pass" => funnel.ev_gate_pass = funnel.ev_gate_pass.saturating_add(1),
             "ev_gate_reject" => funnel.ev_gate_reject = funnel.ev_gate_reject.saturating_add(1),
@@ -1571,6 +1623,19 @@ impl DashboardHandle {
                 &reject.stage,
                 &reject.reason,
                 reject.count,
+            );
+        }
+
+        for selector in pending.selector_performance_rollups.into_values() {
+            self.storage.record_selector_performance_rollup(
+                &selector.bucket,
+                &selector.selector,
+                &selector.target,
+                &selector.decode_source,
+                &selector.stage,
+                selector.count,
+                selector.confidence_sum,
+                selector.gas_gwei_sum,
             );
         }
 
