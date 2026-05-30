@@ -1571,6 +1571,17 @@ async fn process_evaluation_task(
 
     if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
         if !economic_payload {
+            let ev_diag =
+                scavenger_economic_edge_diagnostic(&config, &payload, candidate.gas_price);
+            dashboard.record_reject_reason("ev_gate", ev_diag.reason);
+            dashboard.record_edge_sample(ev_gate_edge_sample(
+                tx_hash,
+                &candidate.signal,
+                &payload,
+                candidate.gas_price,
+                "ev_gate_reject",
+                &ev_diag,
+            ));
             candidate.latency_trace.ev_gate_us = Some(0);
             candidate.latency_trace.total_internal_us =
                 Some(elapsed_us(candidate.candidate_started));
@@ -1588,6 +1599,17 @@ async fn process_evaluation_task(
         if let Err(reason) =
             passes_scavenger_sanity_gate(&config, &payload, candidate.lookup_latency)
         {
+            let ev_diag =
+                scavenger_sanity_diagnostic(&config, &payload, candidate.lookup_latency, reason);
+            dashboard.record_reject_reason("ev_gate", ev_diag.reason);
+            dashboard.record_edge_sample(ev_gate_edge_sample(
+                tx_hash,
+                &candidate.signal,
+                &payload,
+                candidate.gas_price,
+                "ev_gate_reject",
+                &ev_diag,
+            ));
             candidate.latency_trace.ev_gate_us = Some(elapsed_us(sanity_started));
             candidate.latency_trace.total_internal_us =
                 Some(elapsed_us(candidate.candidate_started));
@@ -1660,19 +1682,29 @@ async fn process_evaluation_task(
     }
 
     let ev_gate_started = Instant::now();
-    if !passes_ev_gate(
+    let ev_diag = ev_gate_diagnostic(
         &config,
         &payload,
         &candidate.signal,
         candidate.lookup_latency,
         min_profit_wei,
-    ) {
+    );
+    if !ev_diag.pass {
         candidate.latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
         dashboard.record_opportunity_funnel("ev_gate_reject");
+        dashboard.record_reject_reason("ev_gate", ev_diag.reason);
+        dashboard.record_edge_sample(ev_gate_edge_sample(
+            tx_hash,
+            &candidate.signal,
+            &payload,
+            candidate.gas_price,
+            "ev_gate_reject",
+            &ev_diag,
+        ));
         candidate
             .latency_trace
-            .emit(&config, &dashboard, tx_hash, "reject", "ev_gate");
+            .emit(&config, &dashboard, tx_hash, "reject", ev_diag.reason);
         return None;
     }
     dashboard.record_opportunity_funnel("ev_gate_pass");
@@ -1685,12 +1717,22 @@ async fn process_evaluation_task(
         / U256::from(10_000u64);
 
     let quality_gate_started = Instant::now();
-    if !passes_quality_gate(&config, &payload, execution_cost_wei) {
+    let quality_diag = quality_gate_diagnostic(&config, &payload, execution_cost_wei);
+    if !quality_diag.pass {
         candidate.latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        dashboard.record_reject_reason("quality_gate", quality_diag.reason);
+        dashboard.record_edge_sample(ev_gate_edge_sample(
+            tx_hash,
+            &candidate.signal,
+            &payload,
+            candidate.gas_price,
+            "quality_gate_reject",
+            &quality_diag,
+        ));
         candidate
             .latency_trace
-            .emit(&config, &dashboard, tx_hash, "reject", "quality_gate");
+            .emit(&config, &dashboard, tx_hash, "reject", quality_diag.reason);
         return None;
     }
     candidate.latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
@@ -1848,9 +1890,49 @@ pub(crate) fn passes_quality_gate(
     payload: &crate::mev::execution::payload_builder::ExecutionPayload,
     execution_cost_wei: U256,
 ) -> bool {
+    quality_gate_diagnostic(config, payload, execution_cost_wei).pass
+}
+
+#[derive(Debug, Clone)]
+struct GateDiagnostic {
+    pass: bool,
+    reason: &'static str,
+    detail: String,
+    expected_profit_wei: U256,
+    execution_cost_wei: U256,
+    min_profit_wei: U256,
+    net_ev_usd: f64,
+    roi_bps: u64,
+}
+
+fn quality_gate_diagnostic(
+    config: &Config,
+    payload: &crate::mev::execution::payload_builder::ExecutionPayload,
+    execution_cost_wei: U256,
+) -> GateDiagnostic {
     if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
-        return !payload.expected_profit_wei.is_zero()
-            && payload.price_impact_bps <= scavenger_quality_price_impact_cap_bps(config);
+        let impact_cap = scavenger_quality_price_impact_cap_bps(config);
+        let pass = !payload.expected_profit_wei.is_zero() && payload.price_impact_bps <= impact_cap;
+        let reason = if payload.expected_profit_wei.is_zero() {
+            "quality_zero_expected_profit"
+        } else if payload.price_impact_bps > impact_cap {
+            "quality_price_impact_above_cap"
+        } else {
+            "quality_gate_pass"
+        };
+        return GateDiagnostic {
+            pass,
+            reason,
+            detail: format!(
+                "expected_profit_wei={} price_impact_bps={} impact_cap_bps={}",
+                payload.expected_profit_wei, payload.price_impact_bps, impact_cap
+            ),
+            expected_profit_wei: payload.expected_profit_wei,
+            execution_cost_wei,
+            min_profit_wei: U256::zero(),
+            net_ev_usd: wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price,
+            roi_bps: roi_bps(payload.expected_profit_wei, execution_cost_wei),
+        };
     }
 
     let roi = roi_bps(payload.expected_profit_wei, execution_cost_wei);
@@ -1858,7 +1940,33 @@ pub(crate) fn passes_quality_gate(
         / config.mev.effective_max_price_impact_bps().max(1) as f64)
         * 100.0)
         .clamp(0.0, 100.0) as u16;
-    roi >= config.mev.effective_min_roi_bps() && impact_score <= 100
+    let min_roi = config.mev.effective_min_roi_bps();
+    let pass = roi >= min_roi && impact_score <= 100;
+    let reason = if roi < min_roi {
+        "quality_roi_below_min"
+    } else if impact_score > 100 {
+        "quality_impact_score_above_cap"
+    } else {
+        "quality_gate_pass"
+    };
+    GateDiagnostic {
+        pass,
+        reason,
+        detail: format!(
+            "roi_bps={} min_roi_bps={} impact_score={} price_impact_bps={} impact_cap_bps={} execution_cost_wei={}",
+            roi,
+            min_roi,
+            impact_score,
+            payload.price_impact_bps,
+            config.mev.effective_max_price_impact_bps(),
+            execution_cost_wei
+        ),
+        expected_profit_wei: payload.expected_profit_wei,
+        execution_cost_wei,
+        min_profit_wei: U256::zero(),
+        net_ev_usd: wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price,
+        roi_bps: roi,
+    }
 }
 
 fn passes_scavenger_sanity_gate(
@@ -1935,6 +2043,87 @@ fn scavenger_payload_has_economic_edge(
         "scavenger edge check"
     );
     payload.expected_profit_wei >= floor
+}
+
+fn scavenger_economic_edge_diagnostic(
+    config: &Config,
+    payload: &crate::mev::execution::payload_builder::ExecutionPayload,
+    gas_price: U256,
+) -> GateDiagnostic {
+    let gas_cost_wei = gas_price.saturating_mul(U256::from(payload.gas_limit));
+    let min_gas_fraction_bps = std::env::var("MEV_SCAVENGER_MIN_GAS_FRACTION_BPS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(100)
+        .clamp(1, 10_000);
+    let min_edge_wei =
+        gas_cost_wei.saturating_mul(U256::from(min_gas_fraction_bps)) / U256::from(10_000u64);
+    let min_edge_usd = std::env::var("MEV_SCAVENGER_MIN_ECONOMIC_EDGE_USD")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .unwrap_or(0.0005)
+        .max(0.0);
+    let min_edge_native = min_edge_usd / config.mev.eth_usd_price.max(0.000_001);
+    let min_edge_from_usd = ethers::utils::parse_ether(format!("{:.18}", min_edge_native))
+        .unwrap_or_else(|_| U256::zero());
+    let floor = min_edge_wei.max(min_edge_from_usd);
+    let pass = payload.expected_profit_wei >= floor;
+    GateDiagnostic {
+        pass,
+        reason: if payload.expected_profit_wei.is_zero() {
+            "ev_zero_expected_profit"
+        } else if !pass {
+            "ev_scavenger_edge_below_floor"
+        } else {
+            "ev_gate_pass"
+        },
+        detail: format!(
+            "expected_profit_wei={} floor_wei={} gas_cost_wei={} min_gas_fraction_bps={} min_edge_usd={:.6} min_edge_from_usd_wei={} gas_price_wei={} gas_limit={}",
+            payload.expected_profit_wei,
+            floor,
+            gas_cost_wei,
+            min_gas_fraction_bps,
+            min_edge_usd,
+            min_edge_from_usd,
+            gas_price,
+            payload.gas_limit
+        ),
+        expected_profit_wei: payload.expected_profit_wei,
+        execution_cost_wei: gas_cost_wei,
+        min_profit_wei: floor,
+        net_ev_usd: wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price,
+        roi_bps: roi_bps(payload.expected_profit_wei, gas_cost_wei),
+    }
+}
+
+fn scavenger_sanity_diagnostic(
+    config: &Config,
+    payload: &crate::mev::execution::payload_builder::ExecutionPayload,
+    lookup_latency: std::time::Duration,
+    reason: &'static str,
+) -> GateDiagnostic {
+    GateDiagnostic {
+        pass: false,
+        reason,
+        detail: format!(
+            "lookup_ms={} max_allowed_ms={} target={} calldata_bytes={} capital_wei={} expected_profit_wei={} gas_limit={} max_gas_per_tx={} price_impact_bps={} impact_cap_bps={}",
+            lookup_latency.as_millis(),
+            config.mev.effective_max_pending_age_ms().saturating_mul(3).max(1),
+            payload.target_contract,
+            payload.calldata.len(),
+            payload.capital_committed_wei,
+            payload.expected_profit_wei,
+            payload.gas_limit,
+            config.mev.max_gas_per_tx,
+            payload.price_impact_bps,
+            scavenger_quality_price_impact_cap_bps(config)
+        ),
+        expected_profit_wei: payload.expected_profit_wei,
+        execution_cost_wei: U256::zero(),
+        min_profit_wei: U256::zero(),
+        net_ev_usd: wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price,
+        roi_bps: 0,
+    }
 }
 
 fn scavenger_quality_price_impact_cap_bps(config: &Config) -> u64 {
@@ -2130,10 +2319,22 @@ pub(crate) fn passes_ev_gate(
     lookup_latency: std::time::Duration,
     min_profit_wei: U256,
 ) -> bool {
+    ev_gate_diagnostic(config, payload, signal, lookup_latency, min_profit_wei).pass
+}
+
+fn ev_gate_diagnostic(
+    config: &Config,
+    payload: &crate::mev::execution::payload_builder::ExecutionPayload,
+    signal: &SwapSignal,
+    lookup_latency: std::time::Duration,
+    min_profit_wei: U256,
+) -> GateDiagnostic {
     match signal.kind {
-        SwapKind::V2 => passes_ev_gate_v2(config, payload, signal, lookup_latency, min_profit_wei),
+        SwapKind::V2 => {
+            ev_gate_diagnostic_v2(config, payload, signal, lookup_latency, min_profit_wei)
+        }
         SwapKind::V3 { .. } => {
-            passes_ev_gate_v3(config, payload, signal, lookup_latency, min_profit_wei)
+            ev_gate_diagnostic_v3(config, payload, signal, lookup_latency, min_profit_wei)
         }
     }
 }
@@ -2145,12 +2346,27 @@ pub(crate) fn passes_ev_gate_v2(
     lookup_latency: std::time::Duration,
     min_profit_wei: U256,
 ) -> bool {
+    ev_gate_diagnostic_v2(config, payload, signal, lookup_latency, min_profit_wei).pass
+}
+
+fn ev_gate_diagnostic_v2(
+    config: &Config,
+    payload: &crate::mev::execution::payload_builder::ExecutionPayload,
+    signal: &SwapSignal,
+    lookup_latency: std::time::Duration,
+    min_profit_wei: U256,
+) -> GateDiagnostic {
     if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
         let lookup_is_fresh = lookup_latency.as_millis()
             <= u128::from(config.mev.effective_max_pending_age_ms().max(1));
         let gas_budget_ok = payload.gas_limit <= config.mev.max_gas_per_tx;
 
-        return lookup_is_fresh && !payload.expected_profit_wei.is_zero() && gas_budget_ok;
+        return scavenger_ev_gate_result(
+            config,
+            payload,
+            lookup_latency,
+            lookup_is_fresh && !payload.expected_profit_wei.is_zero() && gas_budget_ok,
+        );
     }
 
     let lookup_is_fresh =
@@ -2163,12 +2379,26 @@ pub(crate) fn passes_ev_gate_v2(
     let net_ev_usd = wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price;
     let gas_budget_ok = payload.gas_limit <= config.mev.max_gas_per_tx;
 
-    lookup_is_fresh
+    let pass = lookup_is_fresh
         && large_enough
         && inevitable_impact
         && profit_above_threshold
         && net_ev_usd >= config.mev.effective_min_profit_usd()
-        && gas_budget_ok
+        && gas_budget_ok;
+    standard_ev_gate_result(
+        config,
+        payload,
+        signal,
+        lookup_latency,
+        min_profit_wei,
+        pass,
+        lookup_is_fresh,
+        large_enough,
+        inevitable_impact,
+        profit_above_threshold,
+        net_ev_usd,
+        gas_budget_ok,
+    )
 }
 
 pub(crate) fn passes_ev_gate_v3(
@@ -2178,12 +2408,27 @@ pub(crate) fn passes_ev_gate_v3(
     lookup_latency: std::time::Duration,
     min_profit_wei: U256,
 ) -> bool {
+    ev_gate_diagnostic_v3(config, payload, signal, lookup_latency, min_profit_wei).pass
+}
+
+fn ev_gate_diagnostic_v3(
+    config: &Config,
+    payload: &crate::mev::execution::payload_builder::ExecutionPayload,
+    signal: &SwapSignal,
+    lookup_latency: std::time::Duration,
+    min_profit_wei: U256,
+) -> GateDiagnostic {
     if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
         let lookup_is_fresh = lookup_latency.as_millis()
             <= u128::from(config.mev.effective_max_pending_age_ms().max(1));
         let gas_budget_ok = payload.gas_limit <= config.mev.max_gas_per_tx;
 
-        return lookup_is_fresh && !payload.expected_profit_wei.is_zero() && gas_budget_ok;
+        return scavenger_ev_gate_result(
+            config,
+            payload,
+            lookup_latency,
+            lookup_is_fresh && !payload.expected_profit_wei.is_zero() && gas_budget_ok,
+        );
     }
 
     let lookup_is_fresh =
@@ -2196,12 +2441,122 @@ pub(crate) fn passes_ev_gate_v3(
     let net_ev_usd = wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price;
     let gas_budget_ok = payload.gas_limit <= config.mev.max_gas_per_tx;
 
-    lookup_is_fresh
+    let pass = lookup_is_fresh
         && large_enough
         && inevitable_impact
         && profit_above_threshold
         && net_ev_usd >= config.mev.effective_min_profit_usd()
-        && gas_budget_ok
+        && gas_budget_ok;
+    standard_ev_gate_result(
+        config,
+        payload,
+        signal,
+        lookup_latency,
+        min_profit_wei,
+        pass,
+        lookup_is_fresh,
+        large_enough,
+        inevitable_impact,
+        profit_above_threshold,
+        net_ev_usd,
+        gas_budget_ok,
+    )
+}
+
+fn scavenger_ev_gate_result(
+    config: &Config,
+    payload: &crate::mev::execution::payload_builder::ExecutionPayload,
+    lookup_latency: std::time::Duration,
+    pass: bool,
+) -> GateDiagnostic {
+    let lookup_is_fresh =
+        lookup_latency.as_millis() <= u128::from(config.mev.effective_max_pending_age_ms().max(1));
+    let gas_budget_ok = payload.gas_limit <= config.mev.max_gas_per_tx;
+    let reason = if !lookup_is_fresh {
+        "ev_lookup_stale"
+    } else if payload.expected_profit_wei.is_zero() {
+        "ev_zero_expected_profit"
+    } else if !gas_budget_ok {
+        "ev_gas_limit_above_cap"
+    } else {
+        "ev_gate_pass"
+    };
+    GateDiagnostic {
+        pass,
+        reason,
+        detail: format!(
+            "lookup_ms={} max_pending_age_ms={} expected_profit_wei={} gas_limit={} max_gas_per_tx={} price_impact_bps={}",
+            lookup_latency.as_millis(),
+            config.mev.effective_max_pending_age_ms(),
+            payload.expected_profit_wei,
+            payload.gas_limit,
+            config.mev.max_gas_per_tx,
+            payload.price_impact_bps
+        ),
+        expected_profit_wei: payload.expected_profit_wei,
+        execution_cost_wei: U256::zero(),
+        min_profit_wei: U256::zero(),
+        net_ev_usd: wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price,
+        roi_bps: 0,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn standard_ev_gate_result(
+    config: &Config,
+    payload: &crate::mev::execution::payload_builder::ExecutionPayload,
+    signal: &SwapSignal,
+    lookup_latency: std::time::Duration,
+    min_profit_wei: U256,
+    pass: bool,
+    lookup_is_fresh: bool,
+    large_enough: bool,
+    inevitable_impact: bool,
+    profit_above_threshold: bool,
+    net_ev_usd: f64,
+    gas_budget_ok: bool,
+) -> GateDiagnostic {
+    let min_large_swap_wei =
+        ethers::utils::parse_ether(config.mev.effective_min_large_swap_eth().to_string())
+            .unwrap_or_default();
+    let reason = if !lookup_is_fresh {
+        "ev_lookup_stale"
+    } else if !large_enough {
+        "ev_notional_below_min"
+    } else if !inevitable_impact {
+        "ev_price_impact_too_low"
+    } else if !profit_above_threshold {
+        "ev_profit_below_min_wei"
+    } else if net_ev_usd < config.mev.effective_min_profit_usd() {
+        "ev_profit_below_min_usd"
+    } else if !gas_budget_ok {
+        "ev_gas_limit_above_cap"
+    } else {
+        "ev_gate_pass"
+    };
+    GateDiagnostic {
+        pass,
+        reason,
+        detail: format!(
+            "lookup_ms={} max_pending_age_ms={} notional_wei={} min_large_swap_wei={} expected_profit_wei={} min_profit_wei={} net_ev_usd={:.6} min_profit_usd={:.6} price_impact_bps={} gas_limit={} max_gas_per_tx={}",
+            lookup_latency.as_millis(),
+            config.mev.effective_max_pending_age_ms(),
+            signal.notional_wei,
+            min_large_swap_wei,
+            payload.expected_profit_wei,
+            min_profit_wei,
+            net_ev_usd,
+            config.mev.effective_min_profit_usd(),
+            payload.price_impact_bps,
+            payload.gas_limit,
+            config.mev.max_gas_per_tx
+        ),
+        expected_profit_wei: payload.expected_profit_wei,
+        execution_cost_wei: U256::zero(),
+        min_profit_wei,
+        net_ev_usd,
+        roi_bps: 0,
+    }
 }
 
 pub(crate) async fn build_payload<M: Middleware + 'static>(
@@ -2530,6 +2885,51 @@ fn payload_reject_edge_sample(
             .map(|address| format!("{address:?}"))
             .unwrap_or_else(|| "unknown".to_string()),
     }
+}
+
+fn ev_gate_edge_sample(
+    tx_hash: H256,
+    signal: &SwapSignal,
+    payload: &ExecutionPayload,
+    gas_price: U256,
+    status: &str,
+    diagnostic: &GateDiagnostic,
+) -> EdgeMetadata {
+    let mut sample = payload.edge_metadata.clone().unwrap_or_else(|| {
+        payload_reject_edge_sample(tx_hash, signal, status, &diagnostic.detail, gas_price)
+    });
+    sample.victim_tx = short_hash(tx_hash);
+    sample.selector = format!(
+        "0x{:02x}{:02x}{:02x}{:02x}",
+        signal.selector[0], signal.selector[1], signal.selector[2], signal.selector[3]
+    );
+    sample.status = status.to_string();
+    sample.reason = format!("{} {}", diagnostic.reason, diagnostic.detail);
+    sample.gas_estimate = payload.gas_limit;
+    sample.simulated_extraction_native = wei_to_eth_f64(diagnostic.expected_profit_wei);
+    sample.gross_edge_wei = diagnostic.expected_profit_wei.to_string();
+    sample.gross_edge_native = wei_to_eth_f64(diagnostic.expected_profit_wei);
+    sample.price_impact_bps = payload.price_impact_bps;
+    sample.pool = format!("{:?}", payload.pair);
+    sample.router = format!("{:?}", signal.router);
+    if sample.path.is_empty() {
+        sample.path = signal
+            .path
+            .iter()
+            .map(|address| format!("{address:?}"))
+            .collect();
+    }
+    sample.hops = sample.hops.max(signal.path_len().saturating_sub(1) as u64);
+    sample.hop_profitability_rank = vec![
+        format!("gate_reason={}", diagnostic.reason),
+        format!("expected_profit_wei={}", diagnostic.expected_profit_wei),
+        format!("execution_cost_wei={}", diagnostic.execution_cost_wei),
+        format!("min_profit_or_floor_wei={}", diagnostic.min_profit_wei),
+        format!("net_ev_usd={:.6}", diagnostic.net_ev_usd),
+        format!("roi_bps={}", diagnostic.roi_bps),
+        diagnostic.detail.clone(),
+    ];
+    sample
 }
 
 fn enrich_edge_explainer_sample(

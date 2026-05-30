@@ -13,6 +13,7 @@ use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use tracing::warn;
 
 #[derive(Clone)]
 pub struct Storage {
@@ -31,15 +32,34 @@ impl Storage {
         if let Ok(database_url) = env::var("DATABASE_URL") {
             let database_url = database_url.trim();
             if !database_url.is_empty() {
-                let pool = PgPoolOptions::new()
+                match PgPoolOptions::new()
                     .max_connections(5)
                     .connect(database_url)
-                    .await?;
-                Self::migrate_postgres(&pool).await?;
-                return Ok(Self {
-                    backend: StorageBackend::Postgres(pool),
-                    network: network.to_string(),
-                });
+                    .await
+                {
+                    Ok(pool) => match Self::migrate_postgres(&pool).await {
+                        Ok(()) => {
+                            return Ok(Self {
+                                backend: StorageBackend::Postgres(pool),
+                                network: network.to_string(),
+                            });
+                        }
+                        Err(err) if postgres_storage_required() => return Err(err),
+                        Err(err) => {
+                            warn!(
+                                "postgres storage migration failed, falling back to sqlite: {}",
+                                err
+                            );
+                        }
+                    },
+                    Err(err) if postgres_storage_required() => return Err(err.into()),
+                    Err(err) => {
+                        warn!(
+                            "postgres storage connection failed, falling back to sqlite: {}",
+                            err
+                        );
+                    }
+                }
             }
         }
 
@@ -1569,6 +1589,13 @@ impl Storage {
         fs::copy(path, &versioned)?;
         Ok(Some(versioned))
     }
+}
+
+fn postgres_storage_required() -> bool {
+    env::var("STORAGE_POSTGRES_REQUIRED")
+        .unwrap_or_else(|_| "false".to_string())
+        .trim()
+        .eq_ignore_ascii_case("true")
 }
 
 #[derive(Debug, Clone, Serialize)]
