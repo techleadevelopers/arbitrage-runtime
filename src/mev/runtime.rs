@@ -5,7 +5,7 @@ use crate::dashboard::DashboardHandle;
 use crate::mev::adaptive::{
     AdaptivePolicy, AdaptiveQuoteInput, ClusterKey, ContextSignal, PreflightInput,
 };
-use crate::mev::amm::uniswap_v2::{amount_out_exact_in, V2PoolState};
+use crate::mev::amm::uniswap_v2::{amount_out_exact_in, price_impact_bps, V2PoolState};
 use crate::mev::amm::uniswap_v3::V3PoolState;
 use crate::mev::cache::pool_cache::PoolCache;
 use crate::mev::execution::payload_builder::{
@@ -858,6 +858,7 @@ async fn process_lookup_decode_task(
             );
         } else {
             dashboard.record_reject_reason("decode", "not_relevant_or_below_min");
+            dashboard.record_reject_reason("decode_selector", &decode_reject_selector_reason(&tx));
             if let Some(sample) =
                 decode_reject_edge_sample(&config, &tx, task.tx_hash, "not_relevant_or_below_min")
             {
@@ -874,6 +875,7 @@ async fn process_lookup_decode_task(
         return None;
     };
     dashboard.record_opportunity_funnel("decode_pass");
+    dashboard.record_reject_reason("decode_selector_pass", &decode_reject_selector_reason(&tx));
     latency_trace.decode_swap_us = Some(elapsed_us(decode_started));
 
     let hour_utc = chrono::Utc::now().hour() as u8;
@@ -1297,6 +1299,7 @@ async fn process_evaluation_task(
         .clone()
         .map(|sample| enrich_edge_explainer_sample(sample, tx_hash, &candidate.signal, &fast_gate))
     {
+        append_gas_sniper_shadow_metrics(&mut sample, &payload, candidate.gas_price);
         if !economic_payload {
             sample.status = "shadow_candidate".to_string();
             sample.reason = "dust edge below economic floor".to_string();
@@ -2218,6 +2221,32 @@ fn enrich_edge_explainer_sample(
     sample
 }
 
+fn append_gas_sniper_shadow_metrics(
+    sample: &mut EdgeMetadata,
+    payload: &ExecutionPayload,
+    observed_gas_price: U256,
+) {
+    let base_fee_per_block = observed_gas_price;
+    let base_priority =
+        observed_gas_price.saturating_mul(U256::from(5_000u64)) / U256::from(10_000u64);
+    let priority_to_win =
+        base_priority.saturating_mul(U256::from(15_000u64)) / U256::from(10_000u64);
+    let edge_gas_budget = payload
+        .expected_profit_wei
+        .saturating_mul(U256::from(35u64))
+        / U256::from(100u64);
+    let edge_capped_gas_price = if payload.gas_limit == 0 {
+        U256::zero()
+    } else {
+        edge_gas_budget / U256::from(payload.gas_limit)
+    };
+    let priority_fee_to_win = priority_to_win.min(edge_capped_gas_price);
+    sample.hop_profitability_rank.push(format!(
+        "gas_shadow: base_fee_per_block_wei={} priority_fee_to_win_wei={} edge_cap_gas_price_wei={} missed_inclusion=false replacement_needed=false",
+        base_fee_per_block, priority_fee_to_win, edge_capped_gas_price
+    ));
+}
+
 fn compact_text(value: &str, max_chars: usize) -> String {
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() <= max_chars {
@@ -2406,12 +2435,21 @@ async fn best_scavenger_v2_reverse_route<M: Middleware + 'static>(
         let Some(amount_out) = quote_v2_runtime_route_exact_in(probe_amount, &route, &pools) else {
             continue;
         };
+        let route_impact_bps =
+            quote_v2_runtime_route_impact_bps(probe_amount, &route, &pools).unwrap_or(10_000);
+        if route_impact_bps > scavenger_quality_price_impact_cap_bps(config) {
+            continue;
+        }
+        if route_has_low_liquidity_probe(probe_amount, &route, &pools) {
+            continue;
+        }
+        let score = scavenger_v2_route_score(amount_out, route_impact_bps, route.len());
         let replace = best
             .as_ref()
-            .map(|(best_out, _, _)| amount_out > *best_out)
+            .map(|(best_score, _, _)| score > *best_score)
             .unwrap_or(true);
         if replace {
-            best = Some((amount_out, route, pools));
+            best = Some((score, route, pools));
         }
     }
 
@@ -2506,6 +2544,59 @@ fn quote_v2_runtime_route_exact_in(
         amount = amount_out_exact_in(amount, reserve_in, reserve_out, pool.fee_bps)?;
     }
     Some(amount)
+}
+
+fn quote_v2_runtime_route_impact_bps(
+    amount_in: U256,
+    route: &[Address],
+    pools: &[V2PoolState],
+) -> Option<u64> {
+    if route.len() < 2 || pools.len() + 1 != route.len() {
+        return None;
+    }
+    let mut amount = amount_in;
+    let mut worst_impact_bps = 0u64;
+    for (idx, pool) in pools.iter().enumerate() {
+        let (reserve_in, reserve_out) = pool.reserves_for(route[idx], route[idx + 1])?;
+        let amount_out = amount_out_exact_in(amount, reserve_in, reserve_out, pool.fee_bps)?;
+        worst_impact_bps = worst_impact_bps.max(price_impact_bps(
+            amount,
+            amount_out,
+            reserve_in,
+            reserve_out,
+        ));
+        amount = amount_out;
+    }
+    Some(worst_impact_bps)
+}
+
+fn route_has_low_liquidity_probe(
+    probe_amount: U256,
+    route: &[Address],
+    pools: &[V2PoolState],
+) -> bool {
+    if route.len() < 2 || pools.len() + 1 != route.len() {
+        return true;
+    }
+    for (idx, pool) in pools.iter().enumerate() {
+        let Some((reserve_in, reserve_out)) = pool.reserves_for(route[idx], route[idx + 1]) else {
+            return true;
+        };
+        if reserve_in <= probe_amount.saturating_mul(U256::from(20u64))
+            || reserve_out <= U256::one()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn scavenger_v2_route_score(amount_out: U256, impact_bps: u64, route_len: usize) -> U256 {
+    let hop_count = route_len.saturating_sub(1).max(1) as u64;
+    let penalty_bps = 10_000u64
+        .saturating_add(impact_bps.saturating_mul(2))
+        .saturating_add(hop_count.saturating_sub(1).saturating_mul(250));
+    amount_out.saturating_mul(U256::from(10_000u64)) / U256::from(penalty_bps.max(1))
 }
 
 fn push_unique_address(addresses: &mut Vec<Address>, address: Address) {
@@ -3084,6 +3175,18 @@ fn selector(tx: &Transaction) -> Option<[u8; 4]> {
         return Some(crate::mev::decoder::simd::SELECTORS[index]);
     }
     (input.len() >= 4).then(|| [input[0], input[1], input[2], input[3]])
+}
+
+fn decode_reject_selector_reason(tx: &Transaction) -> String {
+    let selector = selector(tx).unwrap_or([0, 0, 0, 0]);
+    format!(
+        "selector=0x{:02x}{:02x}{:02x}{:02x} source={}",
+        selector[0],
+        selector[1],
+        selector[2],
+        selector[3],
+        aggregator_name_from_tx(tx).unwrap_or("direct_or_unknown")
+    )
 }
 
 fn aggregator_name_from_tx(tx: &Transaction) -> Option<&'static str> {

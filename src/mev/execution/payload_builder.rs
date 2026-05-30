@@ -386,51 +386,6 @@ impl PayloadBuilder {
         };
 
         let scavenger = config.mev.opportunity_mode() == OpportunityMode::Scavenger;
-        if scavenger {
-            let sample = EdgeMetadata {
-                victim_tx: String::new(),
-                selector: String::new(),
-                status: "blocked".to_string(),
-                reason: "v3 repayment model not unit-safe yet".to_string(),
-                route_kind: "v3".to_string(),
-                path: vec![
-                    format!("{:?}", input.token_out),
-                    format!("{:?}", input.token_in),
-                ],
-                hops: 1,
-                impacted_pools: vec![format!("{:?}", input.pair)],
-                slippage_window_score: 0.0,
-                pool_imbalance_score: 0.0,
-                cross_dex_deviation_bps: 0,
-                gas_estimate: 0,
-                simulated_extraction_native: 0.0,
-                aggregator_type: "direct_router".to_string(),
-                route_complexity: 1,
-                split_ratio_bps: 0,
-                dex_sequence: vec!["v3".to_string()],
-                route_inefficiency_score: 0.0,
-                liquidity_distortion_score: 0.0,
-                hop_profitability_rank: Vec::new(),
-                best_size_bps: 0,
-                amount_in_wei: "0".to_string(),
-                amount_out_wei: "0".to_string(),
-                gross_edge_wei: "0".to_string(),
-                gross_edge_native: 0.0,
-                repayment_wei: "0".to_string(),
-                repayment_native: 0.0,
-                price_impact_bps: post_victim.slippage_impact_bps,
-                self_slippage_bps: 0,
-                pool: format!("{:?}", input.pair),
-                factory: format_optional_address(input.factory),
-                router: format!("{:?}", input.router),
-                token_in: format!("{:?}", input.token_in),
-                token_out: format!("{:?}", input.token_out),
-            };
-            return Err(payload_error_with_edge_sample(
-                "v3 scavenger payload disabled until repayment model is unit-safe",
-                Some(sample),
-            ));
-        }
         if post_victim.slippage_impact_bps > effective_payload_price_impact_cap_bps(config) {
             return Err(format!(
                 "victim price impact too high: {}bps",
@@ -587,6 +542,21 @@ impl PayloadBuilder {
             token_out: format!("{:?}", input.token_out),
         };
 
+        if scavenger {
+            let sample = v3_scavenger_shadow_sample(
+                edge_metadata,
+                amount_in,
+                amount_out,
+                fee_tier,
+                gas_cost,
+                path.len() == 43,
+            );
+            return Err(payload_error_with_edge_sample(
+                "v3 scavenger payload disabled until repayment model is unit-safe",
+                Some(sample),
+            ));
+        }
+
         let executor = config.mev.mev_executor.ok_or_else(|| {
             payload_error_with_edge_sample(
                 "MEV_EXECUTOR_ADDRESS is required to build atomic payload",
@@ -669,6 +639,50 @@ fn scavenger_shadow_negative_tolerance_native(config: &Config) -> f64 {
         .unwrap_or(15.0)
         .abs();
     tolerance_usd / config.mev.eth_usd_price.max(1.0)
+}
+
+fn v3_scavenger_shadow_sample(
+    mut sample: EdgeMetadata,
+    amount_in: U256,
+    amount_out: U256,
+    fee_tier: u32,
+    gas_cost: U256,
+    single_hop_path: bool,
+) -> EdgeMetadata {
+    let repayment = v3_flash_repayment_wei(amount_in, fee_tier);
+    let gross_edge = amount_out.saturating_sub(repayment);
+    let net_after_gas = gross_edge.saturating_sub(gas_cost);
+    let unit_safe = single_hop_path && !repayment.is_zero() && amount_out >= repayment;
+
+    sample.status = "v3_shadow".to_string();
+    sample.reason = format!(
+        "v3_shadow_repayment_wei={} v3_shadow_gross_edge={} v3_shadow_net_after_gas={} unit_safe={}",
+        repayment, gross_edge, net_after_gas, unit_safe
+    );
+    sample.simulated_extraction_native = wei_to_eth_f64(gross_edge);
+    sample.gross_edge_wei = gross_edge.to_string();
+    sample.gross_edge_native = wei_to_eth_f64(gross_edge);
+    sample.repayment_wei = repayment.to_string();
+    sample.repayment_native = wei_to_eth_f64(repayment);
+    sample.hop_profitability_rank = vec![
+        format!("v3_shadow_repayment_wei={}", repayment),
+        format!("v3_shadow_gross_edge={}", gross_edge),
+        format!("v3_shadow_net_after_gas={}", net_after_gas),
+        format!("unit_safe={}", unit_safe),
+    ];
+    sample
+}
+
+fn v3_flash_repayment_wei(amount: U256, fee_tier: u32) -> U256 {
+    if amount.is_zero() {
+        return U256::zero();
+    }
+    let fee_denominator = U256::from(1_000_000u64);
+    let fee = amount
+        .saturating_mul(U256::from(fee_tier))
+        .saturating_add(fee_denominator - U256::one())
+        / fee_denominator;
+    amount.saturating_add(fee)
 }
 
 fn format_optional_address(address: Option<Address>) -> String {
