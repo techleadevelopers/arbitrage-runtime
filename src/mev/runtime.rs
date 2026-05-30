@@ -3047,6 +3047,13 @@ fn short_hash(hash: H256) -> String {
     }
 }
 
+fn selector_hex(selector: [u8; 4]) -> String {
+    format!(
+        "0x{:02x}{:02x}{:02x}{:02x}",
+        selector[0], selector[1], selector[2], selector[3]
+    )
+}
+
 fn contextual_capital_available_wei(
     config: &Config,
     context_signal: ContextSignal,
@@ -3827,13 +3834,7 @@ fn decode_safe_exec_transaction_swap(
         return None;
     }
     let inner_selector = [inner[0], inner[1], inner[2], inner[3]];
-    decode_swap_signal(
-        inner_selector,
-        target,
-        value,
-        &inner[4..],
-        monitored_tokens,
-    )
+    decode_swap_signal(inner_selector, target, value, &inner[4..], monitored_tokens)
 }
 
 fn decode_universal_router_swap(
@@ -4433,6 +4434,7 @@ fn diagnose_decode_reject(
             | UNIVERSAL_ROUTER_EXECUTE
             | UNIVERSAL_ROUTER_EXECUTE_NO_DEADLINE
             | ZERO_EX_SELL_TO_UNISWAP
+            | SAFE_EXEC_TRANSACTION
     );
 
     if matches!(
@@ -4496,6 +4498,10 @@ fn diagnose_decode_reject(
             ),
             hints: vec![format!("unsupported selector {selector_text}")],
         };
+    }
+
+    if selector == SAFE_EXEC_TRANSACTION {
+        return diagnose_safe_exec_decode(tx, tx_hash, selector_text.as_str(), path_hint);
     }
 
     if let Some(diagnostic) = diagnose_direct_router_decode(
@@ -4579,6 +4585,85 @@ fn diagnose_decode_reject(
         } else {
             vec!["decode rejected after monitored token hint".to_string()]
         },
+    }
+}
+
+fn diagnose_safe_exec_decode(
+    tx: &Transaction,
+    tx_hash: H256,
+    selector_text: &str,
+    path_hint: Vec<String>,
+) -> DecodeRejectDiagnostic {
+    let args = tx.input.as_ref().get(4..).unwrap_or_default();
+    let decoded = abi::decode(
+        &[
+            ParamType::Address,
+            ParamType::Uint(256),
+            ParamType::Bytes,
+            ParamType::Uint(8),
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Address,
+            ParamType::Address,
+            ParamType::Bytes,
+        ],
+        args,
+    );
+    let Ok(decoded) = decoded else {
+        return DecodeRejectDiagnostic {
+            reason: "safe_exec_abi_decode_failed",
+            detail: format!(
+                "tx={} selector={} safe ABI decode failed",
+                short_hash(tx_hash),
+                selector_text
+            ),
+            hints: vec!["safe execTransaction wrapper not decoded".to_string()],
+        };
+    };
+    let target = decoded
+        .first()
+        .and_then(token_as_address)
+        .map(|address| format!("{address:?}"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let operation = decoded
+        .get(3)
+        .and_then(token_as_uint)
+        .unwrap_or_else(U256::zero);
+    let inner_selector = match decoded.get(2) {
+        Some(Token::Bytes(value)) if value.len() >= 4 => {
+            Some([value[0], value[1], value[2], value[3]])
+        }
+        _ => None,
+    };
+    let inner_selector_text = inner_selector
+        .map(selector_hex)
+        .unwrap_or_else(|| "none".to_string());
+    let reason = if !operation.is_zero() {
+        "safe_exec_delegatecall_ignored"
+    } else if inner_selector.is_none() {
+        "safe_exec_inner_calldata_missing"
+    } else {
+        "safe_exec_inner_selector_unsupported"
+    };
+    DecodeRejectDiagnostic {
+        reason,
+        detail: format!(
+            "tx={} selector={} target={} operation={} inner_selector={} monitored_token_hint={}",
+            short_hash(tx_hash),
+            selector_text,
+            target,
+            operation,
+            inner_selector_text,
+            if path_hint.is_empty() {
+                "none".to_string()
+            } else {
+                path_hint.join(",")
+            }
+        ),
+        hints: vec![format!(
+            "safe execTransaction inner selector {inner_selector_text}"
+        )],
     }
 }
 
@@ -5911,6 +5996,48 @@ mod tests {
         assert_eq!(signal.amount_in, U256::from(2u64) * unit);
         assert_eq!(signal.path, vec![monitored_in, monitored_out]);
         assert_eq!(signal.notional_wei, U256::from(2u64) * unit);
+    }
+
+    #[test]
+    fn safe_exec_transaction_unwraps_inner_v2_swap() {
+        let safe = Address::from_low_u64_be(20);
+        let router = Address::from_low_u64_be(10);
+        let token_in = Address::from_low_u64_be(3);
+        let token_out = Address::from_low_u64_be(4);
+        let unit = U256::exp10(18);
+        let inner_args = encode(&[
+            Token::Uint(U256::from(2u64) * unit),
+            Token::Uint(U256::from(1u64)),
+            Token::Array(vec![Token::Address(token_in), Token::Address(token_out)]),
+            Token::Address(Address::from_low_u64_be(99)),
+            Token::Uint(U256::from(123u64)),
+        ]);
+        let inner_calldata = [SWAP_EXACT_TOKENS_FOR_TOKENS.to_vec(), inner_args].concat();
+        let safe_args = encode(&[
+            Token::Address(router),
+            Token::Uint(U256::zero()),
+            Token::Bytes(inner_calldata),
+            Token::Uint(U256::zero()),
+            Token::Uint(U256::zero()),
+            Token::Uint(U256::zero()),
+            Token::Uint(U256::zero()),
+            Token::Address(Address::zero()),
+            Token::Address(Address::zero()),
+            Token::Bytes(Vec::new()),
+        ]);
+        let monitored = vec![MonitoredTokenConfig {
+            address: token_in,
+            decimals: 18,
+            price_eth: 1.0,
+        }];
+
+        let signal = decode_safe_exec_transaction_swap(safe, &safe_args, &monitored).unwrap();
+
+        assert_eq!(signal.selector, SWAP_EXACT_TOKENS_FOR_TOKENS);
+        assert_eq!(signal.router, router);
+        assert_eq!(signal.amount_in, U256::from(2u64) * unit);
+        assert_eq!(signal.path, vec![token_in, token_out]);
+        assert!(matches!(signal.kind, SwapKind::V2));
     }
 
     #[test]

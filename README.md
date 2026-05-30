@@ -1231,10 +1231,23 @@ For BNB Chain configuration, use the `_BSC` suffix as the canonical operator-fac
 - `STORAGE_PATH`
 - `DATABASE_URL`
 - `STORAGE_POSTGRES_REQUIRED`
+- `STORAGE_EVENTS_ENABLED`
+- `STORAGE_TELEMETRY_ENABLED`
 - `STORAGE_EVENTS_RETENTION_HOURS`
 - `STORAGE_TELEMETRY_RETENTION_HOURS`
+- `MEV_FILE_TELEMETRY_ENABLED`
+- `MEV_FILE_TELEMETRY_DIR`
+- `MEV_FILE_TELEMETRY_MAX_MB`
+- `MEV_FILE_TELEMETRY_KEEP_FILES`
+- `MEV_DECODE_REJECT_SAMPLE_RATE`
+- `MEV_FILE_LATENCY_TELEMETRY_ENABLED`
 
 If `DATABASE_URL` is set, the storage layer attempts Postgres first. With `STORAGE_POSTGRES_REQUIRED=true`, any Postgres connection or migration failure is fatal. With `STORAGE_POSTGRES_REQUIRED=false` or unset, the runtime falls back to SQLite at `STORAGE_PATH` if Postgres is unavailable, which is useful during database disk-pressure incidents.
+
+Runtime event and latency persistence is opt-in to keep small managed Postgres volumes from filling during shadow runs:
+
+- `STORAGE_EVENTS_ENABLED=false`: keep dashboard events in memory and optional file telemetry, but do not insert every event into Postgres.
+- `STORAGE_TELEMETRY_ENABLED=false`: keep live latency metrics in memory, but do not insert every latency sample into Postgres.
 
 Runtime-only storage is pruned automatically:
 
@@ -1242,6 +1255,14 @@ Runtime-only storage is pruned automatically:
 - `STORAGE_TELEMETRY_RETENTION_HOURS`: latency telemetry retention, default `6`.
 
 Execution outcomes, relay metrics, toxicity profiles, and treasury records are not part of this short runtime prune. They remain the evidence layer for historical calibration.
+
+For raw investigation, enable lightweight file telemetry instead of writing high-cardinality debug data into Postgres:
+
+- `MEV_FILE_TELEMETRY_ENABLED=true`: writes JSONL records to `MEV_FILE_TELEMETRY_DIR`.
+- `MEV_FILE_TELEMETRY_MAX_MB=25`: rotates the active file when it reaches this size.
+- `MEV_FILE_TELEMETRY_KEEP_FILES=5`: keeps the latest rotated files.
+- `MEV_DECODE_REJECT_SAMPLE_RATE=20`: writes every new decode-reject key and then samples repeated decode rejects.
+- `MEV_FILE_LATENCY_TELEMETRY_ENABLED=false`: latency JSONL is disabled by default because it is high-volume.
 
 ### RPC and execution path
 
@@ -1349,6 +1370,10 @@ Use this funnel before loosening strategy logic. If `pending hashes` rises but `
 Decode rejects are intentionally granular. The main reasons to watch are:
 
 - `selector_unsupported`: calldata selector is not one of the supported direct router or aggregator selectors.
+- `safe_exec_abi_decode_failed`: selector `0x6a761202` matched Gnosis Safe `execTransaction`, but the wrapper ABI could not be decoded.
+- `safe_exec_delegatecall_ignored`: a Safe wrapper used delegatecall; it is intentionally not unwrapped into a victim swap.
+- `safe_exec_inner_calldata_missing`: Safe `execTransaction` decoded, but the wrapped calldata was empty or shorter than a selector.
+- `safe_exec_inner_selector_unsupported`: Safe `execTransaction` decoded, but the inner target selector is still unsupported.
 - `universal_router_command_unsupported`: Universal Router calldata decoded, but it used commands outside the executable V2/V3 subset.
 - `universal_router_subplan_not_extracted`: Universal Router command graph was present, but no executable hop was extracted from nested subplans.
 - `universal_router_abi_decode_failed`: Universal Router selector matched, but commands/inputs could not be decoded.
@@ -1361,6 +1386,8 @@ Decode rejects are intentionally granular. The main reasons to watch are:
 In `scavenger`, `monitored_token_not_input` routes are allowed to continue as shadow candidates with a conservative notional floor so payload telemetry can reveal whether the route is economically useful. In stricter modes, the input token still needs a configured price to pass normal notional gating.
 
 Universal Router telemetry includes command names, input sizes, nested subplan status, swap count, hop count, unsupported commands, and route graph hints. Treat `permit2_*`, wrap/unwrap, sweep, transfer, and balance-check commands as context commands; they are not payload hops by themselves.
+
+Safe wrapper telemetry is treated as a decode layer, not as a strategy by itself. Selector `0x6a761202` is unwrapped as `execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)` when the operation is a normal call, then the inner calldata is passed back through the normal V2/V3/Universal Router decoder. If the dashboard still shows an unsupported selector after this unwrap, the selector is the inner target function that needs ABI coverage. For example, a remaining `unsupported selector 0xeaa79076` should be investigated as a separate router/aggregator selector before changing economic gates.
 
 Payload rejects also emit `payload_build_detail`. The key categories are:
 

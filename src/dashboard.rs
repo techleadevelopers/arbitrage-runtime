@@ -11,7 +11,11 @@ use axum::{Json, Router};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -28,6 +32,7 @@ pub struct DashboardHandle {
     pending: Arc<Mutex<PendingStorageWrites>>,
     observer: Arc<Mutex<ScavengerObserver>>,
     last_storage_prune: Arc<Mutex<Instant>>,
+    file_telemetry: Arc<FileTelemetry>,
 }
 
 #[derive(Default)]
@@ -89,6 +94,178 @@ struct PendingExecutionOutcome {
     gas_used: u64,
     submit_latency_ms: f64,
     finalization_latency_ms: f64,
+}
+
+struct FileTelemetry {
+    enabled: bool,
+    path: PathBuf,
+    max_bytes: u64,
+    keep_files: usize,
+    decode_reject_sample_rate: u64,
+    state: Mutex<FileTelemetryState>,
+}
+
+#[derive(Default)]
+struct FileTelemetryState {
+    edge_samples_seen: u64,
+    seen_decode_reject_keys: HashSet<String>,
+}
+
+impl FileTelemetry {
+    fn from_env() -> Self {
+        let enabled = env_bool("MEV_FILE_TELEMETRY_ENABLED", false);
+        let dir = std::env::var("MEV_FILE_TELEMETRY_DIR").unwrap_or_else(|_| "logs".to_string());
+        let max_mb = env_u64("MEV_FILE_TELEMETRY_MAX_MB", 25).max(1);
+        let keep_files = env_u64("MEV_FILE_TELEMETRY_KEEP_FILES", 5).clamp(1, 100) as usize;
+        let decode_reject_sample_rate = env_u64("MEV_DECODE_REJECT_SAMPLE_RATE", 20).max(1);
+        Self {
+            enabled,
+            path: PathBuf::from(dir).join("edge-shadow.jsonl"),
+            max_bytes: max_mb.saturating_mul(1024 * 1024),
+            keep_files,
+            decode_reject_sample_rate,
+            state: Mutex::new(FileTelemetryState::default()),
+        }
+    }
+
+    fn record_edge_sample(&self, sample: &EdgeSampleSnapshot) {
+        if !self.enabled || !self.should_write_edge_sample(sample) {
+            return;
+        }
+        let record = serde_json::json!({
+            "at": Utc::now().to_rfc3339(),
+            "kind": "edge_sample",
+            "sample": sample,
+        });
+        self.write_json_line(&record);
+    }
+
+    fn record_event(&self, level: &str, message: &str) {
+        if !self.enabled {
+            return;
+        }
+        let record = serde_json::json!({
+            "at": Utc::now().to_rfc3339(),
+            "kind": "event",
+            "level": level,
+            "message": message,
+        });
+        self.write_json_line(&record);
+    }
+
+    fn record_latency(
+        &self,
+        stage: &str,
+        duration_ms: u128,
+        wallet: Option<&str>,
+        note: Option<&str>,
+    ) {
+        if !self.enabled || !file_latency_enabled() {
+            return;
+        }
+        let record = serde_json::json!({
+            "at": Utc::now().to_rfc3339(),
+            "kind": "latency",
+            "stage": stage,
+            "duration_ms": duration_ms,
+            "wallet": wallet,
+            "note": note,
+        });
+        self.write_json_line(&record);
+    }
+
+    fn should_write_edge_sample(&self, sample: &EdgeSampleSnapshot) -> bool {
+        if sample.status != "decode_reject" {
+            return true;
+        }
+        let key = format!("{}|{}", sample.selector, sample.reason);
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        state.edge_samples_seen = state.edge_samples_seen.saturating_add(1);
+        if state.seen_decode_reject_keys.insert(key) {
+            return true;
+        }
+        state.edge_samples_seen % self.decode_reject_sample_rate == 0
+    }
+
+    fn write_json_line(&self, record: &serde_json::Value) {
+        if let Some(parent) = self.path.parent() {
+            if fs::create_dir_all(parent).is_err() {
+                return;
+            }
+        }
+        self.rotate_if_needed();
+        let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        else {
+            return;
+        };
+        if serde_json::to_writer(&mut file, record).is_ok() {
+            let _ = file.write_all(b"\n");
+        }
+    }
+
+    fn rotate_if_needed(&self) {
+        let Ok(metadata) = fs::metadata(&self.path) else {
+            return;
+        };
+        if metadata.len() < self.max_bytes {
+            return;
+        }
+        for idx in (1..=self.keep_files).rev() {
+            let from = rotated_path(&self.path, idx);
+            let to = rotated_path(&self.path, idx + 1);
+            if from.exists() {
+                if idx == self.keep_files {
+                    let _ = fs::remove_file(&from);
+                } else {
+                    let _ = fs::rename(&from, &to);
+                }
+            }
+        }
+        let _ = fs::rename(&self.path, rotated_path(&self.path, 1));
+    }
+}
+
+fn rotated_path(path: &std::path::Path, idx: usize) -> PathBuf {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("jsonl");
+    path.with_extension(format!("{idx}.{extension}"))
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn storage_events_enabled() -> bool {
+    env_bool("STORAGE_EVENTS_ENABLED", false)
+}
+
+fn storage_telemetry_enabled() -> bool {
+    env_bool("STORAGE_TELEMETRY_ENABLED", false)
+}
+
+fn file_latency_enabled() -> bool {
+    env_bool("MEV_FILE_LATENCY_TELEMETRY_ENABLED", false)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -834,6 +1011,7 @@ impl DashboardHandle {
                     .checked_sub(Duration::from_secs(120))
                     .unwrap_or_else(Instant::now),
             )),
+            file_telemetry: Arc::new(FileTelemetry::from_env()),
         }
     }
 
@@ -930,6 +1108,7 @@ impl DashboardHandle {
         if let Ok(mut pending) = self.pending.lock() {
             pending.events.push((level.to_string(), message.clone()));
         }
+        self.file_telemetry.record_event(level, &message);
         let mut state = self.inner.write().expect("dashboard state lock");
         push_event(&mut state.recent_events, level, message);
     }
@@ -959,6 +1138,8 @@ impl DashboardHandle {
                 note: note.map(str::to_string),
             });
         }
+        self.file_telemetry
+            .record_latency(stage, duration_ms, wallet, note);
         let mut state = self.inner.write().expect("dashboard state lock");
         upsert_latency_metric(&mut state.latency_metrics, stage, duration_ms);
     }
@@ -1094,6 +1275,7 @@ impl DashboardHandle {
             state.edge_telemetry.blocked_count =
                 state.edge_telemetry.blocked_count.saturating_add(1);
         }
+        let file_snapshot = snapshot.clone();
         state.edge_telemetry.last_sample = Some(snapshot.clone());
         state.edge_telemetry.samples.push_front(snapshot);
         while state.edge_telemetry.samples.len() > 50 {
@@ -1107,6 +1289,8 @@ impl DashboardHandle {
                 format!("edge telemetry sample recorded count={sample_count}"),
             );
         }
+        drop(state);
+        self.file_telemetry.record_edge_sample(&file_snapshot);
     }
 
     pub fn set_relay_rankings(&self, relays: Vec<RelaySnapshot>) {
@@ -1239,17 +1423,21 @@ impl DashboardHandle {
             std::mem::take(&mut *pending)
         };
 
-        for (level, message) in pending.events {
-            self.storage.log_event(&level, &message);
+        if storage_events_enabled() {
+            for (level, message) in pending.events {
+                self.storage.log_event(&level, &message);
+            }
         }
 
-        for latency in pending.latencies {
-            self.storage.log_telemetry(
-                &latency.stage,
-                latency.duration_ms,
-                latency.wallet.as_deref(),
-                latency.note.as_deref(),
-            );
+        if storage_telemetry_enabled() {
+            for latency in pending.latencies {
+                self.storage.log_telemetry(
+                    &latency.stage,
+                    latency.duration_ms,
+                    latency.wallet.as_deref(),
+                    latency.note.as_deref(),
+                );
+            }
         }
 
         for relay in pending.relay_updates {
