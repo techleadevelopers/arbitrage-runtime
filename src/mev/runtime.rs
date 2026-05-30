@@ -489,6 +489,10 @@ pub async fn run(
             eval_workers
         ),
     );
+    dashboard.event(
+        "info",
+        "decoder capabilities safe_exec=enabled universal_router_subplan=enabled file_jsonl_telemetry=enabled_or_env_controlled",
+    );
 
     for worker_idx in 0..lookup_decode_workers {
         let rx = lookup_decode_rx.clone();
@@ -4486,9 +4490,12 @@ fn diagnose_decode_reject(
         return DecodeRejectDiagnostic {
             reason: "selector_unsupported",
             detail: format!(
-                "tx={} selector={} monitored_token_hint={} input_bytes={}",
+                "tx={} selector={} to={} monitored_token_hint={} input_bytes={}",
                 short_hash(tx_hash),
                 selector_text,
+                tx.to
+                    .map(|address| format!("{address:?}"))
+                    .unwrap_or_else(|| "unknown".to_string()),
                 if path_hint.is_empty() {
                     "none".to_string()
                 } else {
