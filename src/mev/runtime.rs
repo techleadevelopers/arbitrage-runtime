@@ -865,17 +865,36 @@ async fn process_lookup_decode_task(
         latency_trace.decode_swap_us = Some(elapsed_us(decode_started));
         latency_trace.total_internal_us = Some(elapsed_us(task.candidate_started));
         dashboard.record_opportunity_funnel("decode_reject");
+        let decode_reject = diagnose_decode_reject(
+            &config,
+            &tx,
+            task.tx_hash,
+            min_large_swap_wei,
+            config.mev.opportunity_mode(),
+        );
+        dashboard.record_reject_reason("decode", decode_reject.reason);
+        dashboard.record_reject_reason("decode_selector", &decode_reject_selector_reason(&tx));
         if let Some(name) = aggregator_name_from_tx(&tx) {
             dashboard.record_reject_reason("aggregator_decode", name);
-            if let Some(sample) = aggregator_intelligence_sample(&config, &tx, task.tx_hash, name) {
+            dashboard.record_reject_reason("aggregator_decode_detail", decode_reject.reason);
+            if let Some(mut sample) =
+                aggregator_intelligence_sample(&config, &tx, task.tx_hash, name)
+            {
+                sample.status = "decode_reject".to_string();
+                sample.reason = decode_reject.detail.clone();
+                if !decode_reject.hints.is_empty() {
+                    sample.hop_profitability_rank = decode_reject.hints.clone();
+                }
                 dashboard.record_edge_sample(sample);
             }
             dashboard.event(
                 "warn",
                 format!(
-                    "aggregator flow not decoded tx={} source={}",
+                    "aggregator flow not decoded tx={} source={} reason={} detail={}",
                     short_hash(task.tx_hash),
-                    name
+                    name,
+                    decode_reject.reason,
+                    compact_text(&decode_reject.detail, 140)
                 ),
             );
             latency_trace.emit(
@@ -883,13 +902,11 @@ async fn process_lookup_decode_task(
                 &dashboard,
                 task.tx_hash,
                 "reject",
-                "aggregator_decode_missing",
+                decode_reject.reason,
             );
         } else {
-            dashboard.record_reject_reason("decode", "not_relevant_or_below_min");
-            dashboard.record_reject_reason("decode_selector", &decode_reject_selector_reason(&tx));
             if let Some(sample) =
-                decode_reject_edge_sample(&config, &tx, task.tx_hash, "not_relevant_or_below_min")
+                decode_reject_edge_sample(&config, &tx, task.tx_hash, &decode_reject)
             {
                 dashboard.record_edge_sample(sample);
             }
@@ -898,7 +915,7 @@ async fn process_lookup_decode_task(
                 &dashboard,
                 task.tx_hash,
                 "reject",
-                "decode_no_signal",
+                decode_reject.reason,
             );
         }
         return None;
@@ -1412,20 +1429,32 @@ async fn process_evaluation_task(
         Ok(payload) => payload,
         Err(err) => {
             dashboard.record_opportunity_funnel("payload_reject");
-            if let Some(sample) = extract_edge_sample(&err).map(|sample| {
-                enrich_edge_explainer_sample(sample, tx_hash, &candidate.signal, &fast_gate)
-            }) {
-                dashboard.record_edge_sample(sample);
-            }
             let human_reason = human_payload_error(&err);
+            let payload_detail = payload_error_detail(&err, &candidate.signal);
+            let sample = extract_edge_sample(&err)
+                .map(|sample| {
+                    enrich_edge_explainer_sample(sample, tx_hash, &candidate.signal, &fast_gate)
+                })
+                .unwrap_or_else(|| {
+                    payload_reject_edge_sample(
+                        tx_hash,
+                        &candidate.signal,
+                        &human_reason,
+                        &payload_detail,
+                        candidate.gas_price,
+                    )
+                });
+            dashboard.record_edge_sample(sample);
             dashboard.record_reject_reason("payload_build", &human_reason);
+            dashboard.record_reject_reason("payload_build_detail", payload_detail.as_str());
             dashboard.event(
                 "warn",
                 format!(
-                    "payload blocked mode={} tx={} reason={}",
+                    "payload blocked mode={} tx={} reason={} detail={}",
                     config.mev.opportunity_mode().as_str(),
                     short_hash(tx_hash),
-                    human_reason
+                    human_reason,
+                    payload_detail
                 ),
             );
             candidate.latency_trace.payload_build_us = Some(elapsed_us(payload_started));
@@ -2341,6 +2370,69 @@ fn human_payload_error(error: &str) -> String {
     format!("{reason} ({})", compact_text(&clean_error, 96))
 }
 
+fn payload_error_detail(error: &str, signal: &SwapSignal) -> String {
+    let clean_error = strip_edge_sample(error);
+    let lower = clean_error.to_ascii_lowercase();
+    let route_kind = match &signal.kind {
+        SwapKind::V2 => "v2".to_string(),
+        SwapKind::V3 { fee_tier, .. } => format!("v3 fee_tier={fee_tier}"),
+    };
+    let path = signal
+        .path
+        .iter()
+        .map(|address| format!("{address:?}"))
+        .collect::<Vec<_>>()
+        .join(">");
+
+    let category = if lower.contains("v2 factory unavailable")
+        || lower.contains("v3 factory unavailable")
+        || lower.contains("missing uniswap v2 factory")
+        || lower.contains("missing uniswap v3 factory")
+    {
+        "factory_wrong_or_unavailable"
+    } else if lower.contains("v3 pool not found") {
+        "v3_fee_tier_or_pool_not_found"
+    } else if lower.contains("pair not found") {
+        if matches!(signal.kind, SwapKind::V3 { .. }) {
+            "v3_routed_to_v2_pair_lookup"
+        } else {
+            "v2_pair_not_found"
+        }
+    } else if lower.contains("pool after victim does not support reverse path")
+        || lower.contains("reverse path")
+    {
+        "path_inverted_or_pool_token_mismatch"
+    } else if lower.contains("failed to fetch pool state") {
+        "pool_state_unavailable"
+    } else if lower.contains("victim price impact too high") {
+        "victim_price_impact_too_high"
+    } else if lower.contains("no positive gross") {
+        "economic_no_positive_gross_edge"
+    } else if lower.contains("no roi-positive") {
+        "economic_no_positive_net_after_gas"
+    } else if lower.contains("below minimum") {
+        "economic_profit_below_floor"
+    } else {
+        "payload_builder_unclassified"
+    };
+
+    format!(
+        "{category} route_kind={} amount_in={} amount_out_min={} path={} raw={}",
+        route_kind,
+        signal.amount_in,
+        signal
+            .amount_out_min
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        if path.is_empty() {
+            "unknown".to_string()
+        } else {
+            path
+        },
+        compact_text(&clean_error, 120)
+    )
+}
+
 fn strip_edge_sample(error: &str) -> String {
     error
         .split(" | edge_sample=")
@@ -2352,6 +2444,91 @@ fn strip_edge_sample(error: &str) -> String {
 fn extract_edge_sample(error: &str) -> Option<EdgeMetadata> {
     let (_, json) = error.split_once(" | edge_sample=")?;
     serde_json::from_str::<EdgeMetadata>(json).ok()
+}
+
+fn payload_reject_edge_sample(
+    tx_hash: H256,
+    signal: &SwapSignal,
+    human_reason: &str,
+    payload_detail: &str,
+    gas_price: U256,
+) -> EdgeMetadata {
+    let (route_kind, fee_tier_hint, encoded_hops) = match &signal.kind {
+        SwapKind::V2 => ("v2".to_string(), "n/a".to_string(), 0),
+        SwapKind::V3 { fee_tier, hops, .. } => ("v3".to_string(), fee_tier.to_string(), *hops),
+    };
+    EdgeMetadata {
+        victim_tx: short_hash(tx_hash),
+        selector: format!(
+            "0x{:02x}{:02x}{:02x}{:02x}",
+            signal.selector[0], signal.selector[1], signal.selector[2], signal.selector[3]
+        ),
+        status: "payload_reject".to_string(),
+        reason: format!("{human_reason}; {payload_detail}"),
+        route_kind: route_kind.clone(),
+        path: signal
+            .path
+            .iter()
+            .map(|address| format!("{address:?}"))
+            .collect(),
+        hops: signal.path_len().saturating_sub(1).max(encoded_hops) as u64,
+        impacted_pools: Vec::new(),
+        slippage_window_score: scavenger_slippage_window_hint(signal),
+        pool_imbalance_score: 0.0,
+        cross_dex_deviation_bps: 0,
+        gas_estimate: gas_price.as_u64(),
+        simulated_extraction_native: 0.0,
+        aggregator_type: if matches!(
+            signal.selector,
+            UNIVERSAL_ROUTER_EXECUTE | UNIVERSAL_ROUTER_EXECUTE_NO_DEADLINE
+        ) {
+            "universal_router".to_string()
+        } else {
+            "direct_router".to_string()
+        },
+        route_complexity: signal.path_len().max(1) as u64,
+        split_ratio_bps: 0,
+        dex_sequence: vec![route_kind],
+        route_inefficiency_score: scavenger_route_inefficiency_hint(signal),
+        liquidity_distortion_score: 0.0,
+        hop_profitability_rank: vec![
+            format!("amount_in={}", signal.amount_in),
+            format!(
+                "amount_out_min={}",
+                signal
+                    .amount_out_min
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ),
+            format!("fee_tier={fee_tier_hint}"),
+            payload_detail.to_string(),
+        ],
+        best_size_bps: 0,
+        amount_in_wei: signal.amount_in.to_string(),
+        amount_out_wei: signal
+            .amount_out_min
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "0".to_string()),
+        gross_edge_wei: "0".to_string(),
+        gross_edge_native: 0.0,
+        repayment_wei: "0".to_string(),
+        repayment_native: 0.0,
+        price_impact_bps: 0,
+        self_slippage_bps: 0,
+        pool: "unknown".to_string(),
+        factory: "unknown".to_string(),
+        router: format!("{:?}", signal.router),
+        token_in: signal
+            .path
+            .first()
+            .map(|address| format!("{address:?}"))
+            .unwrap_or_else(|| "unknown".to_string()),
+        token_out: signal
+            .path
+            .last()
+            .map(|address| format!("{address:?}"))
+            .unwrap_or_else(|| "unknown".to_string()),
+    }
 }
 
 fn enrich_edge_explainer_sample(
@@ -2602,8 +2779,14 @@ async fn find_v2_pair<M: Middleware + 'static>(
         let factory_contract = UniswapV2Factory::new(factory, provider.clone());
         match factory_contract.get_pair(token_in, token_out).call().await {
             Ok(pair) if pair != Address::zero() => return Ok((factory, pair)),
-            Ok(_) => errors.push(format!("pair not found on factory {:?}", factory)),
-            Err(err) => errors.push(format!("factory {:?} lookup failed: {}", factory, err)),
+            Ok(_) => errors.push(format!(
+                "v2 pair not found on factory {:?} token_in={:?} token_out={:?}",
+                factory, token_in, token_out
+            )),
+            Err(err) => errors.push(format!(
+                "v2 factory {:?} lookup failed token_in={:?} token_out={:?}: {}",
+                factory, token_in, token_out, err
+            )),
         }
     }
 
@@ -2899,10 +3082,13 @@ async fn find_v3_pool<M: Middleware + 'static>(
         {
             Ok(pool) if pool != Address::zero() => return Ok((factory, pool)),
             Ok(_) => errors.push(format!(
-                "v3 pool not found on factory {:?} fee={}",
-                factory, fee_tier
+                "v3 pool not found on factory {:?} fee={} token_in={:?} token_out={:?}",
+                factory, fee_tier, token_in, token_out
             )),
-            Err(err) => errors.push(format!("v3 factory {:?} lookup failed: {}", factory, err)),
+            Err(err) => errors.push(format!(
+                "v3 factory {:?} lookup failed fee={} token_in={:?} token_out={:?}: {}",
+                factory, fee_tier, token_in, token_out, err
+            )),
         }
     }
 
@@ -3303,7 +3489,7 @@ fn universal_router_hop_to_signal(
         let fee_tier = hop.fee_tier?;
         SwapKind::V3 {
             fee_tier,
-            encoded_path: encode_v3_path(hop.token_in, fee_tier, hop.token_out),
+            encoded_path: encode_v3_path(hop.token_out, fee_tier, hop.token_in),
             hops: 1,
             exact_out: hop.exact_out,
         }
@@ -3734,11 +3920,187 @@ fn aggregator_intelligence_sample(
     })
 }
 
+#[derive(Debug, Clone)]
+struct DecodeRejectDiagnostic {
+    reason: &'static str,
+    detail: String,
+    hints: Vec<String>,
+}
+
+fn diagnose_decode_reject(
+    config: &Config,
+    tx: &Transaction,
+    tx_hash: H256,
+    min_large_swap_wei: U256,
+    mode: OpportunityMode,
+) -> DecodeRejectDiagnostic {
+    let Some(selector) = selector(tx) else {
+        return DecodeRejectDiagnostic {
+            reason: "selector_missing_or_short_calldata",
+            detail: "calldata shorter than 4-byte selector".to_string(),
+            hints: Vec::new(),
+        };
+    };
+    let selector_text = format!(
+        "0x{:02x}{:02x}{:02x}{:02x}",
+        selector[0], selector[1], selector[2], selector[3]
+    );
+    let path_hint = monitored_token_path_hint(config, tx.input.as_ref());
+    let supported_selector = matches!(
+        selector,
+        SWAP_EXACT_ETH_FOR_TOKENS
+            | SWAP_EXACT_ETH_FOR_TOKENS_SUPPORTING_FEE
+            | SWAP_EXACT_TOKENS_FOR_TOKENS
+            | SWAP_EXACT_TOKENS_FOR_ETH
+            | SWAP_EXACT_TOKENS_FOR_TOKENS_SUPPORTING_FEE
+            | SWAP_EXACT_TOKENS_FOR_ETH_SUPPORTING_FEE
+            | V3_EXACT_INPUT_SINGLE
+            | V3_EXACT_INPUT
+            | UNIVERSAL_ROUTER_EXECUTE
+            | UNIVERSAL_ROUTER_EXECUTE_NO_DEADLINE
+            | ZERO_EX_SELL_TO_UNISWAP
+    );
+
+    if matches!(
+        selector,
+        UNIVERSAL_ROUTER_EXECUTE | UNIVERSAL_ROUTER_EXECUTE_NO_DEADLINE
+    ) {
+        let hints = universal_router_decode_hints(tx);
+        let args = tx.input.as_ref().get(4..).unwrap_or_default();
+        let graph = universal_router_route_graph(args);
+        let reason = match &graph {
+            Some(graph) if graph.swap_command_count == 0 => "universal_router_no_swap_command",
+            Some(graph) if graph.hops.is_empty() && !graph.unsupported_commands.is_empty() => {
+                "universal_router_command_unsupported"
+            }
+            Some(graph) if graph.hops.is_empty() => "universal_router_subplan_not_extracted",
+            Some(_) if path_hint.is_empty() => "monitored_token_not_in_path",
+            Some(_) => "universal_router_path_invalid",
+            None => "universal_router_abi_decode_failed",
+        };
+        let mut detail = format!(
+            "tx={} selector={} {}",
+            short_hash(tx_hash),
+            selector_text,
+            reason
+        );
+        if let Some(graph) = graph {
+            detail.push_str(&format!(
+                " commands={} swaps={} hops={} unsupported={}",
+                graph.command_count,
+                graph.swap_command_count,
+                graph.hops.len(),
+                graph.unsupported_commands.join(",")
+            ));
+        }
+        if !path_hint.is_empty() {
+            detail.push_str(&format!(" monitored_tokens={}", path_hint.join(",")));
+        }
+        if !hints.is_empty() {
+            detail.push_str(&format!(" hints={}", hints.join(" | ")));
+        }
+        return DecodeRejectDiagnostic {
+            reason,
+            detail,
+            hints,
+        };
+    }
+
+    if !supported_selector {
+        return DecodeRejectDiagnostic {
+            reason: "selector_unsupported",
+            detail: format!(
+                "tx={} selector={} monitored_token_hint={} input_bytes={}",
+                short_hash(tx_hash),
+                selector_text,
+                if path_hint.is_empty() {
+                    "none".to_string()
+                } else {
+                    path_hint.join(",")
+                },
+                tx.input.as_ref().len()
+            ),
+            hints: vec![format!("unsupported selector {selector_text}")],
+        };
+    }
+
+    if let Some(mut signal) = decode_relevant_swap(
+        tx,
+        &config.monitored_tokens,
+        U256::zero(),
+        OpportunityMode::Scavenger,
+    ) {
+        if signal.path.len() < 2 {
+            return DecodeRejectDiagnostic {
+                reason: "path_invalid",
+                detail: format!("selector={} decoded path has <2 tokens", selector_text),
+                hints: vec!["decoded path invalid".to_string()],
+            };
+        }
+        match estimate_notional_wei(&signal, &config.monitored_tokens) {
+            Some(notional_wei) => {
+                signal.notional_wei = notional_wei;
+                if mode != OpportunityMode::Scavenger && notional_wei < min_large_swap_wei {
+                    return DecodeRejectDiagnostic {
+                        reason: "amount_in_below_min",
+                        detail: format!(
+                            "selector={} notional_wei={} min_large_swap_wei={} path_len={}",
+                            selector_text,
+                            notional_wei,
+                            min_large_swap_wei,
+                            signal.path_len()
+                        ),
+                        hints: vec![
+                            format!("amount_in_wei={}", signal.amount_in),
+                            format!("notional_wei={notional_wei}"),
+                            format!("min_large_swap_wei={min_large_swap_wei}"),
+                        ],
+                    };
+                }
+            }
+            None => {
+                return DecodeRejectDiagnostic {
+                    reason: "token_monitored_path_invalid",
+                    detail: format!(
+                        "selector={} path decoded but no monitored token valuation path_len={}",
+                        selector_text,
+                        signal.path_len()
+                    ),
+                    hints: signal
+                        .path
+                        .iter()
+                        .map(|address| format!("{address:?}"))
+                        .collect(),
+                };
+            }
+        }
+    }
+
+    DecodeRejectDiagnostic {
+        reason: "not_relevant_or_below_min",
+        detail: format!(
+            "selector={} monitored_token_hint={} input_bytes={}",
+            selector_text,
+            if path_hint.is_empty() {
+                "none".to_string()
+            } else {
+                path_hint.join(",")
+            },
+            tx.input.as_ref().len()
+        ),
+        hints: if path_hint.is_empty() {
+            Vec::new()
+        } else {
+            vec!["decode rejected after monitored token hint".to_string()]
+        },
+    }
+}
+
 fn decode_reject_edge_sample(
     config: &Config,
     tx: &Transaction,
     tx_hash: H256,
-    reason: &str,
+    diagnostic: &DecodeRejectDiagnostic,
 ) -> Option<EdgeMetadata> {
     let selector = selector(tx)?;
     let path_hint = monitored_token_path_hint(config, tx.input.as_ref());
@@ -3752,7 +4114,7 @@ fn decode_reject_edge_sample(
             selector[0], selector[1], selector[2], selector[3]
         ),
         status: "decode_reject".to_string(),
-        reason: reason.to_string(),
+        reason: diagnostic.detail.clone(),
         route_kind: "unknown".to_string(),
         path: path_hint,
         hops: 0,
@@ -3768,7 +4130,11 @@ fn decode_reject_edge_sample(
         dex_sequence: vec!["decode_reject".to_string()],
         route_inefficiency_score: 0.0,
         liquidity_distortion_score: 0.0,
-        hop_profitability_rank: vec!["decode rejected after monitored token hint".to_string()],
+        hop_profitability_rank: if diagnostic.hints.is_empty() {
+            vec![diagnostic.reason.to_string()]
+        } else {
+            diagnostic.hints.clone()
+        },
         best_size_bps: 0,
         amount_in_wei: tx.value.to_string(),
         amount_out_wei: "0".to_string(),
@@ -4246,6 +4612,11 @@ fn universal_router_decode_hints(tx: &Transaction) -> Vec<String> {
             0x01 => universal_router_v3_exact_out_status(input),
             0x08 => universal_router_v2_swap_status(input, false),
             0x09 => universal_router_v2_swap_status(input, true),
+            0x02 | 0x03 | 0x0a | 0x0d => "permit2 command skipped".to_string(),
+            0x04 | 0x05 | 0x06 | 0x0b | 0x0c | 0x0e => {
+                "balance/transfer command skipped".to_string()
+            }
+            0x21 => universal_router_subplan_status(input),
             _ => "unsupported command".to_string(),
         };
         hints.push(format!(
@@ -4261,6 +4632,28 @@ fn universal_router_decode_hints(tx: &Transaction) -> Vec<String> {
         ));
     }
     hints
+}
+
+fn universal_router_subplan_status(input: &[u8]) -> String {
+    match decode_universal_router_sub_plan(input) {
+        Some((sub_commands, sub_inputs)) => {
+            let mut graph = UniversalRouterRouteGraph {
+                command_count: 0,
+                swap_command_count: 0,
+                hops: Vec::new(),
+                unsupported_commands: Vec::new(),
+            };
+            collect_universal_router_graph(&sub_commands, &sub_inputs, 1, &mut graph);
+            format!(
+                "subplan decoded commands={} swaps={} hops={} unsupported={}",
+                graph.command_count,
+                graph.swap_command_count,
+                graph.hops.len(),
+                graph.unsupported_commands.join(",")
+            )
+        }
+        None => "subplan decode failed".to_string(),
+    }
 }
 
 fn universal_router_command_name(opcode: u8) -> &'static str {
