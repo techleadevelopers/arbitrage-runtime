@@ -168,6 +168,8 @@ pub struct ExecutionOutcomeSnapshot {
     pub token_in: String,
     pub token_out: String,
     pub victim_tx: String,
+    pub target_tx: String,
+    pub alvo_tx: String,
     pub outcome: String,
     pub expected_profit_eth: f64,
     pub realized_profit_eth: f64,
@@ -228,6 +230,8 @@ pub struct EdgeTelemetrySnapshot {
 pub struct EdgeSampleSnapshot {
     pub observed_at: String,
     pub victim_tx: String,
+    pub target_tx: String,
+    pub alvo_tx: String,
     pub selector: String,
     pub status: String,
     pub reason: String,
@@ -920,7 +924,7 @@ impl DashboardHandle {
     }
 
     pub fn event(&self, level: &str, message: impl Into<String>) {
-        let message = message.into();
+        let message = dashboard_display_message(&message.into());
         if let Ok(mut pending) = self.pending.lock() {
             pending.events.push((level.to_string(), message.clone()));
         }
@@ -963,6 +967,7 @@ impl DashboardHandle {
     }
 
     pub fn record_reject_reason(&self, stage: &str, reason: &str) {
+        let reason = dashboard_display_message(reason);
         let mut state = self.inner.write().expect("dashboard state lock");
         if let Some(entry) = state
             .reject_reasons
@@ -973,7 +978,7 @@ impl DashboardHandle {
         } else {
             state.reject_reasons.push(RejectReasonSnapshot {
                 stage: stage.to_string(),
-                reason: reason.to_string(),
+                reason,
                 count: 1,
             });
         }
@@ -1042,9 +1047,12 @@ impl DashboardHandle {
 
     pub fn record_edge_sample(&self, sample: EdgeMetadata) {
         let mut state = self.inner.write().expect("dashboard state lock");
+        let target_tx = sample.victim_tx;
         let snapshot = EdgeSampleSnapshot {
             observed_at: Utc::now().to_rfc3339(),
-            victim_tx: sample.victim_tx,
+            victim_tx: target_tx.clone(),
+            target_tx: target_tx.clone(),
+            alvo_tx: target_tx,
             selector: sample.selector,
             status: sample.status,
             reason: sample.reason,
@@ -1214,6 +1222,8 @@ impl DashboardHandle {
                 token_in: update.token_in.to_string(),
                 token_out: update.token_out.to_string(),
                 victim_tx: update.victim_tx.to_string(),
+                target_tx: update.victim_tx.to_string(),
+                alvo_tx: update.victim_tx.to_string(),
                 outcome: update.outcome.to_string(),
                 expected_profit_eth: update.expected_profit_eth,
                 realized_profit_eth: update.realized_profit_eth,
@@ -1633,6 +1643,15 @@ fn push_event(queue: &mut VecDeque<DashboardEvent>, level: &str, message: String
     while queue.len() > 50 {
         queue.pop_back();
     }
+}
+
+fn dashboard_display_message(message: &str) -> String {
+    message
+        .replace("victim_tx", "alvo_tx")
+        .replace("victim=", "alvo=")
+        .replace("victim ", "alvo ")
+        .replace(" victim", " alvo")
+        .replace("Victim", "Alvo")
 }
 
 fn build_latency_metrics(summary: HashMap<String, (u64, u128, u128, u128)>) -> Vec<LatencyMetric> {

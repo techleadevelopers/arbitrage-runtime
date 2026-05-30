@@ -502,7 +502,7 @@ impl PayloadBuilder {
             ));
         }
 
-        let edge_metadata = EdgeMetadata {
+        let mut edge_metadata = EdgeMetadata {
             victim_tx: String::new(),
             selector: String::new(),
             status: "payload_built".to_string(),
@@ -543,18 +543,33 @@ impl PayloadBuilder {
         };
 
         if scavenger {
-            let sample = v3_scavenger_shadow_sample(
-                edge_metadata,
+            let shadow_metrics = v3_scavenger_shadow_metrics(
                 amount_in,
                 amount_out,
                 fee_tier,
                 gas_cost,
                 path.len() == 43,
             );
-            return Err(payload_error_with_edge_sample(
-                "v3 scavenger payload disabled until repayment model is unit-safe",
-                Some(sample),
-            ));
+            edge_metadata = v3_scavenger_shadow_sample(edge_metadata, shadow_metrics);
+            if !shadow_metrics.unit_safe || shadow_metrics.net_after_gas.is_zero() {
+                return Err(payload_error_with_edge_sample(
+                    "v3 scavenger payload disabled until repayment model is unit-safe",
+                    Some(edge_metadata),
+                ));
+            }
+            if config.allow_send {
+                edge_metadata.status = "blocked".to_string();
+                edge_metadata.reason = format!("{} live_send_blocked=true", edge_metadata.reason);
+                return Err(payload_error_with_edge_sample(
+                    "v3 scavenger payload shadow-ready but live send is disabled for V3",
+                    Some(edge_metadata),
+                ));
+            }
+            edge_metadata.status = "v3_shadow_ready".to_string();
+            edge_metadata.reason = format!(
+                "{} shadow_payload_built=true allow_send=false",
+                edge_metadata.reason
+            );
         }
 
         let executor = config.mev.mev_executor.ok_or_else(|| {
@@ -641,34 +656,53 @@ fn scavenger_shadow_negative_tolerance_native(config: &Config) -> f64 {
     tolerance_usd / config.mev.eth_usd_price.max(1.0)
 }
 
-fn v3_scavenger_shadow_sample(
-    mut sample: EdgeMetadata,
+#[derive(Debug, Clone, Copy)]
+struct V3ScavengerShadowMetrics {
+    repayment: U256,
+    gross_edge: U256,
+    net_after_gas: U256,
+    unit_safe: bool,
+}
+
+fn v3_scavenger_shadow_metrics(
     amount_in: U256,
     amount_out: U256,
     fee_tier: u32,
     gas_cost: U256,
     single_hop_path: bool,
-) -> EdgeMetadata {
+) -> V3ScavengerShadowMetrics {
     let repayment = v3_flash_repayment_wei(amount_in, fee_tier);
     let gross_edge = amount_out.saturating_sub(repayment);
     let net_after_gas = gross_edge.saturating_sub(gas_cost);
     let unit_safe = single_hop_path && !repayment.is_zero() && amount_out >= repayment;
 
+    V3ScavengerShadowMetrics {
+        repayment,
+        gross_edge,
+        net_after_gas,
+        unit_safe,
+    }
+}
+
+fn v3_scavenger_shadow_sample(
+    mut sample: EdgeMetadata,
+    metrics: V3ScavengerShadowMetrics,
+) -> EdgeMetadata {
     sample.status = "v3_shadow".to_string();
     sample.reason = format!(
         "v3_shadow_repayment_wei={} v3_shadow_gross_edge={} v3_shadow_net_after_gas={} unit_safe={}",
-        repayment, gross_edge, net_after_gas, unit_safe
+        metrics.repayment, metrics.gross_edge, metrics.net_after_gas, metrics.unit_safe
     );
-    sample.simulated_extraction_native = wei_to_eth_f64(gross_edge);
-    sample.gross_edge_wei = gross_edge.to_string();
-    sample.gross_edge_native = wei_to_eth_f64(gross_edge);
-    sample.repayment_wei = repayment.to_string();
-    sample.repayment_native = wei_to_eth_f64(repayment);
+    sample.simulated_extraction_native = wei_to_eth_f64(metrics.gross_edge);
+    sample.gross_edge_wei = metrics.gross_edge.to_string();
+    sample.gross_edge_native = wei_to_eth_f64(metrics.gross_edge);
+    sample.repayment_wei = metrics.repayment.to_string();
+    sample.repayment_native = wei_to_eth_f64(metrics.repayment);
     sample.hop_profitability_rank = vec![
-        format!("v3_shadow_repayment_wei={}", repayment),
-        format!("v3_shadow_gross_edge={}", gross_edge),
-        format!("v3_shadow_net_after_gas={}", net_after_gas),
-        format!("unit_safe={}", unit_safe),
+        format!("v3_shadow_repayment_wei={}", metrics.repayment),
+        format!("v3_shadow_gross_edge={}", metrics.gross_edge),
+        format!("v3_shadow_net_after_gas={}", metrics.net_after_gas),
+        format!("unit_safe={}", metrics.unit_safe),
     ];
     sample
 }
@@ -1161,5 +1195,59 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("v3 scavenger payload disabled until repayment model is unit-safe"));
+    }
+
+    #[test]
+    fn scavenger_v3_single_hop_unit_safe_builds_shadow_payload_when_send_blocked() {
+        let mut config = test_config();
+        config.mev.max_price_impact_bps = 6_000;
+        let token_in = Address::from_low_u64_be(1);
+        let token_out = Address::from_low_u64_be(2);
+        let mut encoded_path = Vec::new();
+        encoded_path.extend_from_slice(token_out.as_bytes());
+        encoded_path.extend_from_slice(&500u32.to_be_bytes()[1..]);
+        encoded_path.extend_from_slice(token_in.as_bytes());
+
+        let pool = V3PoolState {
+            pool: Address::from_low_u64_be(30),
+            token0: token_in,
+            token1: token_out,
+            sqrt_price_x96: U256::from_dec_str("79228162514264337593543950336").unwrap(),
+            liquidity: U256::from(1_000_000_000_000_000_000u128),
+            current_tick: 0,
+            fee_bps: 5,
+            initialized_ticks: Vec::new(),
+        };
+
+        let payload = PayloadBuilder::build_fee_extraction_v3(
+            &config,
+            FeeExtractionBuildInput {
+                router: Address::from_low_u64_be(40),
+                factory: Some(Address::from_low_u64_be(21)),
+                pair: pool.pool,
+                recipient: Address::from_low_u64_be(12),
+                token_in,
+                token_out,
+                victim_amount_in: U256::from(150_000_000_000_000_000u128),
+                state_before: AmmState::UniswapV3(pool),
+                capital_available_wei: U256::from(100_000_000_000_000u128),
+                gas_price_wei: U256::zero(),
+                context_priority_score: 0.5,
+                context_toxicity_score: 0.5,
+                route_kind: AmmRouteKind::UniswapV3 {
+                    fee_tier: 500,
+                    path: Bytes::from(encoded_path),
+                },
+                v2_swap_path: None,
+                v2_swap_pools: Vec::new(),
+            },
+        )
+        .expect("unit-safe v3 single-hop should build a shadow payload while ALLOW_SEND=false");
+
+        let sample = payload.edge_metadata.expect("edge metadata");
+        assert_eq!(sample.status, "v3_shadow_ready");
+        assert!(sample.reason.contains("unit_safe=true"));
+        assert!(sample.reason.contains("shadow_payload_built=true"));
+        assert!(payload.expected_profit_wei > U256::zero());
     }
 }
