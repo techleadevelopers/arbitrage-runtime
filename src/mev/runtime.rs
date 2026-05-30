@@ -62,6 +62,7 @@ pub(crate) enum SwapKind {
         fee_tier: u32,
         encoded_path: ethers::types::Bytes,
         hops: usize,
+        exact_out: bool,  // <-- ADICIONAR
     },
 }
 
@@ -424,6 +425,7 @@ pub async fn run(
         ethers::utils::parse_ether(config.mev.effective_min_net_profit_eth().to_string())?;
     let adaptive = AdaptivePolicy::shared(&config);
     refresh_historical_profiles(&adaptive, &storage, &dashboard);
+    spawn_historical_profile_refresher(adaptive.clone(), storage.clone(), dashboard.clone());
     let executor = ExecutionEngine::new(
         config.clone(),
         rpc_fleet.clone(),
@@ -438,7 +440,6 @@ pub async fn run(
     let (ready_tx, mut ready_rx) = mpsc::channel::<PendingExecutionCandidate>(EVAL_QUEUE_CAPACITY);
     let lookup_decode_rx = Arc::new(Mutex::new(lookup_decode_rx));
     let eval_rx = Arc::new(Mutex::new(eval_rx));
-    let mut last_profile_refresh = Instant::now();
     let mut batcher = MicroBatcher::default();
     let mut flush_tick = tokio::time::interval(Duration::from_millis(MICROBATCH_WINDOW_MS));
 
@@ -543,10 +544,6 @@ pub async fn run(
                 let scan_started = Instant::now();
                 if dashboard.runtime_paused() {
                     continue;
-                }
-                if last_profile_refresh.elapsed() >= Duration::from_secs(60) {
-                    refresh_historical_profiles(&adaptive, &storage, &dashboard);
-                    last_profile_refresh = Instant::now();
                 }
                 if mark_seen_tx(&mut seen_hashes, &mut seen_order, tx_hash) {
                     dashboard.record_opportunity_funnel("pending_hashes_received");
@@ -2696,8 +2693,8 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
     context_signal: ContextSignal,
     fee_tier: u32,
     encoded_path: ethers::types::Bytes,
-    pool_cache: &PoolCache, // NOVO PARÂMETRO
-    block_number: u64,      // NOVO PARÂMETRO
+    pool_cache: &PoolCache,
+    block_number: u64,
 ) -> Result<ExecutionPayload, String> {
     let recipient = config.profit_address;
     let token_in = *signal
@@ -2735,6 +2732,42 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
 
     let capital_available_wei = contextual_capital_available_wei(config, context_signal)?;
 
+    // NOVO: Determinar o amount_in correto baseado no tipo de swap
+    let (victim_amount_in, is_exact_out) = match &signal.kind {
+        SwapKind::V3 { exact_out, .. } => {
+            if *exact_out {
+                // Para exact-out, amount_in é o teto (amount_in_max)
+                (signal.amount_in, true)
+            } else {
+                (signal.amount_in, false)
+            }
+        }
+        _ => (signal.amount_in, false),
+    };
+
+    // NOVO: Calcular edge conservador para exact-out single-hop
+    if is_exact_out {
+        let _amount_out_min = signal.amount_out_min.ok_or_else(|| {
+            "exact_out requires amount_out_min".to_string()
+        })?;
+        
+        // Verificar se o edge é positivo usando amount_in_max como teto
+        let gas_cost_wei = gas_price.saturating_mul(U256::from(300_000u64));
+        
+        // Cálculo conservador: assumimos que vamos pagar o amount_in_max inteiro
+        if victim_amount_in <= gas_cost_wei {
+            return Err(format!(
+                "exact_out edge below gas cost: amount_in_max={} gas_cost={}",
+                victim_amount_in, gas_cost_wei
+            ));
+        }
+        
+        let edge_wei = victim_amount_in.saturating_sub(gas_cost_wei);
+        if edge_wei.is_zero() {
+            return Err("exact_out positive gross edge not found".to_string());
+        }
+    }
+
     PayloadBuilder::build_fee_extraction_v3(
         config,
         FeeExtractionBuildInput {
@@ -2744,7 +2777,7 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
             recipient,
             token_in,
             token_out,
-            victim_amount_in: signal.amount_in,
+            victim_amount_in,  // USAR O VALOR CORRETO (amount_in_max para exact-out)
             state_before: crate::mev::simulation::state_simulator::AmmState::UniswapV3(state),
             capital_available_wei,
             gas_price_wei: gas_price,
@@ -2851,6 +2884,7 @@ pub(crate) fn decode_relevant_swap(
                     fee_tier,
                     encoded_path: encode_v3_path(token_out, fee_tier, token_in),
                     hops: 1,
+                    exact_out: false,
                 },
             }
         }
@@ -2891,6 +2925,7 @@ pub(crate) fn decode_relevant_swap(
                         parsed.token_in,
                     ),
                     hops: parsed.hops,
+                    exact_out: false,
                 },
             }
         }
@@ -3008,6 +3043,7 @@ fn decode_universal_router_v2_exact_in(
     })
 }
 
+
 fn decode_universal_router_v2_exact_out(
     selector: [u8; 4],
     router: Address,
@@ -3076,6 +3112,7 @@ fn decode_universal_router_v3_exact_in(
                 parsed.token_in,
             ),
             hops: parsed.hops,
+            exact_out: false,
         },
     })
 }
@@ -3118,9 +3155,11 @@ fn decode_universal_router_v3_exact_out(
                 parsed.token_in,
             ),
             hops: parsed.hops,
+            exact_out: true,
         },
     })
 }
+
 
 fn decode_zero_ex_sell_to_uniswap(
     selector: [u8; 4],
@@ -3868,6 +3907,21 @@ fn refresh_historical_profiles(
             warn!("historical profile refresh failed: {}", err);
         }
     }
+}
+
+fn spawn_historical_profile_refresher(
+    adaptive: crate::mev::adaptive::SharedAdaptivePolicy,
+    storage: Storage,
+    dashboard: DashboardHandle,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(300));
+
+        loop {
+            tick.tick().await;
+            refresh_historical_profiles(&adaptive, &storage, &dashboard);
+        }
+    });
 }
 
 #[cfg(test)]
