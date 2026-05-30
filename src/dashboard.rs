@@ -2,8 +2,8 @@ use crate::config::{parse_opportunity_mode, Config, OpportunityMode, Opportunity
 use crate::mev::execution::payload_builder::EdgeMetadata;
 use crate::rpc::{RpcEndpointSnapshot, RpcFleet};
 use crate::storage::{
-    SelectorPerformanceSnapshot, SelectorPoolPerformanceSnapshot, Storage,
-    UnsupportedSelectorRecord,
+    SelectorPerformanceSnapshot, SelectorPoolPerformanceSnapshot, SelectorReplayScoreSnapshot,
+    Storage, UnsupportedSelectorRecord,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
@@ -862,6 +862,7 @@ pub struct DashboardState {
     pub edge_telemetry: EdgeTelemetrySnapshot,
     pub selector_scores: Vec<SelectorPerformanceSnapshot>,
     pub selector_pool_scores: Vec<SelectorPoolPerformanceSnapshot>,
+    pub selector_replay_scores: Vec<SelectorReplayScoreSnapshot>,
     pub scavenger_observer: ScavengerObserverReport,
     pub reject_reasons: Vec<RejectReasonSnapshot>,
     pub relay_rankings: Vec<RelaySnapshot>,
@@ -1084,6 +1085,7 @@ impl DashboardHandle {
                 selector_pool_scores: storage
                     .selector_pool_performance_scores(12)
                     .unwrap_or_default(),
+                selector_replay_scores: storage.selector_replay_scores(12).unwrap_or_default(),
                 scavenger_observer: ScavengerObserverReport::default(),
                 reject_reasons: Vec::new(),
                 relay_rankings,
@@ -1161,6 +1163,9 @@ impl DashboardHandle {
         }
         if let Ok(selector_pool_scores) = self.storage.selector_pool_performance_scores(12) {
             state.selector_pool_scores = selector_pool_scores;
+        }
+        if let Ok(selector_replay_scores) = self.storage.selector_replay_scores(12) {
+            state.selector_replay_scores = selector_replay_scores;
         }
         state.opportunity_mode = self
             .opportunity_mode

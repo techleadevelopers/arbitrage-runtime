@@ -18,12 +18,12 @@ use crate::mev::simulation::state_simulator::{
     AccountState, AmmState, EvmPreflightResult, StateSimulator,
 };
 use crate::rpc::RpcFleet;
-use crate::storage::Storage;
+use crate::storage::{ReplayCandidateRecord, Storage};
 use chrono::Timelike;
 use ethers::abi::{self, ParamType, Token};
 use ethers::providers::{Middleware, Provider, StreamExt, Ws};
 use ethers::types::{Address, Transaction, H256, U256};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -119,6 +119,23 @@ struct PendingExecutionCandidate {
     capital_efficiency: f64,
     relay_score: f64,
     context_priority_score: f64,
+}
+
+#[derive(Debug, Clone)]
+struct ReplayCandidate {
+    tx_hash: H256,
+    selector: String,
+    target: String,
+    pool: String,
+    path: Vec<Address>,
+    amount_in: U256,
+    amount_out_min: Option<U256>,
+    gas_gwei: f64,
+    block_number: u64,
+    expected_profit: f64,
+    confidence: f64,
+    decode_source: &'static str,
+    gas_limit: u64,
 }
 
 impl PendingExecutionCandidate {
@@ -484,6 +501,7 @@ pub async fn run(
         mpsc::channel::<PendingHashTask>(LOOKUP_DECODE_QUEUE_CAPACITY);
     let (eval_tx, eval_rx) = mpsc::channel::<LookupDecodedCandidate>(EVAL_QUEUE_CAPACITY);
     let (ready_tx, mut ready_rx) = mpsc::channel::<PendingExecutionCandidate>(EVAL_QUEUE_CAPACITY);
+    let replay_tx = spawn_replay_worker_if_enabled(storage.clone(), dashboard.clone());
     let lookup_decode_rx = Arc::new(Mutex::new(lookup_decode_rx));
     let eval_rx = Arc::new(Mutex::new(eval_rx));
     let mut batcher = MicroBatcher::default();
@@ -556,6 +574,7 @@ pub async fn run(
         let adaptive = adaptive.clone();
         let dashboard = dashboard.clone();
         let pool_cache = pool_cache.clone();
+        let replay_tx = replay_tx.clone();
 
         tokio::spawn(async move {
             while let Some(candidate) = recv_from_shared_channel(&rx).await {
@@ -570,6 +589,7 @@ pub async fn run(
                     dashboard.clone(),
                     min_large_swap_wei,
                     min_profit_wei,
+                    replay_tx.clone(),
                     pool_cache.clone(),
                 )
                 .await
@@ -1368,6 +1388,7 @@ async fn process_evaluation_task(
     dashboard: DashboardHandle,
     min_large_swap_wei: U256,
     min_profit_wei: U256,
+    replay_tx: Option<mpsc::Sender<ReplayCandidate>>,
     pool_cache: Arc<PoolCache>, // NOVO PARÂMETRO
 ) -> Option<PendingExecutionCandidate> {
     let tx_hash = candidate.tx.hash;
@@ -1606,6 +1627,16 @@ async fn process_evaluation_task(
         &payload,
         economic_payload,
         gas_price_gwei(candidate.gas_price),
+    );
+    maybe_enqueue_replay_candidate(
+        replay_tx.as_ref(),
+        tx_hash,
+        &candidate.signal,
+        &payload,
+        economic_payload,
+        candidate.gas_price,
+        candidate.block_number,
+        &dashboard,
     );
     if let Some(mut sample) = payload
         .edge_metadata
@@ -3338,6 +3369,188 @@ fn record_payload_pool_reject(
             gas_gwei,
         );
     }
+}
+
+fn maybe_enqueue_replay_candidate(
+    replay_tx: Option<&mpsc::Sender<ReplayCandidate>>,
+    tx_hash: H256,
+    signal: &SwapSignal,
+    payload: &ExecutionPayload,
+    economic_payload: bool,
+    gas_price: U256,
+    block_number: u64,
+    dashboard: &DashboardHandle,
+) {
+    let Some(replay_tx) = replay_tx else {
+        return;
+    };
+    let expected_profit = wei_to_eth_f64(payload.expected_profit_wei);
+    if !economic_payload || expected_profit <= 0.0 {
+        return;
+    }
+    if signal.decode_confidence < replay_min_confidence() {
+        return;
+    }
+    let pool = payload
+        .edge_metadata
+        .as_ref()
+        .map(|sample| sample.pool.as_str())
+        .filter(|pool| !pool.trim().is_empty() && *pool != "unknown")
+        .map(str::to_string)
+        .unwrap_or_else(|| address_hex(payload.pair));
+    if pool == "unknown" {
+        return;
+    }
+    let key = format!(
+        "{}|{}|{}",
+        selector_hex(signal.selector),
+        address_hex(signal.router),
+        pool
+    );
+    let repeat_count = replay_repeat_count(&key);
+    if repeat_count < replay_min_repeat_count() {
+        return;
+    }
+    let candidate = ReplayCandidate {
+        tx_hash,
+        selector: selector_hex(signal.selector),
+        target: address_hex(signal.router),
+        pool,
+        path: signal.path.clone(),
+        amount_in: signal.amount_in,
+        amount_out_min: signal.amount_out_min,
+        gas_gwei: gas_price_gwei(gas_price),
+        block_number,
+        expected_profit,
+        confidence: signal.decode_confidence,
+        decode_source: signal.decode_source,
+        gas_limit: payload.gas_limit,
+    };
+    match replay_tx.try_send(candidate) {
+        Ok(()) => {
+            dashboard.record_opportunity_funnel("replay_candidate");
+            dashboard.record_reject_reason("replay_queue", "queued");
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            dashboard.record_reject_reason("replay_queue", "full_drop");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            dashboard.record_reject_reason("replay_queue", "closed");
+        }
+    }
+}
+
+fn replay_repeat_count(key: &str) -> u64 {
+    static REPLAY_REPEAT_COUNTS: OnceLock<StdMutex<HashMap<String, u64>>> = OnceLock::new();
+    let counts = REPLAY_REPEAT_COUNTS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let Ok(mut guard) = counts.lock() else {
+        return 1;
+    };
+    let count = guard.entry(key.to_string()).or_insert(0);
+    *count = count.saturating_add(1);
+    *count
+}
+
+fn spawn_replay_worker_if_enabled(
+    storage: Storage,
+    dashboard: DashboardHandle,
+) -> Option<mpsc::Sender<ReplayCandidate>> {
+    if !env_bool("MEV_REPLAY_QUEUE_ENABLED", true) {
+        return None;
+    }
+    let capacity = env_usize_clamped("MEV_REPLAY_QUEUE_CAPACITY", 512, 16, 8192);
+    let max_per_min = env_usize_clamped("MEV_REPLAY_MAX_PER_MIN", 10, 1, 600);
+    let (tx, mut rx) = mpsc::channel::<ReplayCandidate>(capacity);
+    tokio::spawn(async move {
+        let delay_ms = (60_000u64 / max_per_min.max(1) as u64).max(100);
+        let mut tick = tokio::time::interval(Duration::from_millis(delay_ms));
+        dashboard.event(
+            "info",
+            format!(
+                "replay candidate worker enabled capacity={} max_per_min={} fork_rpc={}",
+                capacity,
+                max_per_min,
+                if replay_fork_rpc_configured() {
+                    "configured"
+                } else {
+                    "disabled"
+                }
+            ),
+        );
+        while let Some(candidate) = rx.recv().await {
+            tick.tick().await;
+            let record = replay_candidate_record(
+                &candidate,
+                "replay_candidate",
+                "queued for offline fork verification",
+            );
+            storage.record_replay_candidate(&record);
+            if replay_fork_rpc_configured() {
+                storage.record_replay_candidate(&replay_candidate_record(
+                    &candidate,
+                    "deferred",
+                    "fork replay rpc configured; execution adapter pending",
+                ));
+            } else {
+                storage.record_replay_candidate(&replay_candidate_record(
+                    &candidate,
+                    "deferred",
+                    "fork replay rpc disabled; no hot-path rpc used",
+                ));
+            }
+            storage.record_selector_replay_score(
+                &candidate.selector,
+                &candidate.target,
+                &candidate.pool,
+                false,
+                false,
+                candidate.expected_profit,
+                0.0,
+                candidate.gas_limit as f64,
+            );
+            dashboard.record_reject_reason("replay_worker", "candidate_persisted");
+        }
+        dashboard.event("info", "replay candidate worker stopped");
+    });
+    Some(tx)
+}
+
+fn replay_candidate_record(
+    candidate: &ReplayCandidate,
+    status: &str,
+    detail: &str,
+) -> ReplayCandidateRecord {
+    ReplayCandidateRecord {
+        tx_hash: format!("{:?}", candidate.tx_hash),
+        selector: candidate.selector.clone(),
+        target: candidate.target.clone(),
+        pool: candidate.pool.clone(),
+        path: candidate
+            .path
+            .iter()
+            .map(|address| address_hex(*address))
+            .collect::<Vec<_>>()
+            .join(">"),
+        amount_in: candidate.amount_in.to_string(),
+        amount_out_min: candidate
+            .amount_out_min
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "0".to_string()),
+        gas_gwei: candidate.gas_gwei,
+        block_number: candidate.block_number,
+        expected_profit: candidate.expected_profit,
+        confidence: candidate.confidence,
+        decode_source: candidate.decode_source.to_string(),
+        status: status.to_string(),
+        detail: detail.to_string(),
+    }
+}
+
+fn replay_fork_rpc_configured() -> bool {
+    std::env::var("MEV_REPLAY_RPC_URL_POLYGON")
+        .or_else(|_| std::env::var("TENDERLY_FORK_URL_POLYGON"))
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
 }
 
 fn known_target_label(address: Address) -> Option<&'static str> {
@@ -6588,6 +6801,36 @@ fn worker_count(env_name: &str, max_workers: usize) -> usize {
         }
     }
     max_workers.max(1)
+}
+
+fn env_bool(env_name: &str, default: bool) -> bool {
+    std::env::var(env_name)
+        .ok()
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(default)
+}
+
+fn env_usize_clamped(env_name: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(env_name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+fn replay_min_confidence() -> f64 {
+    std::env::var("MEV_REPLAY_MIN_CONFIDENCE")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .unwrap_or(0.35)
+        .clamp(0.0, 1.0)
+}
+
+fn replay_min_repeat_count() -> u64 {
+    env_usize_clamped("MEV_REPLAY_MIN_REPEAT_COUNT", 3, 1, 100) as u64
 }
 
 fn token_as_uint(token: &Token) -> Option<U256> {

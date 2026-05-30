@@ -66,6 +66,41 @@ pub struct SelectorPoolPerformanceSnapshot {
     pub last_seen: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReplayCandidateRecord {
+    pub tx_hash: String,
+    pub selector: String,
+    pub target: String,
+    pub pool: String,
+    pub path: String,
+    pub amount_in: String,
+    pub amount_out_min: String,
+    pub gas_gwei: f64,
+    pub block_number: u64,
+    pub expected_profit: f64,
+    pub confidence: f64,
+    pub decode_source: String,
+    pub status: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SelectorReplayScoreSnapshot {
+    pub selector: String,
+    pub target: String,
+    pub pool: String,
+    pub replay_cases: u64,
+    pub replay_success_count: u64,
+    pub replay_revert_count: u64,
+    pub avg_expected_profit: f64,
+    pub avg_simulated_profit: f64,
+    pub avg_gas_used: f64,
+    pub success_rate_pct: f64,
+    pub revert_rate_pct: f64,
+    pub recommendation: String,
+    pub last_seen: String,
+}
+
 #[derive(Clone)]
 pub struct Storage {
     backend: StorageBackend,
@@ -294,6 +329,42 @@ impl Storage {
                 last_seen TEXT NOT NULL,
                 PRIMARY KEY (network, bucket, selector, target, token_pair, pool, dex_kind, fee_tier)
             );
+
+            CREATE TABLE IF NOT EXISTS replay_candidates (
+                network TEXT NOT NULL DEFAULT 'unknown',
+                tx_hash TEXT NOT NULL,
+                selector TEXT NOT NULL,
+                target TEXT NOT NULL,
+                pool TEXT NOT NULL,
+                path TEXT NOT NULL,
+                amount_in TEXT NOT NULL,
+                amount_out_min TEXT NOT NULL,
+                gas_gwei REAL NOT NULL DEFAULT 0,
+                block_number INTEGER NOT NULL DEFAULT 0,
+                expected_profit REAL NOT NULL DEFAULT 0,
+                confidence REAL NOT NULL DEFAULT 0,
+                decode_source TEXT NOT NULL DEFAULT 'unknown',
+                status TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (network, tx_hash, selector, target, pool)
+            );
+
+            CREATE TABLE IF NOT EXISTS selector_replay_scores (
+                network TEXT NOT NULL DEFAULT 'unknown',
+                selector TEXT NOT NULL,
+                target TEXT NOT NULL,
+                pool TEXT NOT NULL,
+                replay_cases INTEGER NOT NULL DEFAULT 0,
+                replay_success_count INTEGER NOT NULL DEFAULT 0,
+                replay_revert_count INTEGER NOT NULL DEFAULT 0,
+                expected_profit_sum REAL NOT NULL DEFAULT 0,
+                simulated_profit_sum REAL NOT NULL DEFAULT 0,
+                gas_used_sum REAL NOT NULL DEFAULT 0,
+                last_seen TEXT NOT NULL,
+                PRIMARY KEY (network, selector, target, pool)
+            );
             "#,
         )?;
         let _ = conn.execute(
@@ -331,7 +402,7 @@ impl Storage {
     }
 
     pub fn database_table_counts(&self) -> Result<Vec<(String, u64)>, Box<dyn std::error::Error>> {
-        const TABLES: [&str; 13] = [
+        const TABLES: [&str; 15] = [
             "events",
             "telemetry",
             "sweeps",
@@ -345,6 +416,8 @@ impl Storage {
             "reject_reason_rollups",
             "selector_performance_rollups",
             "selector_pool_performance_rollups",
+            "replay_candidates",
+            "selector_replay_scores",
         ];
 
         match &self.backend {
@@ -555,6 +628,44 @@ impl Storage {
                 PRIMARY KEY (network, bucket, selector, target, token_pair, pool, dex_kind, fee_tier)
             )
             "#,
+            r#"
+            CREATE TABLE IF NOT EXISTS replay_candidates (
+                network TEXT NOT NULL DEFAULT 'unknown',
+                tx_hash TEXT NOT NULL,
+                selector TEXT NOT NULL,
+                target TEXT NOT NULL,
+                pool TEXT NOT NULL,
+                path TEXT NOT NULL,
+                amount_in TEXT NOT NULL,
+                amount_out_min TEXT NOT NULL,
+                gas_gwei DOUBLE PRECISION NOT NULL DEFAULT 0,
+                block_number BIGINT NOT NULL DEFAULT 0,
+                expected_profit DOUBLE PRECISION NOT NULL DEFAULT 0,
+                confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+                decode_source TEXT NOT NULL DEFAULT 'unknown',
+                status TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (network, tx_hash, selector, target, pool)
+            )
+            "#,
+            r#"
+            CREATE TABLE IF NOT EXISTS selector_replay_scores (
+                network TEXT NOT NULL DEFAULT 'unknown',
+                selector TEXT NOT NULL,
+                target TEXT NOT NULL,
+                pool TEXT NOT NULL,
+                replay_cases BIGINT NOT NULL DEFAULT 0,
+                replay_success_count BIGINT NOT NULL DEFAULT 0,
+                replay_revert_count BIGINT NOT NULL DEFAULT 0,
+                expected_profit_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+                simulated_profit_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+                gas_used_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+                last_seen TEXT NOT NULL,
+                PRIMARY KEY (network, selector, target, pool)
+            )
+            "#,
         ];
 
         for statement in statements {
@@ -653,6 +764,10 @@ impl Storage {
                     "DELETE FROM selector_pool_performance_rollups WHERE bucket < ?1",
                     [rollup_cutoff.as_str()],
                 )?;
+                conn.execute(
+                    "DELETE FROM replay_candidates WHERE created_at < ?1 AND status IN ('queued', 'deferred', 'replay_candidate')",
+                    [rollup_cutoff.as_str()],
+                )?;
                 Ok(())
             }
             StorageBackend::Postgres(pool) => {
@@ -688,6 +803,13 @@ impl Storage {
                 )?;
                 Self::wait(
                     sqlx::query("DELETE FROM selector_pool_performance_rollups WHERE bucket < $1")
+                        .bind(rollup_cutoff.clone())
+                        .execute(pool),
+                )?;
+                Self::wait(
+                    sqlx::query(
+                        "DELETE FROM replay_candidates WHERE created_at < $1 AND status IN ('queued', 'deferred', 'replay_candidate')",
+                    )
                         .bind(rollup_cutoff)
                         .execute(pool),
                 )?;
@@ -1341,6 +1463,247 @@ impl Storage {
                             row.try_get::<Option<f64>, _>("gas_gwei_sum")
                                 .unwrap_or(None)
                                 .unwrap_or(0.0),
+                            row.get("last_seen"),
+                        )
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    pub fn record_replay_candidate(&self, record: &ReplayCandidateRecord) {
+        let now = Utc::now().to_rfc3339();
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                if let Ok(conn) = conn.lock() {
+                    let _ = conn.execute(
+                        r#"
+                        INSERT INTO replay_candidates (
+                            network, tx_hash, selector, target, pool, path, amount_in, amount_out_min,
+                            gas_gwei, block_number, expected_profit, confidence, decode_source,
+                            status, detail, created_at, updated_at
+                        )
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                        ON CONFLICT(network, tx_hash, selector, target, pool) DO UPDATE SET
+                            status = excluded.status,
+                            detail = excluded.detail,
+                            expected_profit = excluded.expected_profit,
+                            confidence = excluded.confidence,
+                            gas_gwei = excluded.gas_gwei,
+                            updated_at = excluded.updated_at
+                        "#,
+                        params![
+                            self.network.as_str(),
+                            record.tx_hash.as_str(),
+                            record.selector.as_str(),
+                            record.target.as_str(),
+                            record.pool.as_str(),
+                            record.path.as_str(),
+                            record.amount_in.as_str(),
+                            record.amount_out_min.as_str(),
+                            record.gas_gwei,
+                            record.block_number as i64,
+                            record.expected_profit,
+                            record.confidence,
+                            record.decode_source.as_str(),
+                            record.status.as_str(),
+                            record.detail.as_str(),
+                            now,
+                            now,
+                        ],
+                    );
+                }
+            }
+            StorageBackend::Postgres(pool) => {
+                let _ = Self::wait(
+                    sqlx::query(
+                        r#"
+                        INSERT INTO replay_candidates (
+                            network, tx_hash, selector, target, pool, path, amount_in, amount_out_min,
+                            gas_gwei, block_number, expected_profit, confidence, decode_source,
+                            status, detail, created_at, updated_at
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                        ON CONFLICT(network, tx_hash, selector, target, pool) DO UPDATE SET
+                            status = EXCLUDED.status,
+                            detail = EXCLUDED.detail,
+                            expected_profit = EXCLUDED.expected_profit,
+                            confidence = EXCLUDED.confidence,
+                            gas_gwei = EXCLUDED.gas_gwei,
+                            updated_at = EXCLUDED.updated_at
+                        "#,
+                    )
+                    .bind(self.network.clone())
+                    .bind(record.tx_hash.clone())
+                    .bind(record.selector.clone())
+                    .bind(record.target.clone())
+                    .bind(record.pool.clone())
+                    .bind(record.path.clone())
+                    .bind(record.amount_in.clone())
+                    .bind(record.amount_out_min.clone())
+                    .bind(record.gas_gwei)
+                    .bind(record.block_number as i64)
+                    .bind(record.expected_profit)
+                    .bind(record.confidence)
+                    .bind(record.decode_source.clone())
+                    .bind(record.status.clone())
+                    .bind(record.detail.clone())
+                    .bind(now.clone())
+                    .bind(now)
+                    .execute(pool),
+                );
+            }
+        }
+    }
+
+    pub fn record_selector_replay_score(
+        &self,
+        selector: &str,
+        target: &str,
+        pool: &str,
+        success: bool,
+        reverted: bool,
+        expected_profit: f64,
+        simulated_profit: f64,
+        gas_used: f64,
+    ) {
+        let now = Utc::now().to_rfc3339();
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                if let Ok(conn) = conn.lock() {
+                    let _ = conn.execute(
+                        r#"
+                        INSERT INTO selector_replay_scores (
+                            network, selector, target, pool, replay_cases, replay_success_count,
+                            replay_revert_count, expected_profit_sum, simulated_profit_sum,
+                            gas_used_sum, last_seen
+                        )
+                        VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10)
+                        ON CONFLICT(network, selector, target, pool) DO UPDATE SET
+                            replay_cases = replay_cases + 1,
+                            replay_success_count = replay_success_count + excluded.replay_success_count,
+                            replay_revert_count = replay_revert_count + excluded.replay_revert_count,
+                            expected_profit_sum = expected_profit_sum + excluded.expected_profit_sum,
+                            simulated_profit_sum = simulated_profit_sum + excluded.simulated_profit_sum,
+                            gas_used_sum = gas_used_sum + excluded.gas_used_sum,
+                            last_seen = excluded.last_seen
+                        "#,
+                        params![
+                            self.network.as_str(),
+                            selector,
+                            target,
+                            pool,
+                            if success { 1i64 } else { 0i64 },
+                            if reverted { 1i64 } else { 0i64 },
+                            expected_profit,
+                            simulated_profit,
+                            gas_used,
+                            now,
+                        ],
+                    );
+                }
+            }
+            StorageBackend::Postgres(pool_conn) => {
+                let _ = Self::wait(
+                    sqlx::query(
+                        r#"
+                        INSERT INTO selector_replay_scores (
+                            network, selector, target, pool, replay_cases, replay_success_count,
+                            replay_revert_count, expected_profit_sum, simulated_profit_sum,
+                            gas_used_sum, last_seen
+                        )
+                        VALUES ($1, $2, $3, $4, 1, $5, $6, $7, $8, $9, $10)
+                        ON CONFLICT(network, selector, target, pool) DO UPDATE SET
+                            replay_cases = selector_replay_scores.replay_cases + 1,
+                            replay_success_count = selector_replay_scores.replay_success_count + EXCLUDED.replay_success_count,
+                            replay_revert_count = selector_replay_scores.replay_revert_count + EXCLUDED.replay_revert_count,
+                            expected_profit_sum = selector_replay_scores.expected_profit_sum + EXCLUDED.expected_profit_sum,
+                            simulated_profit_sum = selector_replay_scores.simulated_profit_sum + EXCLUDED.simulated_profit_sum,
+                            gas_used_sum = selector_replay_scores.gas_used_sum + EXCLUDED.gas_used_sum,
+                            last_seen = EXCLUDED.last_seen
+                        "#,
+                    )
+                    .bind(self.network.clone())
+                    .bind(selector.to_string())
+                    .bind(target.to_string())
+                    .bind(pool.to_string())
+                    .bind(if success { 1i64 } else { 0i64 })
+                    .bind(if reverted { 1i64 } else { 0i64 })
+                    .bind(expected_profit)
+                    .bind(simulated_profit)
+                    .bind(gas_used)
+                    .bind(now)
+                    .execute(pool_conn),
+                );
+            }
+        }
+    }
+
+    pub fn selector_replay_scores(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SelectorReplayScoreSnapshot>, Box<dyn std::error::Error>> {
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                let conn = conn.lock().map_err(|_| "storage lock poisoned")?;
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT selector, target, pool, replay_cases, replay_success_count,
+                        replay_revert_count, expected_profit_sum, simulated_profit_sum,
+                        gas_used_sum, last_seen
+                    FROM selector_replay_scores
+                    ORDER BY replay_success_count DESC, replay_cases DESC, expected_profit_sum DESC
+                    LIMIT ?1
+                    "#,
+                )?;
+                let rows = stmt.query_map([limit as i64], |row| {
+                    Ok(build_selector_replay_score_snapshot(
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get::<_, i64>(3)?.max(0) as u64,
+                        row.get::<_, i64>(4)?.max(0) as u64,
+                        row.get::<_, i64>(5)?.max(0) as u64,
+                        row.get::<_, f64>(6)?,
+                        row.get::<_, f64>(7)?,
+                        row.get::<_, f64>(8)?,
+                        row.get(9)?,
+                    ))
+                })?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(out)
+            }
+            StorageBackend::Postgres(pool) => {
+                let rows = Self::wait(
+                    sqlx::query(
+                        r#"
+                        SELECT selector, target, pool, replay_cases, replay_success_count,
+                            replay_revert_count, expected_profit_sum, simulated_profit_sum,
+                            gas_used_sum, last_seen
+                        FROM selector_replay_scores
+                        ORDER BY replay_success_count DESC, replay_cases DESC, expected_profit_sum DESC
+                        LIMIT $1
+                        "#,
+                    )
+                    .bind(limit as i64)
+                    .fetch_all(pool),
+                )?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| {
+                        build_selector_replay_score_snapshot(
+                            row.get("selector"),
+                            row.get("target"),
+                            row.get("pool"),
+                            row.get::<i64, _>("replay_cases").max(0) as u64,
+                            row.get::<i64, _>("replay_success_count").max(0) as u64,
+                            row.get::<i64, _>("replay_revert_count").max(0) as u64,
+                            row.get::<f64, _>("expected_profit_sum"),
+                            row.get::<f64, _>("simulated_profit_sum"),
+                            row.get::<f64, _>("gas_used_sum"),
                             row.get("last_seen"),
                         )
                     })
@@ -2706,6 +3069,63 @@ fn build_selector_pool_performance_snapshot(
         avg_liquidity,
         avg_gas_gwei,
         classification: classification.to_string(),
+        last_seen,
+    }
+}
+
+fn build_selector_replay_score_snapshot(
+    selector: String,
+    target: String,
+    pool: String,
+    replay_cases: u64,
+    replay_success_count: u64,
+    replay_revert_count: u64,
+    expected_profit_sum: f64,
+    simulated_profit_sum: f64,
+    gas_used_sum: f64,
+    last_seen: String,
+) -> SelectorReplayScoreSnapshot {
+    let avg_expected_profit = if replay_cases == 0 {
+        0.0
+    } else {
+        expected_profit_sum / replay_cases as f64
+    };
+    let avg_simulated_profit = if replay_cases == 0 {
+        0.0
+    } else {
+        simulated_profit_sum / replay_cases as f64
+    };
+    let avg_gas_used = if replay_cases == 0 {
+        0.0
+    } else {
+        gas_used_sum / replay_cases as f64
+    };
+    let success_rate_pct = percent(replay_success_count, replay_cases);
+    let revert_rate_pct = percent(replay_revert_count, replay_cases);
+    let recommendation = if replay_cases >= 3 && success_rate_pct >= 70.0 && revert_rate_pct <= 20.0
+    {
+        "canary_ready"
+    } else if replay_cases >= 3 && revert_rate_pct > 20.0 {
+        "reject_revert"
+    } else if replay_success_count > 0 {
+        "replay_more"
+    } else {
+        "watch"
+    };
+
+    SelectorReplayScoreSnapshot {
+        selector,
+        target,
+        pool,
+        replay_cases,
+        replay_success_count,
+        replay_revert_count,
+        avg_expected_profit,
+        avg_simulated_profit,
+        avg_gas_used,
+        success_rate_pct,
+        revert_rate_pct,
+        recommendation: recommendation.to_string(),
         last_seen,
     }
 }
