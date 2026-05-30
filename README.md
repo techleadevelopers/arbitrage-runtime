@@ -40,6 +40,28 @@ This snapshot includes the latest Polygon runtime hardening work:
 
 Current production caveat: with `ALLOW_SEND=false`, the runtime remains in observation mode and will never submit, even if a payload reaches execution readiness.
 
+## Runtime Intelligence & Shadow Validation - 2026-05-30
+
+This snapshot adds a telemetry-driven intelligence layer for Polygon scavenger research without increasing hot-path RPC pressure.
+
+- **Unsupported selector registry:** decode rejects are aggregated by `network + target + selector + inner_selector + token_hints`, with count, first/last seen, sample transaction, calldata prefix, input size, and route hint.
+- **Partial aggregator decoding:** frequent Polygon selectors such as Transit Swap V5, custom high-frequency targets, and Safe inner selectors can be decoded heuristically into partial swap signals.
+- **Decode confidence scoring:** ABI/native decodes use high confidence, Safe inner partial decodes use medium confidence, and token-order heuristics use lower confidence. Low-confidence partials are rejected before spending payload/RPC work.
+- **Selector performance rollups:** the runtime aggregates `decode_pass`, `partial_signal`, `confidence_reject`, `payload_reject`, `payload_built`, and `shadow_payload_built` per selector/target/minute.
+- **Automatic selector scoring:** selectors are classified as `good`, `promising`, `noisy`, `expensive`, or `watch` based on payload build rate, confidence rejects, partial signals, and gas profile.
+- **Pool Discovery + Shadow EV:** partial signals that reach payload analysis now record pool discovery outcomes, pool kind, fee tier, token pair, shadow EV direction, expected profit, liquidity, and gas profile.
+- **Replay candidate foundation:** positive shadow EV candidates can be queued asynchronously for offline replay without adding RPC calls to the live lookup/evaluation path.
+- **Rollup-first storage model:** high-frequency runtime telemetry is kept as minute-level rollups instead of raw database spam, preserving operational visibility while reducing cloud storage growth.
+- **RPC capacity-aware backpressure:** pending lookup admission now respects the effective capacity of healthy RPC endpoints instead of relying only on configured lookup rate.
+- **MEV dashboard war room:** the `/mev` dashboard now surfaces full route graphs, unsupported selector registry, selector scoring, pool discovery, shadow EV, partial/shadow funnel counts, and decode/payload rejection reasons.
+
+The intent is to move the runtime from raw mempool observation into a measured research loop:
+
+`unsupported flow -> partial signal -> confidence gate -> pool discovery -> shadow EV -> replay candidate -> canary readiness`
+
+Live execution remains gated by `ALLOW_SEND`, capital controls, replay evidence, and canary whitelist configuration.
+
+
 ## Objective
 
 The engine continuously observes pending transactions and attempts to identify swaps whose execution creates a short-lived, mathematically exploitable price dislocation in AMM liquidity.
