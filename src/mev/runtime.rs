@@ -33,9 +33,9 @@ use tracing::{debug, warn};
 
 const MICROBATCH_WINDOW_MS: u64 = 45;
 const MICROBATCH_MAX_CANDIDATES: usize = 4;
-const LOOKUP_DECODE_QUEUE_CAPACITY: usize = 2048;
+const LOOKUP_DECODE_QUEUE_CAPACITY: usize = 8192;
 const EVAL_QUEUE_CAPACITY: usize = 512;
-const LOOKUP_DECODE_WORKERS_MAX: usize = 2;
+const LOOKUP_DECODE_WORKERS_MAX: usize = 6;
 const EVAL_WORKERS_MAX: usize = 4;
 const SMALL_SCAVENGER_BUDGET_PER_SEC: u64 = 8;
 
@@ -313,7 +313,7 @@ impl PendingLookupBackpressure {
         }
 
         let max_per_sec = effective_pending_lookup_budget(config, self.pressure);
-        let queue_soft_full = queue_remaining <= LOOKUP_DECODE_QUEUE_CAPACITY / 8;
+        let queue_soft_full = queue_remaining <= LOOKUP_DECODE_QUEUE_CAPACITY / 16;
         let allowed = self.accepted_in_window < max_per_sec && !queue_soft_full;
         if allowed {
             self.accepted_in_window = self.accepted_in_window.saturating_add(1);
@@ -1091,9 +1091,6 @@ fn effective_pending_lookup_budget(config: &Config, pressure: RpcLookupPressure)
     let configured = std::env::var("MEV_PENDING_LOOKUP_MAX_PER_SEC")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok());
-    if let Some(configured) = configured {
-        return configured.clamp(1, 1_000);
-    }
     let base = configured.unwrap_or_else(|| match config.mev.opportunity_mode() {
         OpportunityMode::Conservative => 60,
         OpportunityMode::Aggressive => 90,
@@ -1104,9 +1101,23 @@ fn effective_pending_lookup_budget(config: &Config, pressure: RpcLookupPressure)
         OpportunityMode::Aggressive => pressure.available_readers.max(1) as u64 * 60,
         OpportunityMode::Conservative => pressure.available_readers.max(1) as u64 * 40,
     };
-    let base = base.min(healthy_reader_cap);
+    let base = if configured.is_some() {
+        base.clamp(1, 1_000)
+    } else {
+        base.min(healthy_reader_cap)
+    };
 
-    let pressure_multiplier = if pressure.available_readers == 0 {
+    let pressure_multiplier = if configured.is_some() {
+        if pressure.available_readers == 0 {
+            0.05
+        } else if pressure.rate_limited_readers > 0 {
+            0.25
+        } else if pressure.failing_readers > pressure.available_readers {
+            0.60
+        } else {
+            1.0
+        }
+    } else if pressure.available_readers == 0 {
         0.03
     } else if pressure.available_readers <= 1 && pressure.rate_limited_readers > 0 {
         0.18
@@ -2013,19 +2024,19 @@ fn adaptive_gas_cap_gwei(ev_upper_bound_usd: f64, notional_eth: f64, hard_cap_gw
     let tier_floor: f64 = if ev_upper_bound_usd >= 0.25 {
         1_000.0
     } else if ev_upper_bound_usd >= 0.14 {
-        hard_cap_gwei * 0.98  // ~980 gwei
+        hard_cap_gwei * 0.98 // ~980 gwei
     } else if ev_upper_bound_usd >= 0.10 {
         850.0
     } else if ev_upper_bound_usd >= 0.05 {
         450.0
     } else if ev_upper_bound_usd >= 0.02 {
-        350.0
+        hard_cap_gwei * 0.95
     } else if ev_upper_bound_usd >= 0.005 {
-        350.0  // ← ANTES era 220.0
+        350.0 // ← ANTES era 220.0
     } else if ev_upper_bound_usd >= 0.001 {
-        300.0  // ← ANTES era 180.0
+        300.0 // ← ANTES era 180.0
     } else if ev_upper_bound_usd > 0.0 {
-        250.0  // ← ANTES era 180.0 (edge positivo mínimo)
+        250.0 // ← ANTES era 180.0 (edge positivo mínimo)
     } else if ev_upper_bound_usd >= -0.02 {
         150.0
     } else {
@@ -2037,7 +2048,7 @@ fn adaptive_gas_cap_gwei(ev_upper_bound_usd: f64, notional_eth: f64, hard_cap_gw
     } else {
         150.0 + ev_upper_bound_usd * 1_500.0
     };
-    let edge_cap = if ev_upper_bound_usd >= 0.14 {
+    let edge_cap = if ev_upper_bound_usd >= 0.02 {
         tier_floor
     } else {
         tier_floor.max(continuous_cap)
@@ -4684,6 +4695,21 @@ fn spawn_historical_profile_refresher(
 mod tests {
     use super::*;
     use ethers::abi::encode;
+
+    #[test]
+    fn adaptive_gas_cap_allows_positive_two_cent_edge_near_hard_cap() {
+        let cap = adaptive_gas_cap_gwei(0.0243, 0.1, 1_000.0);
+
+        assert!((cap - 950.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn adaptive_gas_cap_keeps_small_positive_edges_below_two_cent_tier() {
+        let cap = adaptive_gas_cap_gwei(0.01, 0.1, 1_000.0);
+
+        assert!(cap < 950.0);
+        assert!(cap >= 350.0);
+    }
 
     #[test]
     fn universal_router_v2_exact_out_decodes_with_amount_in_max() {

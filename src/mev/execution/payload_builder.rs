@@ -543,41 +543,41 @@ impl PayloadBuilder {
         };
 
         if scavenger {
-    let shadow_metrics = v3_scavenger_shadow_metrics(
-        amount_in,
-        amount_out,
-        fee_tier,
-        gas_cost,
-        path.len() == 43,
-    );
-    edge_metadata = v3_scavenger_shadow_sample(edge_metadata, shadow_metrics);
-    
-    // NOVO: Permite shadow mesmo se não for unit-safe (telemetria)
-    if !config.allow_send {
-        // Modo shadow: aceita qualquer V3 para coleta de dados
-        edge_metadata.status = "v3_shadow_ready".to_string();
-        edge_metadata.reason = format!(
-            "{} shadow_payload_built=true allow_send=false unit_safe={} net_after_gas={}",
-            edge_metadata.reason,
-            shadow_metrics.unit_safe,
-            wei_to_eth_f64(shadow_metrics.net_after_gas)
-        );
-        // Continua para construir o payload shadow
-    } else {
-        // Modo live: só permite se for unit-safe e com lucro positivo
-        if !shadow_metrics.unit_safe || shadow_metrics.net_after_gas.is_zero() {
-            return Err(payload_error_with_edge_sample(
+            let shadow_metrics = v3_scavenger_shadow_metrics(
+                amount_in,
+                amount_out,
+                fee_tier,
+                gas_cost,
+                path.len() == 43,
+            );
+            edge_metadata = v3_scavenger_shadow_sample(edge_metadata, shadow_metrics);
+
+            // NOVO: Permite shadow mesmo se não for unit-safe (telemetria)
+            if !config.allow_send {
+                // Modo shadow: aceita qualquer V3 para coleta de dados
+                edge_metadata.status = "v3_shadow_ready".to_string();
+                edge_metadata.reason = format!(
+                    "{} shadow_payload_built=true allow_send=false unit_safe={} net_after_gas={}",
+                    edge_metadata.reason,
+                    shadow_metrics.unit_safe,
+                    wei_to_eth_f64(shadow_metrics.net_after_gas)
+                );
+                // Continua para construir o payload shadow
+            } else {
+                // Modo live: só permite se for unit-safe e com lucro positivo
+                if !shadow_metrics.unit_safe || shadow_metrics.net_after_gas.is_zero() {
+                    return Err(payload_error_with_edge_sample(
                 "v3 scavenger payload blocked for live send until repayment model is unit-safe",
                 Some(edge_metadata),
             ));
+                }
+                edge_metadata.status = "v3_live_ready".to_string();
+                edge_metadata.reason = format!(
+                    "{} unit_safe=true live_send_allowed=true",
+                    edge_metadata.reason
+                );
+            }
         }
-        edge_metadata.status = "v3_live_ready".to_string();
-        edge_metadata.reason = format!(
-            "{} unit_safe=true live_send_allowed=true",
-            edge_metadata.reason
-        );
-    }
-}
 
         let executor = config.mev.mev_executor_v3.or(config.mev.mev_executor).ok_or_else(|| {
             payload_error_with_edge_sample(
@@ -1163,7 +1163,8 @@ mod tests {
 
     #[test]
     fn scavenger_v3_stays_blocked_until_repayment_model_is_unit_safe() {
-        let config = test_config();
+        let mut config = test_config();
+        config.allow_send = true;
         let token_in = Address::from_low_u64_be(1);
         let token_out = Address::from_low_u64_be(2);
         let pool = V3PoolState {
@@ -1202,7 +1203,9 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("v3 scavenger payload disabled until repayment model is unit-safe"));
+        assert!(err.contains(
+            "v3 scavenger payload blocked for live send until repayment model is unit-safe"
+        ));
     }
 
     #[test]
