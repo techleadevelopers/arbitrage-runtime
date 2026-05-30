@@ -2859,8 +2859,20 @@ fn decode_universal_router_swap(
                     return Some(signal);
                 }
             }
+            0x01 => {
+                if let Some(signal) = decode_universal_router_v3_exact_out(selector, router, input)
+                {
+                    return Some(signal);
+                }
+            }
             0x08 => {
                 if let Some(signal) = decode_universal_router_v2_exact_in(selector, router, input) {
+                    return Some(signal);
+                }
+            }
+            0x09 => {
+                if let Some(signal) = decode_universal_router_v2_exact_out(selector, router, input)
+                {
                     return Some(signal);
                 }
             }
@@ -2900,6 +2912,36 @@ fn decode_universal_router_v2_exact_in(
     })
 }
 
+fn decode_universal_router_v2_exact_out(
+    selector: [u8; 4],
+    router: Address,
+    input: &[u8],
+) -> Option<SwapSignal> {
+    let decoded = abi::decode(
+        &[
+            ParamType::Address,
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Array(Box::new(ParamType::Address)),
+            ParamType::Bool,
+        ],
+        input,
+    )
+    .ok()?;
+    let amount_out = decoded.get(1).and_then(token_as_uint)?;
+    let amount_in_max = decoded.get(2).and_then(token_as_uint)?;
+    let path = decoded.get(3).and_then(token_as_address_vec)?;
+    Some(SwapSignal {
+        selector,
+        amount_in: amount_in_max,
+        amount_out_min: Some(amount_out),
+        notional_wei: U256::zero(),
+        path,
+        router,
+        kind: SwapKind::V2,
+    })
+}
+
 fn decode_universal_router_v3_exact_in(
     selector: [u8; 4],
     router: Address,
@@ -2927,6 +2969,48 @@ fn decode_universal_router_v3_exact_in(
         selector,
         amount_in,
         amount_out_min,
+        notional_wei: U256::zero(),
+        path: vec![parsed.token_in, parsed.edge_token_out],
+        router,
+        kind: SwapKind::V3 {
+            fee_tier: parsed.first_fee_tier,
+            encoded_path: encode_v3_path(
+                parsed.edge_token_out,
+                parsed.first_fee_tier,
+                parsed.token_in,
+            ),
+            hops: parsed.hops,
+        },
+    })
+}
+
+fn decode_universal_router_v3_exact_out(
+    selector: [u8; 4],
+    router: Address,
+    input: &[u8],
+) -> Option<SwapSignal> {
+    let decoded = abi::decode(
+        &[
+            ParamType::Address,
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Bytes,
+            ParamType::Bool,
+        ],
+        input,
+    )
+    .ok()?;
+    let amount_out = decoded.get(1).and_then(token_as_uint)?;
+    let amount_in_max = decoded.get(2).and_then(token_as_uint)?;
+    let path_bytes = match decoded.get(3)? {
+        Token::Bytes(value) => value.clone(),
+        _ => return None,
+    };
+    let parsed = parse_v3_exact_out_path(&path_bytes)?;
+    Some(SwapSignal {
+        selector,
+        amount_in: amount_in_max,
+        amount_out_min: Some(amount_out),
         notional_wei: U256::zero(),
         path: vec![parsed.token_in, parsed.edge_token_out],
         router,
@@ -3032,6 +3116,19 @@ fn aggregator_intelligence_sample(
 ) -> EdgeMetadata {
     let selector = selector(tx).unwrap_or([0, 0, 0, 0]);
     let intel = aggregator_route_intel(config, tx, source);
+    let decode_hints = if source == "universal_router" {
+        universal_router_decode_hints(tx)
+    } else {
+        Vec::new()
+    };
+    let reason = if decode_hints.is_empty() {
+        "aggregator flow not decoded into executable graph yet".to_string()
+    } else {
+        format!(
+            "aggregator flow not decoded into executable graph yet: {}",
+            decode_hints.join(" | ")
+        )
+    };
     EdgeMetadata {
         victim_tx: short_hash(tx_hash),
         selector: format!(
@@ -3039,7 +3136,7 @@ fn aggregator_intelligence_sample(
             selector[0], selector[1], selector[2], selector[3]
         ),
         status: "aggregator_candidate".to_string(),
-        reason: "aggregator flow not decoded into executable graph yet".to_string(),
+        reason,
         route_kind: "aggregator".to_string(),
         path: intel.path,
         hops: intel.command_count.max(1),
@@ -3056,7 +3153,11 @@ fn aggregator_intelligence_sample(
         dex_sequence: intel.dex_sequence,
         route_inefficiency_score: intel.route_inefficiency_score,
         liquidity_distortion_score: intel.liquidity_distortion_score,
-        hop_profitability_rank: intel.hop_profitability_rank,
+        hop_profitability_rank: if decode_hints.is_empty() {
+            intel.hop_profitability_rank
+        } else {
+            decode_hints
+        },
         best_size_bps: 0,
         amount_in_wei: tx.value.to_string(),
         amount_out_wei: "0".to_string(),
@@ -3190,6 +3291,184 @@ fn universal_router_intel(tx: &Transaction) -> Option<AggregatorRouteIntel> {
             route_inefficiency_score,
         ),
     })
+}
+
+fn universal_router_decode_hints(tx: &Transaction) -> Vec<String> {
+    let Some(args) = tx.input.as_ref().get(4..) else {
+        return vec!["decode: calldata shorter than selector".to_string()];
+    };
+    let decoded = match abi::decode(
+        &[
+            ParamType::Bytes,
+            ParamType::Array(Box::new(ParamType::Bytes)),
+            ParamType::Uint(256),
+        ],
+        args,
+    )
+    .or_else(|_| {
+        abi::decode(
+            &[
+                ParamType::Bytes,
+                ParamType::Array(Box::new(ParamType::Bytes)),
+            ],
+            args,
+        )
+    }) {
+        Ok(decoded) => decoded,
+        Err(err) => return vec![format!("decode: abi mismatch {err}")],
+    };
+    let commands = match decoded.first() {
+        Some(Token::Bytes(value)) => value,
+        _ => return vec!["decode: commands not bytes".to_string()],
+    };
+    let inputs = match decoded.get(1) {
+        Some(Token::Array(values)) => values,
+        _ => return vec!["decode: inputs not bytes[]".to_string()],
+    };
+
+    let mut hints = Vec::new();
+    for (idx, command) in commands.iter().copied().enumerate().take(8) {
+        let opcode = command & 0x1f;
+        let input = match inputs.get(idx) {
+            Some(Token::Bytes(value)) => value.as_slice(),
+            Some(_) => {
+                hints.push(format!(
+                    "cmd#{idx} {}: input not bytes",
+                    universal_router_command_name(opcode)
+                ));
+                continue;
+            }
+            None => {
+                hints.push(format!(
+                    "cmd#{idx} {}: missing input",
+                    universal_router_command_name(opcode)
+                ));
+                continue;
+            }
+        };
+        let status = match opcode {
+            0x00 => universal_router_v3_exact_in_status(input),
+            0x01 => universal_router_v3_exact_out_status(input),
+            0x08 => universal_router_v2_swap_status(input, false),
+            0x09 => universal_router_v2_swap_status(input, true),
+            _ => "unsupported command".to_string(),
+        };
+        hints.push(format!(
+            "cmd#{idx} {} input={}b {status}",
+            universal_router_command_name(opcode),
+            input.len()
+        ));
+    }
+    if commands.len() > 8 {
+        hints.push(format!("{} additional commands omitted", commands.len() - 8));
+    }
+    hints
+}
+
+fn universal_router_command_name(opcode: u8) -> &'static str {
+    match opcode {
+        0x00 => "v3_exact_in",
+        0x01 => "v3_exact_out",
+        0x02 => "permit2_transfer_from",
+        0x03 => "permit2_permit_batch",
+        0x04 => "sweep",
+        0x05 => "transfer",
+        0x06 => "pay_portion",
+        0x08 => "v2_exact_in",
+        0x09 => "v2_exact_out",
+        0x0a => "permit2_permit",
+        0x0b => "wrap_eth",
+        0x0c => "unwrap_weth",
+        0x0d => "permit2_transfer_from_batch",
+        _ => "unknown",
+    }
+}
+
+fn universal_router_v2_swap_status(input: &[u8], exact_out: bool) -> String {
+    let decoded = abi::decode(
+        &[
+            ParamType::Address,
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Array(Box::new(ParamType::Address)),
+            ParamType::Bool,
+        ],
+        input,
+    );
+    match decoded {
+        Ok(values) => {
+            let path_len = values
+                .get(3)
+                .and_then(token_as_address_vec)
+                .map(|path| path.len())
+                .unwrap_or_default();
+            let mode = if exact_out { "amountInMax" } else { "amountIn" };
+            format!("decoded path_len={path_len} notional={mode}")
+        }
+        Err(err) => format!("abi mismatch {err}"),
+    }
+}
+
+fn universal_router_v3_exact_in_status(input: &[u8]) -> String {
+    let decoded = abi::decode(
+        &[
+            ParamType::Address,
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Bytes,
+            ParamType::Bool,
+        ],
+        input,
+    );
+    match decoded {
+        Ok(values) => {
+            let path = match values.get(3) {
+                Some(Token::Bytes(value)) => value.as_slice(),
+                _ => return "path not bytes".to_string(),
+            };
+            match parse_v3_path(path) {
+                Some(parsed) => format!(
+                    "decoded hops={} first_fee={} path={}b",
+                    parsed.hops,
+                    parsed.first_fee_tier,
+                    path.len()
+                ),
+                None => format!("invalid v3 path {}b", path.len()),
+            }
+        }
+        Err(err) => format!("abi mismatch {err}"),
+    }
+}
+
+fn universal_router_v3_exact_out_status(input: &[u8]) -> String {
+    let decoded = abi::decode(
+        &[
+            ParamType::Address,
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Bytes,
+            ParamType::Bool,
+        ],
+        input,
+    );
+    match decoded {
+        Ok(values) => {
+            let path = match values.get(3) {
+                Some(Token::Bytes(value)) => value.as_slice(),
+                _ => return "path not bytes".to_string(),
+            };
+            match parse_v3_path(path) {
+                Some(parsed) if parsed.hops == 1 => format!(
+                    "decoded single_hop first_fee={} path={}b",
+                    parsed.first_fee_tier,
+                    path.len()
+                ),
+                Some(parsed) => format!("decoded but unsupported multi_hop_exact_out hops={}", parsed.hops),
+                None => format!("invalid v3 path {}b", path.len()),
+            }
+        }
+        Err(err) => format!("abi mismatch {err}"),
+    }
 }
 
 fn universal_router_hop_rank(
@@ -3363,6 +3642,19 @@ fn parse_v3_path(path: &[u8]) -> Option<ParsedV3Path> {
     })
 }
 
+fn parse_v3_exact_out_path(path: &[u8]) -> Option<ParsedV3Path> {
+    let forward = parse_v3_path(path)?;
+    if forward.hops != 1 {
+        return None;
+    }
+    Some(ParsedV3Path {
+        token_in: forward.edge_token_out,
+        edge_token_out: forward.token_in,
+        first_fee_tier: forward.first_fee_tier,
+        hops: forward.hops,
+    })
+}
+
 fn encode_v3_path(token_in: Address, fee_tier: u32, token_out: Address) -> ethers::types::Bytes {
     let mut out = Vec::with_capacity(43);
     out.extend_from_slice(token_in.as_bytes());
@@ -3402,6 +3694,69 @@ fn refresh_historical_profiles(
         }
         Err(err) => {
             warn!("historical profile refresh failed: {}", err);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethers::abi::encode;
+
+    #[test]
+    fn universal_router_v2_exact_out_decodes_with_amount_in_max() {
+        let router = Address::from_low_u64_be(10);
+        let token_in = Address::from_low_u64_be(1);
+        let token_out = Address::from_low_u64_be(2);
+        let input = encode(&[
+            Token::Address(Address::from_low_u64_be(99)),
+            Token::Uint(U256::from(50u64)),
+            Token::Uint(U256::from(75u64)),
+            Token::Array(vec![Token::Address(token_in), Token::Address(token_out)]),
+            Token::Bool(true),
+        ]);
+        let args = encode(&[
+            Token::Bytes(vec![0x09]),
+            Token::Array(vec![Token::Bytes(input)]),
+        ]);
+
+        let signal = decode_universal_router_swap(UNIVERSAL_ROUTER_EXECUTE, router, &args).unwrap();
+
+        assert_eq!(signal.amount_in, U256::from(75u64));
+        assert_eq!(signal.amount_out_min, Some(U256::from(50u64)));
+        assert_eq!(signal.path, vec![token_in, token_out]);
+        assert!(matches!(signal.kind, SwapKind::V2));
+    }
+
+    #[test]
+    fn universal_router_v3_exact_out_decodes_single_hop_only() {
+        let router = Address::from_low_u64_be(10);
+        let token_out = Address::from_low_u64_be(2);
+        let token_in = Address::from_low_u64_be(1);
+        let path = encode_v3_path(token_out, 500, token_in);
+        let input = encode(&[
+            Token::Address(Address::from_low_u64_be(99)),
+            Token::Uint(U256::from(50u64)),
+            Token::Uint(U256::from(75u64)),
+            Token::Bytes(path.to_vec()),
+            Token::Bool(true),
+        ]);
+        let args = encode(&[
+            Token::Bytes(vec![0x01]),
+            Token::Array(vec![Token::Bytes(input)]),
+        ]);
+
+        let signal = decode_universal_router_swap(UNIVERSAL_ROUTER_EXECUTE, router, &args).unwrap();
+
+        assert_eq!(signal.amount_in, U256::from(75u64));
+        assert_eq!(signal.amount_out_min, Some(U256::from(50u64)));
+        assert_eq!(signal.path, vec![token_in, token_out]);
+        match signal.kind {
+            SwapKind::V3 { fee_tier, hops, .. } => {
+                assert_eq!(fee_tier, 500);
+                assert_eq!(hops, 1);
+            }
+            _ => panic!("expected v3 signal"),
         }
     }
 }

@@ -1006,3 +1006,147 @@ fn effective_payload_price_impact_cap_bps(config: &Config) -> u64 {
         config.mev.effective_max_price_impact_bps()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        Config, MevConfig, MonitoredTokenConfig, OpportunityMode, OpportunityThresholds,
+        RpcPreference,
+    };
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::path::PathBuf;
+    use std::sync::{Arc, RwLock};
+
+    fn test_config() -> Config {
+        Config {
+            wallets: PathBuf::from("keys.txt"),
+            network: "polygon".to_string(),
+            chain_id: 137,
+            allow_send: false,
+            tenderly_rpc_only: false,
+            alchemy_keys: Vec::new(),
+            infura_ids: Vec::new(),
+            flashbots_relay: String::new(),
+            builder_relays: Vec::new(),
+            executor_private_key:
+                "0x59c6995e998f97a5a0044966f0945382d7a7d4f6d8f1f0db6b90e6a2f17d5f52"
+                    .to_string(),
+            executor_address: Address::from_low_u64_be(10),
+            vault_address: Address::from_low_u64_be(11),
+            profit_address: Address::from_low_u64_be(12),
+            control_address: Address::from_low_u64_be(13),
+            monitored_tokens: vec![MonitoredTokenConfig {
+                address: Address::from_low_u64_be(1),
+                decimals: 18,
+                price_eth: 1.0,
+            }],
+            estimated_exec_gas: 250_000,
+            estimated_bundle_overhead_gas: 25_000,
+            max_infura_endpoints: 0,
+            rpc_read_preference: RpcPreference::Auto,
+            rpc_send_preference: RpcPreference::Auto,
+            storage_path: PathBuf::from("test.sqlite"),
+            dashboard_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8787),
+            explicit_rpc_urls: Vec::new(),
+            mempool_ws_urls: Vec::new(),
+            mev: MevConfig {
+                enabled: true,
+                opportunity_mode: Arc::new(RwLock::new(OpportunityMode::Scavenger)),
+                runtime_thresholds: Arc::new(RwLock::new(OpportunityThresholds {
+                    min_large_swap_eth: 1.0,
+                    min_net_profit_eth: 0.0001,
+                    min_profit_usd: 0.01,
+                    min_liquidity_eth: 1.0,
+                })),
+                capital_eth: 0.1,
+                capital_window_secs: 90,
+                max_window_exposure_eth: 0.3,
+                max_cluster_window_exposure_eth: 0.2,
+                max_pair_window_exposure_eth: 0.2,
+                min_net_profit_eth: 0.0001,
+                min_roi_bps: 100,
+                min_large_swap_eth: 1.0,
+                gas_safety_margin_bps: 11_000,
+                max_pending_age_ms: 1500,
+                max_gas_per_tx: 260_000,
+                max_gas_price_gwei: Some(100),
+                max_price_impact_bps: 250,
+                slippage_protection_bps: 50,
+                min_profit_usd: 0.01,
+                eth_usd_price: 0.09,
+                min_liquidity_eth: 1.0,
+                latency_trace: false,
+                latency_trace_warn_us: 5_000,
+                pool_state_cache_ttl_ms: 120,
+                executor_min_buffer_eth: 0.1,
+                executor_target_buffer_eth: 0.3,
+                executor_max_buffer_eth: 1.0,
+                relay_fanout_count: 1,
+                rpc_fanout_count: 1,
+                gas_overpay_base_extra_bps: 500,
+                gas_overpay_miss_extra_bps: 2_500,
+                gas_overpay_revert_extra_bps: 1_200,
+                gas_overpay_submit_failure_extra_bps: 1_500,
+                gas_overpay_max_extra_bps: 5_000,
+                finality_confirmations: 1,
+                stop_loss_consecutive_losses: 3,
+                stop_loss_freeze_secs: 300,
+                context_stop_loss_consecutive_losses: 2,
+                context_stop_loss_freeze_secs: 180,
+                capital_multiplier_aggressive: 2.0,
+                capital_multiplier_neutral: 1.0,
+                capital_multiplier_defensive: 0.3,
+                capital_multiplier_priority_threshold: 0.6,
+                capital_multiplier_toxicity_threshold: 0.65,
+                uniswap_v2_factory: Some(Address::from_low_u64_be(20)),
+                uniswap_v3_factory: Some(Address::from_low_u64_be(21)),
+                mev_executor: Some(Address::from_low_u64_be(22)),
+            },
+        }
+    }
+
+    #[test]
+    fn scavenger_v3_stays_blocked_until_repayment_model_is_unit_safe() {
+        let config = test_config();
+        let token_in = Address::from_low_u64_be(1);
+        let token_out = Address::from_low_u64_be(2);
+        let pool = V3PoolState {
+            pool: Address::from_low_u64_be(30),
+            token0: token_in,
+            token1: token_out,
+            sqrt_price_x96: U256::from_dec_str("79228162514264337593543950336").unwrap(),
+            liquidity: U256::from(1_000_000_000_000_000_000u128),
+            current_tick: 0,
+            fee_bps: 5,
+            initialized_ticks: Vec::new(),
+        };
+
+        let err = PayloadBuilder::build_fee_extraction_v3(
+            &config,
+            FeeExtractionBuildInput {
+                router: Address::from_low_u64_be(40),
+                factory: Some(Address::from_low_u64_be(21)),
+                pair: pool.pool,
+                recipient: Address::from_low_u64_be(12),
+                token_in,
+                token_out,
+                victim_amount_in: U256::from(1_000u64),
+                state_before: AmmState::UniswapV3(pool),
+                capital_available_wei: U256::from(10_000u64),
+                gas_price_wei: U256::from(1_000_000_000u64),
+                context_priority_score: 0.5,
+                context_toxicity_score: 0.5,
+                route_kind: AmmRouteKind::UniswapV3 {
+                    fee_tier: 500,
+                    path: Bytes::new(),
+                },
+                v2_swap_path: None,
+                v2_swap_pools: Vec::new(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("v3 scavenger payload disabled until repayment model is unit-safe"));
+    }
+}
