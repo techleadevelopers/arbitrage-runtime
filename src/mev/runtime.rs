@@ -1892,8 +1892,8 @@ fn scavenger_quality_price_impact_cap_bps(config: &Config) -> u64 {
     config
         .mev
         .effective_max_price_impact_bps()
-        .saturating_mul(12)
-        .clamp(600, 3_000)
+        .saturating_mul(15)
+        .clamp(600, 4_000)
 }
 
 pub(crate) fn fast_preflight_gate(
