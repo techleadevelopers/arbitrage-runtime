@@ -544,6 +544,9 @@ impl Config {
         if !supports_default_alchemy_mempool_ws(&self.network) {
             return Vec::new();
         }
+        if env_flag("MEMPOOL_WS_DISABLE_DEFAULT_ALCHEMY") {
+            return Vec::new();
+        }
         self.alchemy_keys
             .iter()
             .filter_map(|(_, key)| alchemy_ws_url_for_network(&self.network, key))
@@ -795,6 +798,7 @@ fn parse_mempool_ws_urls(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .filter(|value| is_allowed_mempool_ws_url(network, value))
+                .filter(|value| !mempool_ws_alchemy_disabled(value))
             {
                 if !urls
                     .iter()
@@ -1034,6 +1038,11 @@ fn is_allowed_mempool_ws_url(network: &str, url: &str) -> bool {
         || !url
             .to_ascii_lowercase()
             .contains("bnb-mainnet.g.alchemy.com")
+}
+
+fn mempool_ws_alchemy_disabled(url: &str) -> bool {
+    env_flag("MEMPOOL_WS_DISABLE_DEFAULT_ALCHEMY")
+        && url.to_ascii_lowercase().contains("alchemy.com")
 }
 
 fn infura_url_for_network(network: &str, key: &str) -> Option<String> {
@@ -1355,6 +1364,30 @@ mod tests {
             env::remove_var("MEMPOOL_WS_URL_POLYGON");
             env::remove_var("MEMPOOL_WS_URL_POLYGON_2");
             env::remove_var("MEMPOOL_WS_URL_POLYGON3");
+        }
+    }
+
+    #[test]
+    fn mempool_ws_disable_alchemy_filters_explicit_alchemy_urls() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            env::remove_var("MEMPOOL_WS_URL_POLYGON");
+            env::remove_var("MEMPOOL_WS_URL_POLYGON_2");
+            env::remove_var("MEMPOOL_WS_URL_POLYGON_3");
+            env::set_var(
+                "MEMPOOL_WS_URL",
+                "wss://polygon-mainnet.g.alchemy.com/v2/old,wss://shared.us-east-1.getblock.io/new",
+            );
+            env::set_var("MEMPOOL_WS_DISABLE_DEFAULT_ALCHEMY", "true");
+        }
+
+        let urls = parse_mempool_ws_urls("polygon", false, &[]);
+
+        assert_eq!(urls, vec!["wss://shared.us-east-1.getblock.io/new".to_string()]);
+
+        unsafe {
+            env::remove_var("MEMPOOL_WS_URL");
+            env::remove_var("MEMPOOL_WS_DISABLE_DEFAULT_ALCHEMY");
         }
     }
 
