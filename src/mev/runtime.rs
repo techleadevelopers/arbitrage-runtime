@@ -1993,31 +1993,37 @@ pub(crate) fn fast_preflight_gate(
 }
 
 fn adaptive_gas_cap_gwei(ev_upper_bound_usd: f64, notional_eth: f64, hard_cap_gwei: f64) -> f64 {
-    let edge_cap = if ev_upper_bound_usd >= 0.50 {
+    let tier_floor: f64 = if ev_upper_bound_usd >= 0.25 {
         1_000.0
-    } else if ev_upper_bound_usd >= 0.25 {
-        800.0
     } else if ev_upper_bound_usd >= 0.15 {
-        1_000.0
-    } else if ev_upper_bound_usd >= 0.10 {
         800.0
-    } else if ev_upper_bound_usd >= 0.05 {
+    } else if ev_upper_bound_usd >= 0.10 {
         600.0
-    } else if ev_upper_bound_usd >= 0.02 {
+    } else if ev_upper_bound_usd >= 0.05 {
         450.0
-    } else if ev_upper_bound_usd >= 0.01 {
+    } else if ev_upper_bound_usd >= 0.02 {
         350.0
-    } else if ev_upper_bound_usd >= 0.005 {
+    } else if ev_upper_bound_usd >= 0.01 {
         250.0
-    } else if ev_upper_bound_usd > 0.0 {
+    } else if ev_upper_bound_usd >= 0.005 {
         220.0
-    } else if ev_upper_bound_usd >= -0.02 {
+    } else if ev_upper_bound_usd > 0.0 {
         180.0
+    } else if ev_upper_bound_usd >= -0.02 {
+        150.0
     } else {
         120.0
     };
+
+    let continuous_cap: f64 = if ev_upper_bound_usd > 0.0 {
+        100.0 + ev_upper_bound_usd * 3_000.0
+    } else {
+        150.0 + ev_upper_bound_usd * 1_500.0
+    };
+    let edge_cap = tier_floor.max(continuous_cap);
+
     let size_multiplier = if ev_upper_bound_usd > 0.0 {
-        (notional_eth / 10.0).clamp(1.0, 1.20)
+        (0.95 + notional_eth / 40.0).clamp(1.0, 1.18)
     } else {
         (notional_eth / 10.0).clamp(0.75, 1.15)
     };
