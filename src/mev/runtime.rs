@@ -29,7 +29,7 @@ use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
-use tracing::warn;
+use tracing::{debug, warn};
 
 const MICROBATCH_WINDOW_MS: u64 = 45;
 const MICROBATCH_MAX_CANDIDATES: usize = 4;
@@ -1861,19 +1861,30 @@ fn scavenger_payload_has_economic_edge(
     let min_gas_fraction_bps = std::env::var("MEV_SCAVENGER_MIN_GAS_FRACTION_BPS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(250)
+        .unwrap_or(100)
         .clamp(1, 10_000);
     let min_edge_wei =
         gas_cost_wei.saturating_mul(U256::from(min_gas_fraction_bps)) / U256::from(10_000u64);
     let min_edge_usd = std::env::var("MEV_SCAVENGER_MIN_ECONOMIC_EDGE_USD")
         .ok()
         .and_then(|value| value.trim().parse::<f64>().ok())
-        .unwrap_or(0.005)
+        .unwrap_or(0.0005)
         .max(0.0);
     let min_edge_native = min_edge_usd / config.mev.eth_usd_price.max(0.000_001);
     let min_edge_from_usd = ethers::utils::parse_ether(format!("{:.18}", min_edge_native))
         .unwrap_or_else(|_| U256::zero());
     let floor = min_edge_wei.max(min_edge_from_usd);
+    debug!(
+        expected_profit_wei = %payload.expected_profit_wei,
+        gas_cost_wei = %gas_cost_wei,
+        min_gas_fraction_bps,
+        min_edge_usd,
+        min_edge_wei = %min_edge_wei,
+        min_edge_from_usd = %min_edge_from_usd,
+        floor_wei = %floor,
+        has_edge = payload.expected_profit_wei >= floor,
+        "scavenger edge check"
+    );
     payload.expected_profit_wei >= floor
 }
 

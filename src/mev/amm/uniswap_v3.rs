@@ -1,4 +1,5 @@
 use ethers::types::{Address, I256, U256};
+use tracing::debug;
 
 pub const Q96_F64: f64 = 79_228_162_514_264_337_593_543_950_336.0;
 
@@ -129,6 +130,19 @@ pub fn size_candidates_v3(
             continue;
         };
         let gross = result.amount_out.saturating_sub(amount_in);
+        if gross.is_zero() {
+            debug!(
+                pool = ?pool.pool,
+                token_in = ?token_in,
+                token_out = ?token_out,
+                fraction_bps = bps,
+                amount_in = %amount_in,
+                amount_out = %result.amount_out,
+                gas_cost_wei = %gas_cost_wei,
+                price_impact_bps = result.price_impact_bps,
+                "v3 size candidate has zero gross edge"
+            );
+        }
         let net = gross.saturating_sub(gas_cost_wei);
         if net.is_zero() {
             continue;
