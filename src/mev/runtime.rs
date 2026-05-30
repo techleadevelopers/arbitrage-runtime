@@ -1139,27 +1139,6 @@ async fn process_evaluation_task(
         ethers::utils::parse_ether(config.mev.effective_min_net_profit_eth().to_string())
             .unwrap_or(min_profit_wei);
 
-    if let Some(max_gas_price_wei) = config.mev.max_gas_price_wei() {
-        if candidate.gas_price > max_gas_price_wei {
-            candidate.latency_trace.total_internal_us =
-                Some(elapsed_us(candidate.candidate_started));
-            dashboard.record_reject_reason("gas_price_cap", "victim_gas_price_above_cap");
-            dashboard.event(
-                "warn",
-                format!(
-                    "opportunity skipped victim={:?}: gas price {:.2} gwei above cap {} gwei",
-                    tx_hash,
-                    wei_to_gwei_f64(candidate.gas_price),
-                    config.mev.max_gas_price_gwei.unwrap_or_default()
-                ),
-            );
-            candidate
-                .latency_trace
-                .emit(&config, &dashboard, tx_hash, "reject", "gas_price_cap");
-            return None;
-        }
-    }
-
     let fast_preflight_started = Instant::now();
     let fast_gate = fast_preflight_gate(
         &candidate.signal,
@@ -1169,6 +1148,36 @@ async fn process_evaluation_task(
         candidate.context_signal,
     );
     candidate.latency_trace.fast_preflight_us = Some(elapsed_us(fast_preflight_started));
+
+    if let Some(max_gas_price_gwei) = config.mev.max_gas_price_gwei {
+        let gas_price_gwei = wei_to_gwei_f64(candidate.gas_price);
+        let notional_eth = wei_to_eth_f64(candidate.signal.notional_wei);
+        let adaptive_cap_gwei = adaptive_gas_cap_gwei(
+            fast_gate.ev_upper_bound_usd,
+            notional_eth,
+            max_gas_price_gwei as f64,
+        );
+        if gas_price_gwei > adaptive_cap_gwei {
+            candidate.latency_trace.total_internal_us =
+                Some(elapsed_us(candidate.candidate_started));
+            dashboard.record_reject_reason("gas_price_cap", "victim_gas_price_above_adaptive_cap");
+            dashboard.event(
+                "warn",
+                format!(
+                    "opportunity skipped victim={:?}: gas price {:.2} gwei above adaptive cap {:.0} gwei ev_upper={:.4}usd hard_cap={} gwei",
+                    tx_hash,
+                    gas_price_gwei,
+                    adaptive_cap_gwei,
+                    fast_gate.ev_upper_bound_usd,
+                    max_gas_price_gwei
+                ),
+            );
+            candidate
+                .latency_trace
+                .emit(&config, &dashboard, tx_hash, "reject", "gas_price_adaptive_cap");
+            return None;
+        }
+    }
 
     if !fast_gate.should_continue {
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
@@ -1851,8 +1860,6 @@ pub(crate) fn fast_preflight_gate(
         Some("ev_upper_bound_below_min")
     } else if competition_score_fast > 0.75 {
         Some("competition_fast_too_high")
-    } else if gas_ratio > 1.8 {
-        Some("gas_ratio_too_high")
     } else {
         None
     };
@@ -1866,6 +1873,22 @@ pub(crate) fn fast_preflight_gate(
         gas_ratio,
         scavenger_try_score: 0.0,
     }
+}
+
+fn adaptive_gas_cap_gwei(ev_upper_bound_usd: f64, notional_eth: f64, hard_cap_gwei: f64) -> f64 {
+    let edge_cap = if ev_upper_bound_usd >= 0.50 {
+        1_000.0
+    } else if ev_upper_bound_usd >= 0.25 {
+        800.0
+    } else if ev_upper_bound_usd >= 0.10 {
+        500.0
+    } else if ev_upper_bound_usd >= 0.05 {
+        300.0
+    } else {
+        180.0
+    };
+    let size_multiplier = (notional_eth / 10.0).clamp(0.75, 1.15);
+    (edge_cap * size_multiplier).clamp(120.0, hard_cap_gwei.max(1.0))
 }
 
 async fn flush_candidate_batch(
