@@ -27,6 +27,45 @@ pub struct UnsupportedSelectorRecord {
     pub route_hint: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SelectorPerformanceSnapshot {
+    pub selector: String,
+    pub target: String,
+    pub decode_source: String,
+    pub partial_signal: u64,
+    pub payload_built: u64,
+    pub payload_reject: u64,
+    pub confidence_reject: u64,
+    pub total: u64,
+    pub avg_confidence: f64,
+    pub avg_gas_gwei: f64,
+    pub built_rate_pct: f64,
+    pub reject_rate_pct: f64,
+    pub classification: String,
+    pub last_seen: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SelectorPoolPerformanceSnapshot {
+    pub selector: String,
+    pub target: String,
+    pub token_pair: String,
+    pub pool: String,
+    pub dex_kind: String,
+    pub fee_tier: u32,
+    pub pool_found: u64,
+    pub pool_missing: u64,
+    pub payload_built: u64,
+    pub shadow_ev_positive: u64,
+    pub shadow_ev_negative: u64,
+    pub total: u64,
+    pub avg_expected_profit: f64,
+    pub avg_liquidity: f64,
+    pub avg_gas_gwei: f64,
+    pub classification: String,
+    pub last_seen: String,
+}
+
 #[derive(Clone)]
 pub struct Storage {
     backend: StorageBackend,
@@ -233,6 +272,28 @@ impl Storage {
                 last_seen TEXT NOT NULL,
                 PRIMARY KEY (network, bucket, selector, target, decode_source, stage)
             );
+
+            CREATE TABLE IF NOT EXISTS selector_pool_performance_rollups (
+                network TEXT NOT NULL DEFAULT 'unknown',
+                bucket TEXT NOT NULL,
+                selector TEXT NOT NULL,
+                target TEXT NOT NULL,
+                token_pair TEXT NOT NULL,
+                pool TEXT NOT NULL,
+                dex_kind TEXT NOT NULL,
+                fee_tier INTEGER NOT NULL DEFAULT 0,
+                pool_found_count INTEGER NOT NULL DEFAULT 0,
+                pool_missing_count INTEGER NOT NULL DEFAULT 0,
+                payload_built_count INTEGER NOT NULL DEFAULT 0,
+                shadow_ev_positive_count INTEGER NOT NULL DEFAULT 0,
+                shadow_ev_negative_count INTEGER NOT NULL DEFAULT 0,
+                expected_profit_sum REAL NOT NULL DEFAULT 0,
+                liquidity_sum REAL NOT NULL DEFAULT 0,
+                gas_gwei_sum REAL NOT NULL DEFAULT 0,
+                samples INTEGER NOT NULL DEFAULT 0,
+                last_seen TEXT NOT NULL,
+                PRIMARY KEY (network, bucket, selector, target, token_pair, pool, dex_kind, fee_tier)
+            );
             "#,
         )?;
         let _ = conn.execute(
@@ -270,7 +331,7 @@ impl Storage {
     }
 
     pub fn database_table_counts(&self) -> Result<Vec<(String, u64)>, Box<dyn std::error::Error>> {
-        const TABLES: [&str; 12] = [
+        const TABLES: [&str; 13] = [
             "events",
             "telemetry",
             "sweeps",
@@ -283,6 +344,7 @@ impl Storage {
             "funnel_rollups",
             "reject_reason_rollups",
             "selector_performance_rollups",
+            "selector_pool_performance_rollups",
         ];
 
         match &self.backend {
@@ -470,6 +532,29 @@ impl Storage {
                 PRIMARY KEY (network, bucket, selector, target, decode_source, stage)
             )
             "#,
+            r#"
+            CREATE TABLE IF NOT EXISTS selector_pool_performance_rollups (
+                network TEXT NOT NULL DEFAULT 'unknown',
+                bucket TEXT NOT NULL,
+                selector TEXT NOT NULL,
+                target TEXT NOT NULL,
+                token_pair TEXT NOT NULL,
+                pool TEXT NOT NULL,
+                dex_kind TEXT NOT NULL,
+                fee_tier BIGINT NOT NULL DEFAULT 0,
+                pool_found_count BIGINT NOT NULL DEFAULT 0,
+                pool_missing_count BIGINT NOT NULL DEFAULT 0,
+                payload_built_count BIGINT NOT NULL DEFAULT 0,
+                shadow_ev_positive_count BIGINT NOT NULL DEFAULT 0,
+                shadow_ev_negative_count BIGINT NOT NULL DEFAULT 0,
+                expected_profit_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+                liquidity_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+                gas_gwei_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+                samples BIGINT NOT NULL DEFAULT 0,
+                last_seen TEXT NOT NULL,
+                PRIMARY KEY (network, bucket, selector, target, token_pair, pool, dex_kind, fee_tier)
+            )
+            "#,
         ];
 
         for statement in statements {
@@ -564,6 +649,10 @@ impl Storage {
                     "DELETE FROM selector_performance_rollups WHERE bucket < ?1",
                     [rollup_cutoff.as_str()],
                 )?;
+                conn.execute(
+                    "DELETE FROM selector_pool_performance_rollups WHERE bucket < ?1",
+                    [rollup_cutoff.as_str()],
+                )?;
                 Ok(())
             }
             StorageBackend::Postgres(pool) => {
@@ -594,6 +683,11 @@ impl Storage {
                 )?;
                 Self::wait(
                     sqlx::query("DELETE FROM selector_performance_rollups WHERE bucket < $1")
+                        .bind(rollup_cutoff.clone())
+                        .execute(pool),
+                )?;
+                Self::wait(
+                    sqlx::query("DELETE FROM selector_pool_performance_rollups WHERE bucket < $1")
                         .bind(rollup_cutoff)
                         .execute(pool),
                 )?;
@@ -906,6 +1000,351 @@ impl Storage {
                     .bind(now)
                     .execute(pool),
                 );
+            }
+        }
+    }
+
+    pub fn selector_performance_scores(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SelectorPerformanceSnapshot>, Box<dyn std::error::Error>> {
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                let conn = conn.lock().map_err(|_| "storage lock poisoned")?;
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT
+                        selector,
+                        target,
+                        decode_source,
+                        SUM(CASE WHEN stage = 'partial_signal' THEN count ELSE 0 END) AS partial_signal,
+                        SUM(CASE WHEN stage = 'payload_built' THEN count ELSE 0 END) AS payload_built,
+                        SUM(CASE WHEN stage = 'shadow_payload_built' THEN count ELSE 0 END) AS shadow_payload_built,
+                        SUM(CASE WHEN stage = 'payload_reject' THEN count ELSE 0 END) AS payload_reject,
+                        SUM(CASE WHEN stage = 'confidence_reject' THEN count ELSE 0 END) AS confidence_reject,
+                        SUM(count) AS total,
+                        SUM(confidence_sum) AS confidence_sum,
+                        SUM(gas_gwei_sum) AS gas_gwei_sum,
+                        MAX(last_seen) AS last_seen
+                    FROM selector_performance_rollups
+                    GROUP BY selector, target, decode_source
+                    ORDER BY payload_built DESC, shadow_payload_built DESC, confidence_sum / NULLIF(total, 0) DESC, payload_reject DESC
+                    LIMIT ?1
+                    "#,
+                )?;
+                let rows = stmt.query_map([limit as i64], |row| {
+                    let partial_signal = row.get::<_, i64>(3)?.max(0) as u64;
+                    let payload_built =
+                        (row.get::<_, i64>(4)? + row.get::<_, i64>(5)?).max(0) as u64;
+                    let payload_reject = row.get::<_, i64>(6)?.max(0) as u64;
+                    let confidence_reject = row.get::<_, i64>(7)?.max(0) as u64;
+                    let total = row.get::<_, i64>(8)?.max(0) as u64;
+                    let confidence_sum = row.get::<_, f64>(9)?;
+                    let gas_gwei_sum = row.get::<_, f64>(10)?;
+                    Ok(build_selector_performance_snapshot(
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        partial_signal,
+                        payload_built,
+                        payload_reject,
+                        confidence_reject,
+                        total,
+                        confidence_sum,
+                        gas_gwei_sum,
+                        row.get(11)?,
+                    ))
+                })?;
+
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(out)
+            }
+            StorageBackend::Postgres(pool) => {
+                let rows = Self::wait(
+                    sqlx::query(
+                        r#"
+                        SELECT
+                            selector,
+                            target,
+                            decode_source,
+                            SUM(CASE WHEN stage = 'partial_signal' THEN count ELSE 0 END)::bigint AS partial_signal,
+                            SUM(CASE WHEN stage = 'payload_built' THEN count ELSE 0 END)::bigint AS payload_built,
+                            SUM(CASE WHEN stage = 'shadow_payload_built' THEN count ELSE 0 END)::bigint AS shadow_payload_built,
+                            SUM(CASE WHEN stage = 'payload_reject' THEN count ELSE 0 END)::bigint AS payload_reject,
+                            SUM(CASE WHEN stage = 'confidence_reject' THEN count ELSE 0 END)::bigint AS confidence_reject,
+                            SUM(count)::bigint AS total,
+                            SUM(confidence_sum)::double precision AS confidence_sum,
+                            SUM(gas_gwei_sum)::double precision AS gas_gwei_sum,
+                            MAX(last_seen) AS last_seen
+                        FROM selector_performance_rollups
+                        GROUP BY selector, target, decode_source
+                        ORDER BY payload_built DESC, shadow_payload_built DESC, SUM(confidence_sum) / NULLIF(SUM(count), 0) DESC, payload_reject DESC
+                        LIMIT $1
+                        "#,
+                    )
+                    .bind(limit as i64)
+                    .fetch_all(pool),
+                )?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| {
+                        let partial_signal = row.get::<i64, _>("partial_signal").max(0) as u64;
+                        let payload_built = (row.get::<i64, _>("payload_built")
+                            + row.get::<i64, _>("shadow_payload_built"))
+                        .max(0) as u64;
+                        let payload_reject = row.get::<i64, _>("payload_reject").max(0) as u64;
+                        let confidence_reject =
+                            row.get::<i64, _>("confidence_reject").max(0) as u64;
+                        let total = row.get::<i64, _>("total").max(0) as u64;
+                        build_selector_performance_snapshot(
+                            row.get("selector"),
+                            row.get("target"),
+                            row.get("decode_source"),
+                            partial_signal,
+                            payload_built,
+                            payload_reject,
+                            confidence_reject,
+                            total,
+                            row.try_get::<Option<f64>, _>("confidence_sum")
+                                .unwrap_or(None)
+                                .unwrap_or(0.0),
+                            row.try_get::<Option<f64>, _>("gas_gwei_sum")
+                                .unwrap_or(None)
+                                .unwrap_or(0.0),
+                            row.get("last_seen"),
+                        )
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_selector_pool_performance_rollup(
+        &self,
+        bucket: &str,
+        selector: &str,
+        target: &str,
+        token_pair: &str,
+        pool: &str,
+        dex_kind: &str,
+        fee_tier: u32,
+        pool_found_count: u64,
+        pool_missing_count: u64,
+        payload_built_count: u64,
+        shadow_ev_positive_count: u64,
+        shadow_ev_negative_count: u64,
+        expected_profit_sum: f64,
+        liquidity_sum: f64,
+        gas_gwei_sum: f64,
+        samples: u64,
+    ) {
+        let now = Utc::now().to_rfc3339();
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                if let Ok(conn) = conn.lock() {
+                    let _ = conn.execute(
+                        r#"
+                        INSERT INTO selector_pool_performance_rollups (
+                            network, bucket, selector, target, token_pair, pool, dex_kind, fee_tier,
+                            pool_found_count, pool_missing_count, payload_built_count,
+                            shadow_ev_positive_count, shadow_ev_negative_count,
+                            expected_profit_sum, liquidity_sum, gas_gwei_sum, samples, last_seen
+                        )
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                        ON CONFLICT(network, bucket, selector, target, token_pair, pool, dex_kind, fee_tier) DO UPDATE SET
+                            pool_found_count = pool_found_count + excluded.pool_found_count,
+                            pool_missing_count = pool_missing_count + excluded.pool_missing_count,
+                            payload_built_count = payload_built_count + excluded.payload_built_count,
+                            shadow_ev_positive_count = shadow_ev_positive_count + excluded.shadow_ev_positive_count,
+                            shadow_ev_negative_count = shadow_ev_negative_count + excluded.shadow_ev_negative_count,
+                            expected_profit_sum = expected_profit_sum + excluded.expected_profit_sum,
+                            liquidity_sum = liquidity_sum + excluded.liquidity_sum,
+                            gas_gwei_sum = gas_gwei_sum + excluded.gas_gwei_sum,
+                            samples = samples + excluded.samples,
+                            last_seen = excluded.last_seen
+                        "#,
+                        params![
+                            self.network.as_str(),
+                            bucket,
+                            selector,
+                            target,
+                            token_pair,
+                            pool,
+                            dex_kind,
+                            fee_tier as i64,
+                            pool_found_count as i64,
+                            pool_missing_count as i64,
+                            payload_built_count as i64,
+                            shadow_ev_positive_count as i64,
+                            shadow_ev_negative_count as i64,
+                            expected_profit_sum,
+                            liquidity_sum,
+                            gas_gwei_sum,
+                            samples as i64,
+                            now,
+                        ],
+                    );
+                }
+            }
+            StorageBackend::Postgres(pool_conn) => {
+                let _ = Self::wait(
+                    sqlx::query(
+                        r#"
+                        INSERT INTO selector_pool_performance_rollups (
+                            network, bucket, selector, target, token_pair, pool, dex_kind, fee_tier,
+                            pool_found_count, pool_missing_count, payload_built_count,
+                            shadow_ev_positive_count, shadow_ev_negative_count,
+                            expected_profit_sum, liquidity_sum, gas_gwei_sum, samples, last_seen
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+                        ON CONFLICT(network, bucket, selector, target, token_pair, pool, dex_kind, fee_tier) DO UPDATE SET
+                            pool_found_count = selector_pool_performance_rollups.pool_found_count + EXCLUDED.pool_found_count,
+                            pool_missing_count = selector_pool_performance_rollups.pool_missing_count + EXCLUDED.pool_missing_count,
+                            payload_built_count = selector_pool_performance_rollups.payload_built_count + EXCLUDED.payload_built_count,
+                            shadow_ev_positive_count = selector_pool_performance_rollups.shadow_ev_positive_count + EXCLUDED.shadow_ev_positive_count,
+                            shadow_ev_negative_count = selector_pool_performance_rollups.shadow_ev_negative_count + EXCLUDED.shadow_ev_negative_count,
+                            expected_profit_sum = selector_pool_performance_rollups.expected_profit_sum + EXCLUDED.expected_profit_sum,
+                            liquidity_sum = selector_pool_performance_rollups.liquidity_sum + EXCLUDED.liquidity_sum,
+                            gas_gwei_sum = selector_pool_performance_rollups.gas_gwei_sum + EXCLUDED.gas_gwei_sum,
+                            samples = selector_pool_performance_rollups.samples + EXCLUDED.samples,
+                            last_seen = EXCLUDED.last_seen
+                        "#,
+                    )
+                    .bind(self.network.clone())
+                    .bind(bucket.to_string())
+                    .bind(selector.to_string())
+                    .bind(target.to_string())
+                    .bind(token_pair.to_string())
+                    .bind(pool.to_string())
+                    .bind(dex_kind.to_string())
+                    .bind(fee_tier as i64)
+                    .bind(pool_found_count as i64)
+                    .bind(pool_missing_count as i64)
+                    .bind(payload_built_count as i64)
+                    .bind(shadow_ev_positive_count as i64)
+                    .bind(shadow_ev_negative_count as i64)
+                    .bind(expected_profit_sum)
+                    .bind(liquidity_sum)
+                    .bind(gas_gwei_sum)
+                    .bind(samples as i64)
+                    .bind(now)
+                    .execute(pool_conn),
+                );
+            }
+        }
+    }
+
+    pub fn selector_pool_performance_scores(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SelectorPoolPerformanceSnapshot>, Box<dyn std::error::Error>> {
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                let conn = conn.lock().map_err(|_| "storage lock poisoned")?;
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT
+                        selector, target, token_pair, pool, dex_kind, fee_tier,
+                        SUM(pool_found_count) AS pool_found,
+                        SUM(pool_missing_count) AS pool_missing,
+                        SUM(payload_built_count) AS payload_built,
+                        SUM(shadow_ev_positive_count) AS shadow_ev_positive,
+                        SUM(shadow_ev_negative_count) AS shadow_ev_negative,
+                        SUM(samples) AS total,
+                        SUM(expected_profit_sum) AS expected_profit_sum,
+                        SUM(liquidity_sum) AS liquidity_sum,
+                        SUM(gas_gwei_sum) AS gas_gwei_sum,
+                        MAX(last_seen) AS last_seen
+                    FROM selector_pool_performance_rollups
+                    GROUP BY selector, target, token_pair, pool, dex_kind, fee_tier
+                    ORDER BY shadow_ev_positive DESC, payload_built DESC, pool_found DESC, pool_missing ASC
+                    LIMIT ?1
+                    "#,
+                )?;
+                let rows = stmt.query_map([limit as i64], |row| {
+                    Ok(build_selector_pool_performance_snapshot(
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get::<_, i64>(5)?.max(0) as u32,
+                        row.get::<_, i64>(6)?.max(0) as u64,
+                        row.get::<_, i64>(7)?.max(0) as u64,
+                        row.get::<_, i64>(8)?.max(0) as u64,
+                        row.get::<_, i64>(9)?.max(0) as u64,
+                        row.get::<_, i64>(10)?.max(0) as u64,
+                        row.get::<_, i64>(11)?.max(0) as u64,
+                        row.get::<_, f64>(12)?,
+                        row.get::<_, f64>(13)?,
+                        row.get::<_, f64>(14)?,
+                        row.get(15)?,
+                    ))
+                })?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(out)
+            }
+            StorageBackend::Postgres(pool) => {
+                let rows = Self::wait(
+                    sqlx::query(
+                        r#"
+                        SELECT
+                            selector, target, token_pair, pool, dex_kind, fee_tier,
+                            SUM(pool_found_count)::bigint AS pool_found,
+                            SUM(pool_missing_count)::bigint AS pool_missing,
+                            SUM(payload_built_count)::bigint AS payload_built,
+                            SUM(shadow_ev_positive_count)::bigint AS shadow_ev_positive,
+                            SUM(shadow_ev_negative_count)::bigint AS shadow_ev_negative,
+                            SUM(samples)::bigint AS total,
+                            SUM(expected_profit_sum)::double precision AS expected_profit_sum,
+                            SUM(liquidity_sum)::double precision AS liquidity_sum,
+                            SUM(gas_gwei_sum)::double precision AS gas_gwei_sum,
+                            MAX(last_seen) AS last_seen
+                        FROM selector_pool_performance_rollups
+                        GROUP BY selector, target, token_pair, pool, dex_kind, fee_tier
+                        ORDER BY shadow_ev_positive DESC, payload_built DESC, pool_found DESC, pool_missing ASC
+                        LIMIT $1
+                        "#,
+                    )
+                    .bind(limit as i64)
+                    .fetch_all(pool),
+                )?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| {
+                        build_selector_pool_performance_snapshot(
+                            row.get("selector"),
+                            row.get("target"),
+                            row.get("token_pair"),
+                            row.get("pool"),
+                            row.get("dex_kind"),
+                            row.get::<i64, _>("fee_tier").max(0) as u32,
+                            row.get::<i64, _>("pool_found").max(0) as u64,
+                            row.get::<i64, _>("pool_missing").max(0) as u64,
+                            row.get::<i64, _>("payload_built").max(0) as u64,
+                            row.get::<i64, _>("shadow_ev_positive").max(0) as u64,
+                            row.get::<i64, _>("shadow_ev_negative").max(0) as u64,
+                            row.get::<i64, _>("total").max(0) as u64,
+                            row.try_get::<Option<f64>, _>("expected_profit_sum")
+                                .unwrap_or(None)
+                                .unwrap_or(0.0),
+                            row.try_get::<Option<f64>, _>("liquidity_sum")
+                                .unwrap_or(None)
+                                .unwrap_or(0.0),
+                            row.try_get::<Option<f64>, _>("gas_gwei_sum")
+                                .unwrap_or(None)
+                                .unwrap_or(0.0),
+                            row.get("last_seen"),
+                        )
+                    })
+                    .collect())
             }
         }
     }
@@ -2145,6 +2584,138 @@ fn runtime_retention_hours(env_name: &str, default_hours: i64) -> i64 {
         .and_then(|value| value.trim().parse::<i64>().ok())
         .unwrap_or(default_hours)
         .clamp(1, 24 * 30)
+}
+
+fn build_selector_performance_snapshot(
+    selector: String,
+    target: String,
+    decode_source: String,
+    partial_signal: u64,
+    payload_built: u64,
+    payload_reject: u64,
+    confidence_reject: u64,
+    total: u64,
+    confidence_sum: f64,
+    gas_gwei_sum: f64,
+    last_seen: String,
+) -> SelectorPerformanceSnapshot {
+    let avg_confidence = if total == 0 {
+        0.0
+    } else {
+        confidence_sum / total as f64
+    };
+    let avg_gas_gwei = if total == 0 {
+        0.0
+    } else {
+        gas_gwei_sum / total as f64
+    };
+    let built_rate_pct = percent(payload_built, total);
+    let reject_rate_pct = percent(payload_reject.saturating_add(confidence_reject), total);
+    let classification = if payload_built > 0 && built_rate_pct >= 5.0 {
+        "good"
+    } else if confidence_reject > payload_built.saturating_add(payload_reject)
+        && confidence_reject >= 3
+    {
+        "noisy"
+    } else if avg_gas_gwei >= 500.0 && payload_built == 0 {
+        "expensive"
+    } else if partial_signal >= 3 && payload_built == 0 {
+        "promising"
+    } else {
+        "watch"
+    };
+
+    SelectorPerformanceSnapshot {
+        selector,
+        target,
+        decode_source,
+        partial_signal,
+        payload_built,
+        payload_reject,
+        confidence_reject,
+        total,
+        avg_confidence,
+        avg_gas_gwei,
+        built_rate_pct,
+        reject_rate_pct,
+        classification: classification.to_string(),
+        last_seen,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_selector_pool_performance_snapshot(
+    selector: String,
+    target: String,
+    token_pair: String,
+    pool: String,
+    dex_kind: String,
+    fee_tier: u32,
+    pool_found: u64,
+    pool_missing: u64,
+    payload_built: u64,
+    shadow_ev_positive: u64,
+    shadow_ev_negative: u64,
+    total: u64,
+    expected_profit_sum: f64,
+    liquidity_sum: f64,
+    gas_gwei_sum: f64,
+    last_seen: String,
+) -> SelectorPoolPerformanceSnapshot {
+    let avg_expected_profit = if total == 0 {
+        0.0
+    } else {
+        expected_profit_sum / total as f64
+    };
+    let avg_liquidity = if total == 0 {
+        0.0
+    } else {
+        liquidity_sum / total as f64
+    };
+    let avg_gas_gwei = if total == 0 {
+        0.0
+    } else {
+        gas_gwei_sum / total as f64
+    };
+    let classification = if shadow_ev_positive > 0 {
+        "evolve_decoder"
+    } else if payload_built > 0 {
+        "pool_real_payload_ready"
+    } else if pool_found > 0 && pool_missing == 0 {
+        "pool_real_watch"
+    } else if pool_missing > pool_found {
+        "pool_missing_or_wrong_path"
+    } else {
+        "watch"
+    };
+
+    SelectorPoolPerformanceSnapshot {
+        selector,
+        target,
+        token_pair,
+        pool,
+        dex_kind,
+        fee_tier,
+        pool_found,
+        pool_missing,
+        payload_built,
+        shadow_ev_positive,
+        shadow_ev_negative,
+        total,
+        avg_expected_profit,
+        avg_liquidity,
+        avg_gas_gwei,
+        classification: classification.to_string(),
+        last_seen,
+    }
+}
+
+fn percent(part: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        (part as f64 / total as f64) * 100.0
+    }
 }
 
 fn runtime_retention_days(env_name: &str, default_days: i64) -> i64 {

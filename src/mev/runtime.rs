@@ -1524,6 +1524,12 @@ async fn process_evaluation_task(
             );
             let human_reason = human_payload_error(&err);
             let payload_detail = payload_error_detail(&err, &candidate.signal);
+            record_payload_pool_reject(
+                &dashboard,
+                &candidate.signal,
+                &payload_detail,
+                gas_price_gwei(candidate.gas_price),
+            );
             let sample = extract_edge_sample(&err)
                 .map(|sample| {
                     enrich_edge_explainer_sample(sample, tx_hash, &candidate.signal, &fast_gate)
@@ -1594,6 +1600,13 @@ async fn process_evaluation_task(
         );
         dashboard.record_reject_reason("payload_build", "scavenger_dust_edge_shadow_only");
     }
+    record_payload_pool_shadow(
+        &dashboard,
+        &candidate.signal,
+        &payload,
+        economic_payload,
+        gas_price_gwei(candidate.gas_price),
+    );
     if let Some(mut sample) = payload
         .edge_metadata
         .clone()
@@ -3194,6 +3207,137 @@ fn gas_price_gwei(gas_price: U256) -> f64 {
 
 fn address_hex(address: Address) -> String {
     format!("{address:?}")
+}
+
+fn token_pair_label(signal: &SwapSignal) -> String {
+    let token_in = signal
+        .path
+        .first()
+        .map(|address| address_hex(*address))
+        .unwrap_or_else(|| "unknown".to_string());
+    let token_out = signal
+        .path
+        .get(1)
+        .or_else(|| signal.path.last())
+        .map(|address| address_hex(*address))
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("{token_in}->{token_out}")
+}
+
+fn signal_dex_kind_and_fee_tier(signal: &SwapSignal) -> (&'static str, u32) {
+    match &signal.kind {
+        SwapKind::V2 => ("v2", 0),
+        SwapKind::V3 { fee_tier, .. } => ("v3", *fee_tier),
+    }
+}
+
+fn payload_pool_liquidity(payload: &ExecutionPayload) -> f64 {
+    match &payload.pool_state_before {
+        AmmState::UniswapV2(pool) => {
+            wei_to_eth_f64(pool.reserve0).max(0.0) + wei_to_eth_f64(pool.reserve1).max(0.0)
+        }
+        AmmState::UniswapV3(pool) => wei_to_eth_f64(pool.liquidity).max(0.0),
+    }
+}
+
+fn record_pool_shadow_stage(
+    dashboard: &DashboardHandle,
+    signal: &SwapSignal,
+    stage: &str,
+    pool: &str,
+    expected_profit_native: f64,
+    liquidity_native: f64,
+    gas_gwei: f64,
+) {
+    let (dex_kind, fee_tier) = signal_dex_kind_and_fee_tier(signal);
+    dashboard.record_selector_pool_performance(
+        &selector_hex(signal.selector),
+        &address_hex(signal.router),
+        &token_pair_label(signal),
+        pool,
+        dex_kind,
+        fee_tier,
+        stage,
+        expected_profit_native,
+        liquidity_native,
+        gas_gwei,
+    );
+}
+
+fn record_payload_pool_shadow(
+    dashboard: &DashboardHandle,
+    signal: &SwapSignal,
+    payload: &ExecutionPayload,
+    economic_payload: bool,
+    gas_gwei: f64,
+) {
+    let pool = payload
+        .edge_metadata
+        .as_ref()
+        .map(|sample| sample.pool.as_str())
+        .filter(|pool| !pool.trim().is_empty() && *pool != "unknown")
+        .map(str::to_string)
+        .unwrap_or_else(|| address_hex(payload.pair));
+    let expected_profit = wei_to_eth_f64(payload.expected_profit_wei);
+    let liquidity = payload_pool_liquidity(payload);
+    record_pool_shadow_stage(
+        dashboard,
+        signal,
+        "pool_found",
+        &pool,
+        expected_profit,
+        liquidity,
+        gas_gwei,
+    );
+    if economic_payload {
+        record_pool_shadow_stage(
+            dashboard,
+            signal,
+            "payload_built",
+            &pool,
+            expected_profit,
+            liquidity,
+            gas_gwei,
+        );
+    }
+    let ev_stage = if expected_profit > 0.0 && economic_payload {
+        "shadow_ev_positive"
+    } else {
+        "shadow_ev_negative"
+    };
+    record_pool_shadow_stage(
+        dashboard,
+        signal,
+        ev_stage,
+        &pool,
+        expected_profit,
+        liquidity,
+        gas_gwei,
+    );
+}
+
+fn record_payload_pool_reject(
+    dashboard: &DashboardHandle,
+    signal: &SwapSignal,
+    payload_detail: &str,
+    gas_gwei: f64,
+) {
+    let detail = payload_detail.to_ascii_lowercase();
+    if detail.contains("pair_not_found")
+        || detail.contains("pool_not_found")
+        || detail.contains("factory_wrong_or_unavailable")
+        || detail.contains("v3_fee_tier_or_pool_not_found")
+    {
+        record_pool_shadow_stage(
+            dashboard,
+            signal,
+            "pool_missing",
+            "unknown",
+            0.0,
+            0.0,
+            gas_gwei,
+        );
+    }
 }
 
 fn known_target_label(address: Address) -> Option<&'static str> {

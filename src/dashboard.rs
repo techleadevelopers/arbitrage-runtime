@@ -1,7 +1,10 @@
 use crate::config::{parse_opportunity_mode, Config, OpportunityMode, OpportunityThresholds};
 use crate::mev::execution::payload_builder::EdgeMetadata;
 use crate::rpc::{RpcEndpointSnapshot, RpcFleet};
-use crate::storage::{Storage, UnsupportedSelectorRecord};
+use crate::storage::{
+    SelectorPerformanceSnapshot, SelectorPoolPerformanceSnapshot, Storage,
+    UnsupportedSelectorRecord,
+};
 use axum::extract::{Path, Query, State};
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::HeaderValue;
@@ -44,6 +47,7 @@ struct PendingStorageWrites {
     funnel_rollups: HashMap<String, PendingCounterRollup>,
     reject_reason_rollups: HashMap<String, PendingRejectReasonRollup>,
     selector_performance_rollups: HashMap<String, PendingSelectorPerformanceRollup>,
+    selector_pool_performance_rollups: HashMap<String, PendingSelectorPoolPerformanceRollup>,
     relay_updates: Vec<PendingRelayUpdate>,
     treasury_updates: Vec<PendingTreasuryUpdate>,
     execution_outcomes: Vec<PendingExecutionOutcome>,
@@ -88,6 +92,25 @@ struct PendingSelectorPerformanceRollup {
     count: u64,
     confidence_sum: f64,
     gas_gwei_sum: f64,
+}
+
+struct PendingSelectorPoolPerformanceRollup {
+    bucket: String,
+    selector: String,
+    target: String,
+    token_pair: String,
+    pool: String,
+    dex_kind: String,
+    fee_tier: u32,
+    pool_found_count: u64,
+    pool_missing_count: u64,
+    payload_built_count: u64,
+    shadow_ev_positive_count: u64,
+    shadow_ev_negative_count: u64,
+    expected_profit_sum: f64,
+    liquidity_sum: f64,
+    gas_gwei_sum: f64,
+    samples: u64,
 }
 
 struct PendingRelayUpdate {
@@ -837,6 +860,8 @@ pub struct DashboardState {
     pub latency_risk: LatencyRiskSnapshot,
     pub opportunity_funnel: OpportunityFunnelSnapshot,
     pub edge_telemetry: EdgeTelemetrySnapshot,
+    pub selector_scores: Vec<SelectorPerformanceSnapshot>,
+    pub selector_pool_scores: Vec<SelectorPoolPerformanceSnapshot>,
     pub scavenger_observer: ScavengerObserverReport,
     pub reject_reasons: Vec<RejectReasonSnapshot>,
     pub relay_rankings: Vec<RelaySnapshot>,
@@ -1055,6 +1080,10 @@ impl DashboardHandle {
                 latency_risk,
                 opportunity_funnel: OpportunityFunnelSnapshot::default(),
                 edge_telemetry: EdgeTelemetrySnapshot::default(),
+                selector_scores: storage.selector_performance_scores(12).unwrap_or_default(),
+                selector_pool_scores: storage
+                    .selector_pool_performance_scores(12)
+                    .unwrap_or_default(),
                 scavenger_observer: ScavengerObserverReport::default(),
                 reject_reasons: Vec::new(),
                 relay_rankings,
@@ -1126,6 +1155,12 @@ impl DashboardHandle {
         }
         if let Ok(execution_outcomes) = self.storage.execution_outcomes(12) {
             state.execution_outcomes = execution_outcomes;
+        }
+        if let Ok(selector_scores) = self.storage.selector_performance_scores(12) {
+            state.selector_scores = selector_scores;
+        }
+        if let Ok(selector_pool_scores) = self.storage.selector_pool_performance_scores(12) {
+            state.selector_pool_scores = selector_pool_scores;
         }
         state.opportunity_mode = self
             .opportunity_mode
@@ -1301,6 +1336,73 @@ impl DashboardHandle {
             entry.count = entry.count.saturating_add(1);
             entry.confidence_sum += confidence.clamp(0.0, 1.0);
             entry.gas_gwei_sum += gas_gwei.max(0.0);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_selector_pool_performance(
+        &self,
+        selector: &str,
+        target: &str,
+        token_pair: &str,
+        pool: &str,
+        dex_kind: &str,
+        fee_tier: u32,
+        stage: &str,
+        expected_profit: f64,
+        liquidity: f64,
+        gas_gwei: f64,
+    ) {
+        if !storage_rollups_enabled() {
+            return;
+        }
+        if let Ok(mut pending) = self.pending.lock() {
+            let bucket = telemetry_bucket_minute();
+            let key =
+                format!("{bucket}|{selector}|{target}|{token_pair}|{pool}|{dex_kind}|{fee_tier}");
+            let entry = pending
+                .selector_pool_performance_rollups
+                .entry(key)
+                .or_insert_with(|| PendingSelectorPoolPerformanceRollup {
+                    bucket,
+                    selector: selector.to_string(),
+                    target: target.to_string(),
+                    token_pair: token_pair.to_string(),
+                    pool: pool.to_string(),
+                    dex_kind: dex_kind.to_string(),
+                    fee_tier,
+                    pool_found_count: 0,
+                    pool_missing_count: 0,
+                    payload_built_count: 0,
+                    shadow_ev_positive_count: 0,
+                    shadow_ev_negative_count: 0,
+                    expected_profit_sum: 0.0,
+                    liquidity_sum: 0.0,
+                    gas_gwei_sum: 0.0,
+                    samples: 0,
+                });
+            match stage {
+                "pool_found" => entry.pool_found_count = entry.pool_found_count.saturating_add(1),
+                "pool_missing" => {
+                    entry.pool_missing_count = entry.pool_missing_count.saturating_add(1)
+                }
+                "payload_built" | "shadow_payload_built" => {
+                    entry.payload_built_count = entry.payload_built_count.saturating_add(1)
+                }
+                "shadow_ev_positive" => {
+                    entry.shadow_ev_positive_count =
+                        entry.shadow_ev_positive_count.saturating_add(1)
+                }
+                "shadow_ev_negative" => {
+                    entry.shadow_ev_negative_count =
+                        entry.shadow_ev_negative_count.saturating_add(1)
+                }
+                _ => {}
+            }
+            entry.expected_profit_sum += expected_profit.max(0.0);
+            entry.liquidity_sum += liquidity.max(0.0);
+            entry.gas_gwei_sum += gas_gwei.max(0.0);
+            entry.samples = entry.samples.saturating_add(1);
         }
     }
 
@@ -1636,6 +1738,27 @@ impl DashboardHandle {
                 selector.count,
                 selector.confidence_sum,
                 selector.gas_gwei_sum,
+            );
+        }
+
+        for pool in pending.selector_pool_performance_rollups.into_values() {
+            self.storage.record_selector_pool_performance_rollup(
+                &pool.bucket,
+                &pool.selector,
+                &pool.target,
+                &pool.token_pair,
+                &pool.pool,
+                &pool.dex_kind,
+                pool.fee_tier,
+                pool.pool_found_count,
+                pool.pool_missing_count,
+                pool.payload_built_count,
+                pool.shadow_ev_positive_count,
+                pool.shadow_ev_negative_count,
+                pool.expected_profit_sum,
+                pool.liquidity_sum,
+                pool.gas_gwei_sum,
+                pool.samples,
             );
         }
 
