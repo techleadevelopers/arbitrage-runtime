@@ -1323,6 +1323,42 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn polygon_mempool_ws_accepts_numbered_fallbacks() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            env::remove_var("MEMPOOL_WS_URL");
+            env::remove_var("MEMPOOL_WS_URL_2");
+            env::remove_var("MEMPOOL_WS_URL_3");
+            env::remove_var("MEMPOOL_WS_URL_POLYGON");
+            env::remove_var("MEMPOOL_WS_URL_POLYGON_2");
+            env::remove_var("MEMPOOL_WS_URL_POLYGON_3");
+            env::remove_var("MEMPOOL_WS_URL_POLYGON2");
+            env::remove_var("MEMPOOL_WS_URL_POLYGON3");
+            env::remove_var("MEMPOOL_WS_DISABLE_DEFAULT_ALCHEMY");
+            env::set_var("MEMPOOL_WS_URL_POLYGON", "wss://polygon-primary.example");
+            env::set_var("MEMPOOL_WS_URL_POLYGON_2", "wss://polygon-fallback-2.example");
+            env::set_var("MEMPOOL_WS_URL_POLYGON3", "wss://polygon-fallback-3.example");
+        }
+
+        let urls = parse_mempool_ws_urls("polygon", false, &[]);
+
+        assert_eq!(
+            urls,
+            vec![
+                "wss://polygon-primary.example".to_string(),
+                "wss://polygon-fallback-2.example".to_string(),
+                "wss://polygon-fallback-3.example".to_string(),
+            ]
+        );
+
+        unsafe {
+            env::remove_var("MEMPOOL_WS_URL_POLYGON");
+            env::remove_var("MEMPOOL_WS_URL_POLYGON_2");
+            env::remove_var("MEMPOOL_WS_URL_POLYGON3");
+        }
+    }
+
+    #[test]
     fn replay_tuned_runtime_env_can_be_applied() {
         let _guard = ENV_LOCK.lock().unwrap();
         let temp = std::env::temp_dir().join(format!(
