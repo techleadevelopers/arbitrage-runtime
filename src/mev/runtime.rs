@@ -1997,8 +1997,10 @@ fn adaptive_gas_cap_gwei(ev_upper_bound_usd: f64, notional_eth: f64, hard_cap_gw
         1_000.0
     } else if ev_upper_bound_usd >= 0.25 {
         800.0
+    } else if ev_upper_bound_usd >= 0.15 {
+        1_000.0
     } else if ev_upper_bound_usd >= 0.10 {
-        700.0
+        800.0
     } else if ev_upper_bound_usd >= 0.05 {
         600.0
     } else if ev_upper_bound_usd >= 0.02 {
