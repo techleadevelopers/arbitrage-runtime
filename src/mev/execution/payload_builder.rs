@@ -313,9 +313,9 @@ impl PayloadBuilder {
             token_out: format!("{:?}", input.token_out),
         };
 
-        let executor = config.mev.mev_executor_v3.or(config.mev.mev_executor).ok_or_else(|| {
+        let executor = config.mev.mev_executor.ok_or_else(|| {
             payload_error_with_edge_sample(
-                "MEV_EXECUTOR_V3_ADDRESS or MEV_EXECUTOR_ADDRESS is required to build V3 atomic payload",
+                "MEV_EXECUTOR_ADDRESS is required to build V2 atomic payload",
                 Some(scavenger_shadow_sample(
                     config,
                     edge_metadata.clone(),
@@ -572,9 +572,9 @@ impl PayloadBuilder {
             );
         }
 
-        let executor = config.mev.mev_executor.ok_or_else(|| {
+        let executor = config.mev.mev_executor_v3.or(config.mev.mev_executor).ok_or_else(|| {
             payload_error_with_edge_sample(
-                "MEV_EXECUTOR_ADDRESS is required to build atomic payload",
+                "MEV_EXECUTOR_V3_ADDRESS or MEV_EXECUTOR_ADDRESS is required to build V3 atomic payload",
                 Some(scavenger_shadow_sample(
                     config,
                     edge_metadata.clone(),

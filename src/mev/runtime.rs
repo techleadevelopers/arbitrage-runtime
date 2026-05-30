@@ -2001,10 +2001,10 @@ pub(crate) fn fast_preflight_gate(
 fn adaptive_gas_cap_gwei(ev_upper_bound_usd: f64, notional_eth: f64, hard_cap_gwei: f64) -> f64 {
     let tier_floor: f64 = if ev_upper_bound_usd >= 0.25 {
         1_000.0
-    } else if ev_upper_bound_usd >= 0.15 {
-        800.0
+    } else if ev_upper_bound_usd >= 0.14 {
+        hard_cap_gwei * 0.98
     } else if ev_upper_bound_usd >= 0.10 {
-        600.0
+        850.0
     } else if ev_upper_bound_usd >= 0.05 {
         450.0
     } else if ev_upper_bound_usd >= 0.02 {
@@ -2026,7 +2026,11 @@ fn adaptive_gas_cap_gwei(ev_upper_bound_usd: f64, notional_eth: f64, hard_cap_gw
     } else {
         150.0 + ev_upper_bound_usd * 1_500.0
     };
-    let edge_cap = tier_floor.max(continuous_cap);
+    let edge_cap = if ev_upper_bound_usd >= 0.14 {
+        tier_floor
+    } else {
+        tier_floor.max(continuous_cap)
+    };
 
     let size_multiplier = if ev_upper_bound_usd > 0.0 {
         (0.95 + notional_eth / 40.0).clamp(1.0, 1.18)
@@ -2465,8 +2469,15 @@ pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
         .get(1)
         .ok_or_else(|| "missing token_out".to_string())?;
 
-    let (factory, pair) =
-        find_v2_pair(provider.clone(), config, signal.router, token_in, token_out).await?;
+    let execution_router = execution_v2_router(config, signal.router);
+    let (factory, pair) = find_v2_pair(
+        provider.clone(),
+        config,
+        execution_router,
+        token_in,
+        token_out,
+    )
+    .await?;
 
     if pair == Address::zero() {
         return Err("v2 pair not found".to_string());
@@ -2497,6 +2508,7 @@ pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
                 token_in,
                 token_out,
                 pair,
+                execution_router,
                 capital_available_wei,
                 pool_cache,
                 block_number,
@@ -2510,7 +2522,7 @@ pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
     PayloadBuilder::build_fee_extraction_v2(
         config,
         FeeExtractionBuildInput {
-            router: signal.router,
+            router: execution_router,
             factory: Some(factory),
             pair,
             recipient,
@@ -2575,6 +2587,7 @@ async fn best_scavenger_v2_reverse_route<M: Middleware + 'static>(
     token_in: Address,
     token_out: Address,
     victim_pair: Address,
+    execution_router: Address,
     capital_available_wei: U256,
     pool_cache: &PoolCache,
     block_number: u64,
@@ -2590,7 +2603,7 @@ async fn best_scavenger_v2_reverse_route<M: Middleware + 'static>(
         let Some(pools) = load_v2_route_pools(
             provider.clone(),
             config,
-            signal.router,
+            execution_router,
             &route,
             victim_pair,
             pool_cache,
@@ -2773,6 +2786,33 @@ fn push_unique_address(addresses: &mut Vec<Address>, address: Address) {
     }
 }
 
+fn execution_v2_router(config: &Config, fallback: Address) -> Address {
+    default_v2_router(config.network.as_str()).unwrap_or(fallback)
+}
+
+fn execution_v3_router(config: &Config, fallback: Address) -> Address {
+    default_v3_router(config.network.as_str()).unwrap_or(fallback)
+}
+
+fn default_v2_router(network: &str) -> Option<Address> {
+    match network {
+        "polygon" => "0xa5e0829caced8ffdd4de3c43696c57f7d7a678ff".parse().ok(),
+        "bsc" | "bnb" => "0x10ed43c718714eb63d5aa57b78b54704e256024e".parse().ok(),
+        "ethereum" => "0x7a250d5630b4cf539739df2c5dacb4c659f2488d".parse().ok(),
+        _ => None,
+    }
+}
+
+fn default_v3_router(network: &str) -> Option<Address> {
+    match network {
+        "polygon" | "ethereum" | "arbitrum" => {
+            "0xe592427a0aece92de3edee1f18e0157c05861564".parse().ok()
+        }
+        "bsc" | "bnb" => "0x13f4ea83d0bd40e75c8222255bc855a974568dd4".parse().ok(),
+        _ => None,
+    }
+}
+
 fn default_v2_factories(network: &str) -> Vec<Address> {
     match network {
         "polygon" => parse_default_addresses(&[
@@ -2876,6 +2916,7 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
 
     let (factory, pool) =
         find_v3_pool(provider.clone(), config, token_in, token_out, fee_tier).await?;
+    let execution_router = execution_v3_router(config, signal.router);
 
     if pool == Address::zero() {
         return Err("v3 pool not found".to_string());
@@ -2939,7 +2980,7 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
     PayloadBuilder::build_fee_extraction_v3(
         config,
         FeeExtractionBuildInput {
-            router: signal.router,
+            router: execution_router,
             factory: Some(factory),
             pair: pool,
             recipient,
@@ -3189,7 +3230,65 @@ fn decode_universal_router_swap_candidates(
         _ => return Vec::new(),
     };
 
-    decode_universal_router_parts(selector, router, commands, inputs, 0)
+    let mut signals = decode_universal_router_parts(selector, router, commands, inputs, 0);
+    if signals.is_empty() {
+        signals.extend(decode_universal_router_graph_candidates(
+            selector, router, commands, inputs,
+        ));
+    }
+    signals
+}
+
+fn decode_universal_router_graph_candidates(
+    selector: [u8; 4],
+    router: Address,
+    commands: &[u8],
+    inputs: &[Token],
+) -> Vec<SwapSignal> {
+    let mut graph = UniversalRouterRouteGraph {
+        command_count: 0,
+        swap_command_count: 0,
+        hops: Vec::new(),
+        unsupported_commands: Vec::new(),
+    };
+    collect_universal_router_graph(commands, inputs, 0, &mut graph);
+    graph
+        .hops
+        .into_iter()
+        .filter_map(|hop| universal_router_hop_to_signal(selector, router, hop))
+        .collect()
+}
+
+fn universal_router_hop_to_signal(
+    selector: [u8; 4],
+    router: Address,
+    hop: UniversalRouterHop,
+) -> Option<SwapSignal> {
+    let amount_in = hop.amount_in?;
+    if amount_in.is_zero() {
+        return None;
+    }
+    let path = vec![hop.token_in, hop.token_out];
+    let kind = if hop.dex == "v3" {
+        let fee_tier = hop.fee_tier?;
+        SwapKind::V3 {
+            fee_tier,
+            encoded_path: encode_v3_path(hop.token_in, fee_tier, hop.token_out),
+            hops: 1,
+            exact_out: hop.exact_out,
+        }
+    } else {
+        SwapKind::V2
+    };
+    Some(SwapSignal {
+        selector,
+        amount_in,
+        amount_out_min: hop.amount_out,
+        notional_wei: U256::zero(),
+        path,
+        router,
+        kind,
+    })
 }
 
 fn decode_universal_router_parts(
