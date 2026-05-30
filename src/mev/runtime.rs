@@ -25,6 +25,7 @@ use ethers::providers::{Middleware, Provider, StreamExt, Ws};
 use ethers::types::{Address, Transaction, H256, U256};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
@@ -36,6 +37,7 @@ const LOOKUP_DECODE_QUEUE_CAPACITY: usize = 2048;
 const EVAL_QUEUE_CAPACITY: usize = 512;
 const LOOKUP_DECODE_WORKERS_MAX: usize = 2;
 const EVAL_WORKERS_MAX: usize = 4;
+const SMALL_SCAVENGER_BUDGET_PER_SEC: u64 = 8;
 
 const SWAP_EXACT_TOKENS_FOR_TOKENS: [u8; 4] = [0x38, 0xed, 0x17, 0x39];
 const SWAP_EXACT_ETH_FOR_TOKENS: [u8; 4] = [0x7f, 0xf3, 0x6a, 0xb5];
@@ -62,7 +64,7 @@ pub(crate) enum SwapKind {
         fee_tier: u32,
         encoded_path: ethers::types::Bytes,
         hops: usize,
-        exact_out: bool,  // <-- ADICIONAR
+        exact_out: bool, // <-- ADICIONAR
     },
 }
 
@@ -350,6 +352,7 @@ impl PendingLookupBackpressure {
 struct LookupDecodedCandidate {
     tx: Transaction,
     signal: SwapSignal,
+    lane: CandidateLane,
     hour_utc: u8,
     gas_price: U256,
     context_signal: ContextSignal,
@@ -359,6 +362,32 @@ struct LookupDecodedCandidate {
     latency_trace: CandidateLatencyTrace,
     block_number: u64,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateLane {
+    Small,
+    Medium,
+    Large,
+    Universal,
+}
+
+impl CandidateLane {
+    fn as_str(self) -> &'static str {
+        match self {
+            CandidateLane::Small => "small",
+            CandidateLane::Medium => "medium",
+            CandidateLane::Large => "large",
+            CandidateLane::Universal => "universal",
+        }
+    }
+}
+
+struct SmallSwapBudget {
+    window_started: Instant,
+    accepted: u64,
+}
+
+static SMALL_SCAVENGER_BUDGET: OnceLock<StdMutex<SmallSwapBudget>> = OnceLock::new();
 
 ethers::contract::abigen!(
     UniswapV2Factory,
@@ -824,10 +853,12 @@ async fn process_lookup_decode_task(
     }
 
     let decode_started = Instant::now();
+    let min_large_swap_wei =
+        ethers::utils::parse_ether(config.mev.effective_min_large_swap_eth().to_string()).ok()?;
     let Some(signal) = decode_relevant_swap(
         &tx,
         &config.monitored_tokens,
-        ethers::utils::parse_ether(config.mev.effective_min_large_swap_eth().to_string()).ok()?,
+        min_large_swap_wei,
         config.mev.opportunity_mode(),
     ) else {
         latency_trace.decode_swap_us = Some(elapsed_us(decode_started));
@@ -903,6 +934,25 @@ async fn process_lookup_decode_task(
         return None;
     }
 
+    let lane = classify_candidate_lane(&signal, min_large_swap_wei);
+    dashboard.record_reject_reason("candidate_lane", lane.as_str());
+    if lane == CandidateLane::Small
+        && config.mev.opportunity_mode() == OpportunityMode::Scavenger
+        && !allow_small_scavenger_candidate()
+    {
+        dashboard.record_opportunity_funnel("small_scavenger_throttled");
+        dashboard.record_reject_reason("small_scavenger", "budget_limited");
+        latency_trace.total_internal_us = Some(elapsed_us(task.candidate_started));
+        latency_trace.emit(
+            &config,
+            &dashboard,
+            task.tx_hash,
+            "reject",
+            "small_scavenger_budget",
+        );
+        return None;
+    }
+
     let block_fetch_started = Instant::now();
     let Some(block_number) = get_current_block_parallel(rpc_fleet.clone()).await else {
         dashboard.record_latency(
@@ -934,6 +984,7 @@ async fn process_lookup_decode_task(
     Some(LookupDecodedCandidate {
         tx,
         signal,
+        lane,
         hour_utc,
         gas_price,
         context_signal,
@@ -954,6 +1005,67 @@ fn pending_lookup_fanout() -> usize {
 }
 
 // NOVA FUNÇÃO auxiliar
+fn classify_candidate_lane(signal: &SwapSignal, min_large_swap_wei: U256) -> CandidateLane {
+    if matches!(
+        signal.selector,
+        UNIVERSAL_ROUTER_EXECUTE | UNIVERSAL_ROUTER_EXECUTE_NO_DEADLINE
+    ) {
+        return CandidateLane::Universal;
+    }
+
+    let medium_floor = ethers::utils::parse_ether("0.05")
+        .unwrap_or_else(|_| U256::from(50_000_000_000_000_000u64));
+    let large_floor = ethers::utils::parse_ether("0.5")
+        .unwrap_or_else(|_| U256::from(500_000_000_000_000_000u64));
+    let medium_threshold = u256_max(
+        min_large_swap_wei.saturating_mul(U256::from(25u64)),
+        medium_floor,
+    );
+    let large_threshold = u256_max(
+        min_large_swap_wei.saturating_mul(U256::from(250u64)),
+        large_floor,
+    );
+
+    if signal.notional_wei >= large_threshold {
+        CandidateLane::Large
+    } else if signal.notional_wei >= medium_threshold {
+        CandidateLane::Medium
+    } else {
+        CandidateLane::Small
+    }
+}
+
+fn allow_small_scavenger_candidate() -> bool {
+    let budget = SMALL_SCAVENGER_BUDGET.get_or_init(|| {
+        StdMutex::new(SmallSwapBudget {
+            window_started: Instant::now(),
+            accepted: 0,
+        })
+    });
+    let Ok(mut guard) = budget.lock() else {
+        return true;
+    };
+    let now = Instant::now();
+    if now.saturating_duration_since(guard.window_started) >= Duration::from_secs(1) {
+        guard.window_started = now;
+        guard.accepted = 0;
+    }
+    if guard.accepted < SMALL_SCAVENGER_BUDGET_PER_SEC {
+        guard.accepted = guard.accepted.saturating_add(1);
+        true
+    } else {
+        false
+    }
+}
+
+fn u256_max(left: U256, right: U256) -> U256 {
+    if left > right {
+        left
+    } else {
+        right
+    }
+}
+
 fn rpc_lookup_pressure(rpc_fleet: &RpcFleet) -> RpcLookupPressure {
     let mut pressure = RpcLookupPressure::default();
     pressure.available_readers = 0;
@@ -1138,6 +1250,7 @@ async fn process_evaluation_task(
     let min_profit_wei =
         ethers::utils::parse_ether(config.mev.effective_min_net_profit_eth().to_string())
             .unwrap_or(min_profit_wei);
+    dashboard.record_reject_reason("eval_lane", candidate.lane.as_str());
 
     let fast_preflight_started = Instant::now();
     let fast_gate = fast_preflight_gate(
@@ -1172,9 +1285,13 @@ async fn process_evaluation_task(
                     max_gas_price_gwei
                 ),
             );
-            candidate
-                .latency_trace
-                .emit(&config, &dashboard, tx_hash, "reject", "gas_price_adaptive_cap");
+            candidate.latency_trace.emit(
+                &config,
+                &dashboard,
+                tx_hash,
+                "reject",
+                "gas_price_adaptive_cap",
+            );
             return None;
         }
     }
@@ -1881,13 +1998,27 @@ fn adaptive_gas_cap_gwei(ev_upper_bound_usd: f64, notional_eth: f64, hard_cap_gw
     } else if ev_upper_bound_usd >= 0.25 {
         800.0
     } else if ev_upper_bound_usd >= 0.10 {
-        500.0
+        700.0
     } else if ev_upper_bound_usd >= 0.05 {
-        300.0
-    } else {
+        600.0
+    } else if ev_upper_bound_usd >= 0.02 {
+        450.0
+    } else if ev_upper_bound_usd >= 0.01 {
+        350.0
+    } else if ev_upper_bound_usd >= 0.005 {
+        250.0
+    } else if ev_upper_bound_usd > 0.0 {
+        220.0
+    } else if ev_upper_bound_usd >= -0.02 {
         180.0
+    } else {
+        120.0
     };
-    let size_multiplier = (notional_eth / 10.0).clamp(0.75, 1.15);
+    let size_multiplier = if ev_upper_bound_usd > 0.0 {
+        (notional_eth / 10.0).clamp(1.0, 1.20)
+    } else {
+        (notional_eth / 10.0).clamp(0.75, 1.15)
+    };
     (edge_cap * size_multiplier).clamp(120.0, hard_cap_gwei.max(1.0))
 }
 
@@ -2770,13 +2901,13 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
 
     // NOVO: Calcular edge conservador para exact-out single-hop
     if is_exact_out {
-        let _amount_out_min = signal.amount_out_min.ok_or_else(|| {
-            "exact_out requires amount_out_min".to_string()
-        })?;
-        
+        let _amount_out_min = signal
+            .amount_out_min
+            .ok_or_else(|| "exact_out requires amount_out_min".to_string())?;
+
         // Verificar se o edge é positivo usando amount_in_max como teto
         let gas_cost_wei = gas_price.saturating_mul(U256::from(300_000u64));
-        
+
         // Cálculo conservador: assumimos que vamos pagar o amount_in_max inteiro
         if victim_amount_in <= gas_cost_wei {
             return Err(format!(
@@ -2784,7 +2915,7 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
                 victim_amount_in, gas_cost_wei
             ));
         }
-        
+
         let edge_wei = victim_amount_in.saturating_sub(gas_cost_wei);
         if edge_wei.is_zero() {
             return Err("exact_out positive gross edge not found".to_string());
@@ -2800,7 +2931,7 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
             recipient,
             token_in,
             token_out,
-            victim_amount_in,  // USAR O VALOR CORRETO (amount_in_max para exact-out)
+            victim_amount_in, // USAR O VALOR CORRETO (amount_in_max para exact-out)
             state_before: crate::mev::simulation::state_simulator::AmmState::UniswapV3(state),
             capital_available_wei,
             gas_price_wei: gas_price,
@@ -2992,10 +3123,22 @@ fn decode_universal_router_swap_for_monitored(
         .filter_map(|mut signal| {
             let notional_wei = estimate_notional_wei(&signal, monitored_tokens)?;
             signal.notional_wei = notional_wei;
-            Some((notional_wei, signal))
+            Some((universal_router_candidate_rank(&signal), signal))
         })
-        .max_by_key(|(notional_wei, _)| *notional_wei)
+        .max_by_key(|(rank, _)| *rank)
         .map(|(_, signal)| signal)
+}
+
+fn universal_router_candidate_rank(signal: &SwapSignal) -> (U256, u8, i64) {
+    let exact_in_score = match &signal.kind {
+        SwapKind::V3 { exact_out, .. } if *exact_out => 0,
+        _ => 1,
+    };
+    (
+        signal.notional_wei,
+        exact_in_score,
+        -(signal.path_len() as i64),
+    )
 }
 
 fn decode_universal_router_swap_candidates(
@@ -3144,7 +3287,6 @@ fn decode_universal_router_v2_exact_in(
     })
 }
 
-
 fn decode_universal_router_v2_exact_out(
     selector: [u8; 4],
     router: Address,
@@ -3260,7 +3402,6 @@ fn decode_universal_router_v3_exact_out(
         },
     })
 }
-
 
 fn decode_zero_ex_sell_to_uniswap(
     selector: [u8; 4],
@@ -4139,7 +4280,10 @@ mod tests {
             Token::Address(Address::from_low_u64_be(99)),
             Token::Uint(U256::from(2u64) * unit),
             Token::Uint(U256::from(1u64)),
-            Token::Array(vec![Token::Address(monitored_in), Token::Address(monitored_out)]),
+            Token::Array(vec![
+                Token::Address(monitored_in),
+                Token::Address(monitored_out),
+            ]),
             Token::Bool(true),
         ]);
         let args = encode(&[
