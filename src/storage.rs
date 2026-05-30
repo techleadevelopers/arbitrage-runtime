@@ -191,6 +191,34 @@ impl Storage {
                 route_hint TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (network, target, selector, inner_selector, token_hints)
             );
+
+            CREATE TABLE IF NOT EXISTS latency_rollups (
+                network TEXT NOT NULL DEFAULT 'unknown',
+                bucket TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                samples INTEGER NOT NULL DEFAULT 0,
+                total_ms INTEGER NOT NULL DEFAULT 0,
+                max_ms INTEGER NOT NULL DEFAULT 0,
+                last_ms INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (network, bucket, stage)
+            );
+
+            CREATE TABLE IF NOT EXISTS funnel_rollups (
+                network TEXT NOT NULL DEFAULT 'unknown',
+                bucket TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (network, bucket, stage)
+            );
+
+            CREATE TABLE IF NOT EXISTS reject_reason_rollups (
+                network TEXT NOT NULL DEFAULT 'unknown',
+                bucket TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (network, bucket, stage, reason)
+            );
             "#,
         )?;
         let _ = conn.execute(
@@ -228,7 +256,7 @@ impl Storage {
     }
 
     pub fn database_table_counts(&self) -> Result<Vec<(String, u64)>, Box<dyn std::error::Error>> {
-        const TABLES: [&str; 8] = [
+        const TABLES: [&str; 11] = [
             "events",
             "telemetry",
             "sweeps",
@@ -237,6 +265,9 @@ impl Storage {
             "treasury_rebalance",
             "execution_outcomes",
             "unsupported_selectors",
+            "latency_rollups",
+            "funnel_rollups",
+            "reject_reason_rollups",
         ];
 
         match &self.backend {
@@ -378,6 +409,37 @@ impl Storage {
                 PRIMARY KEY (network, target, selector, inner_selector, token_hints)
             )
             "#,
+            r#"
+            CREATE TABLE IF NOT EXISTS latency_rollups (
+                network TEXT NOT NULL DEFAULT 'unknown',
+                bucket TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                samples BIGINT NOT NULL DEFAULT 0,
+                total_ms BIGINT NOT NULL DEFAULT 0,
+                max_ms BIGINT NOT NULL DEFAULT 0,
+                last_ms BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (network, bucket, stage)
+            )
+            "#,
+            r#"
+            CREATE TABLE IF NOT EXISTS funnel_rollups (
+                network TEXT NOT NULL DEFAULT 'unknown',
+                bucket TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                count BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (network, bucket, stage)
+            )
+            "#,
+            r#"
+            CREATE TABLE IF NOT EXISTS reject_reason_rollups (
+                network TEXT NOT NULL DEFAULT 'unknown',
+                bucket TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                count BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (network, bucket, stage, reason)
+            )
+            "#,
         ];
 
         for statement in statements {
@@ -445,6 +507,9 @@ impl Storage {
                 6,
             )))
         .to_rfc3339();
+        let rollup_cutoff = (Utc::now()
+            - chrono::Duration::days(runtime_retention_days("STORAGE_ROLLUP_RETENTION_DAYS", 14)))
+        .to_rfc3339();
         match &self.backend {
             StorageBackend::Sqlite(conn) => {
                 let conn = conn.lock().map_err(|_| "storage lock poisoned")?;
@@ -452,6 +517,18 @@ impl Storage {
                 conn.execute(
                     "DELETE FROM telemetry WHERE at < ?1",
                     [telemetry_cutoff.as_str()],
+                )?;
+                conn.execute(
+                    "DELETE FROM latency_rollups WHERE bucket < ?1",
+                    [rollup_cutoff.as_str()],
+                )?;
+                conn.execute(
+                    "DELETE FROM funnel_rollups WHERE bucket < ?1",
+                    [rollup_cutoff.as_str()],
+                )?;
+                conn.execute(
+                    "DELETE FROM reject_reason_rollups WHERE bucket < ?1",
+                    [rollup_cutoff.as_str()],
                 )?;
                 Ok(())
             }
@@ -464,6 +541,21 @@ impl Storage {
                 Self::wait(
                     sqlx::query("DELETE FROM telemetry WHERE at < $1")
                         .bind(telemetry_cutoff)
+                        .execute(pool),
+                )?;
+                Self::wait(
+                    sqlx::query("DELETE FROM latency_rollups WHERE bucket < $1")
+                        .bind(rollup_cutoff.clone())
+                        .execute(pool),
+                )?;
+                Self::wait(
+                    sqlx::query("DELETE FROM funnel_rollups WHERE bucket < $1")
+                        .bind(rollup_cutoff.clone())
+                        .execute(pool),
+                )?;
+                Self::wait(
+                    sqlx::query("DELETE FROM reject_reason_rollups WHERE bucket < $1")
+                        .bind(rollup_cutoff)
                         .execute(pool),
                 )?;
                 Ok(())
@@ -567,6 +659,137 @@ impl Storage {
                     .bind(record.sample_tx.clone())
                     .bind(record.sample_calldata_prefix.clone())
                     .bind(record.route_hint.clone())
+                    .execute(pool),
+                );
+            }
+        }
+    }
+
+    pub fn record_latency_rollup(
+        &self,
+        bucket: &str,
+        stage: &str,
+        samples: u64,
+        total_ms: u128,
+        max_ms: u128,
+        last_ms: u128,
+    ) {
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                if let Ok(conn) = conn.lock() {
+                    let _ = conn.execute(
+                        r#"
+                        INSERT INTO latency_rollups (network, bucket, stage, samples, total_ms, max_ms, last_ms)
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                        ON CONFLICT(network, bucket, stage) DO UPDATE SET
+                            samples = samples + excluded.samples,
+                            total_ms = total_ms + excluded.total_ms,
+                            max_ms = MAX(max_ms, excluded.max_ms),
+                            last_ms = excluded.last_ms
+                        "#,
+                        params![
+                            self.network.as_str(),
+                            bucket,
+                            stage,
+                            samples as i64,
+                            total_ms as i64,
+                            max_ms as i64,
+                            last_ms as i64,
+                        ],
+                    );
+                }
+            }
+            StorageBackend::Postgres(pool) => {
+                let _ = Self::wait(
+                    sqlx::query(
+                        r#"
+                        INSERT INTO latency_rollups (network, bucket, stage, samples, total_ms, max_ms, last_ms)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)
+                        ON CONFLICT(network, bucket, stage) DO UPDATE SET
+                            samples = latency_rollups.samples + EXCLUDED.samples,
+                            total_ms = latency_rollups.total_ms + EXCLUDED.total_ms,
+                            max_ms = GREATEST(latency_rollups.max_ms, EXCLUDED.max_ms),
+                            last_ms = EXCLUDED.last_ms
+                        "#,
+                    )
+                    .bind(self.network.clone())
+                    .bind(bucket.to_string())
+                    .bind(stage.to_string())
+                    .bind(samples as i64)
+                    .bind(total_ms as i64)
+                    .bind(max_ms as i64)
+                    .bind(last_ms as i64)
+                    .execute(pool),
+                );
+            }
+        }
+    }
+
+    pub fn record_funnel_rollup(&self, bucket: &str, stage: &str, count: u64) {
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                if let Ok(conn) = conn.lock() {
+                    let _ = conn.execute(
+                        r#"
+                        INSERT INTO funnel_rollups (network, bucket, stage, count)
+                        VALUES (?1, ?2, ?3, ?4)
+                        ON CONFLICT(network, bucket, stage) DO UPDATE SET
+                            count = count + excluded.count
+                        "#,
+                        params![self.network.as_str(), bucket, stage, count as i64],
+                    );
+                }
+            }
+            StorageBackend::Postgres(pool) => {
+                let _ = Self::wait(
+                    sqlx::query(
+                        r#"
+                        INSERT INTO funnel_rollups (network, bucket, stage, count)
+                        VALUES ($1, $2, $3, $4)
+                        ON CONFLICT(network, bucket, stage) DO UPDATE SET
+                            count = funnel_rollups.count + EXCLUDED.count
+                        "#,
+                    )
+                    .bind(self.network.clone())
+                    .bind(bucket.to_string())
+                    .bind(stage.to_string())
+                    .bind(count as i64)
+                    .execute(pool),
+                );
+            }
+        }
+    }
+
+    pub fn record_reject_reason_rollup(&self, bucket: &str, stage: &str, reason: &str, count: u64) {
+        match &self.backend {
+            StorageBackend::Sqlite(conn) => {
+                if let Ok(conn) = conn.lock() {
+                    let _ = conn.execute(
+                        r#"
+                        INSERT INTO reject_reason_rollups (network, bucket, stage, reason, count)
+                        VALUES (?1, ?2, ?3, ?4, ?5)
+                        ON CONFLICT(network, bucket, stage, reason) DO UPDATE SET
+                            count = count + excluded.count
+                        "#,
+                        params![self.network.as_str(), bucket, stage, reason, count as i64],
+                    );
+                }
+            }
+            StorageBackend::Postgres(pool) => {
+                let _ = Self::wait(
+                    sqlx::query(
+                        r#"
+                        INSERT INTO reject_reason_rollups (network, bucket, stage, reason, count)
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT(network, bucket, stage, reason) DO UPDATE SET
+                            count = reject_reason_rollups.count + EXCLUDED.count
+                        "#,
+                    )
+                    .bind(self.network.clone())
+                    .bind(bucket.to_string())
+                    .bind(stage.to_string())
+                    .bind(reason.to_string())
+                    .bind(count as i64)
                     .execute(pool),
                 );
             }
@@ -1808,6 +2031,14 @@ fn runtime_retention_hours(env_name: &str, default_hours: i64) -> i64 {
         .and_then(|value| value.trim().parse::<i64>().ok())
         .unwrap_or(default_hours)
         .clamp(1, 24 * 30)
+}
+
+fn runtime_retention_days(env_name: &str, default_days: i64) -> i64 {
+    env::var(env_name)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(default_days)
+        .clamp(1, 365)
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -40,6 +40,9 @@ pub struct DashboardHandle {
 struct PendingStorageWrites {
     events: Vec<(String, String)>,
     latencies: Vec<PendingLatency>,
+    latency_rollups: HashMap<String, PendingLatencyRollup>,
+    funnel_rollups: HashMap<String, PendingCounterRollup>,
+    reject_reason_rollups: HashMap<String, PendingRejectReasonRollup>,
     relay_updates: Vec<PendingRelayUpdate>,
     treasury_updates: Vec<PendingTreasuryUpdate>,
     execution_outcomes: Vec<PendingExecutionOutcome>,
@@ -51,6 +54,28 @@ struct PendingLatency {
     duration_ms: u128,
     wallet: Option<String>,
     note: Option<String>,
+}
+
+struct PendingLatencyRollup {
+    bucket: String,
+    stage: String,
+    samples: u64,
+    total_ms: u128,
+    max_ms: u128,
+    last_ms: u128,
+}
+
+struct PendingCounterRollup {
+    bucket: String,
+    stage: String,
+    count: u64,
+}
+
+struct PendingRejectReasonRollup {
+    bucket: String,
+    stage: String,
+    reason: String,
+    count: u64,
 }
 
 struct PendingRelayUpdate {
@@ -266,8 +291,16 @@ fn storage_telemetry_enabled() -> bool {
     env_bool("STORAGE_TELEMETRY_ENABLED", false)
 }
 
+fn storage_rollups_enabled() -> bool {
+    env_bool("STORAGE_ROLLUPS_ENABLED", true)
+}
+
 fn file_latency_enabled() -> bool {
     env_bool("MEV_FILE_LATENCY_TELEMETRY_ENABLED", false)
+}
+
+fn telemetry_bucket_minute() -> String {
+    Utc::now().format("%Y-%m-%dT%H:%M:00Z").to_string()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1147,12 +1180,34 @@ impl DashboardHandle {
         note: Option<&str>,
     ) {
         if let Ok(mut pending) = self.pending.lock() {
-            pending.latencies.push(PendingLatency {
-                stage: stage.to_string(),
-                duration_ms,
-                wallet: wallet.map(str::to_string),
-                note: note.map(str::to_string),
-            });
+            if storage_telemetry_enabled() {
+                pending.latencies.push(PendingLatency {
+                    stage: stage.to_string(),
+                    duration_ms,
+                    wallet: wallet.map(str::to_string),
+                    note: note.map(str::to_string),
+                });
+            }
+            if storage_rollups_enabled() {
+                let bucket = telemetry_bucket_minute();
+                let key = format!("{bucket}|{stage}");
+                let entry =
+                    pending
+                        .latency_rollups
+                        .entry(key)
+                        .or_insert_with(|| PendingLatencyRollup {
+                            bucket,
+                            stage: stage.to_string(),
+                            samples: 0,
+                            total_ms: 0,
+                            max_ms: 0,
+                            last_ms: 0,
+                        });
+                entry.samples = entry.samples.saturating_add(1);
+                entry.total_ms = entry.total_ms.saturating_add(duration_ms);
+                entry.max_ms = entry.max_ms.max(duration_ms);
+                entry.last_ms = duration_ms;
+            }
         }
         self.file_telemetry
             .record_latency(stage, duration_ms, wallet, note);
@@ -1166,6 +1221,21 @@ impl DashboardHandle {
     }
 
     pub fn record_reject_reason(&self, stage: &str, reason: &str) {
+        if storage_rollups_enabled() {
+            if let Ok(mut pending) = self.pending.lock() {
+                let bucket = telemetry_bucket_minute();
+                let key = format!("{bucket}|{stage}|{reason}");
+                let entry = pending.reject_reason_rollups.entry(key).or_insert_with(|| {
+                    PendingRejectReasonRollup {
+                        bucket,
+                        stage: stage.to_string(),
+                        reason: reason.to_string(),
+                        count: 0,
+                    }
+                });
+                entry.count = entry.count.saturating_add(1);
+            }
+        }
         let mut state = self.inner.write().expect("dashboard state lock");
         if let Some(entry) = state
             .reject_reasons
@@ -1187,6 +1257,22 @@ impl DashboardHandle {
     }
 
     pub fn record_opportunity_funnel(&self, stage: &str) {
+        if storage_rollups_enabled() {
+            if let Ok(mut pending) = self.pending.lock() {
+                let bucket = telemetry_bucket_minute();
+                let key = format!("{bucket}|{stage}");
+                let entry =
+                    pending
+                        .funnel_rollups
+                        .entry(key)
+                        .or_insert_with(|| PendingCounterRollup {
+                            bucket,
+                            stage: stage.to_string(),
+                            count: 0,
+                        });
+                entry.count = entry.count.saturating_add(1);
+            }
+        }
         let mut state = self.inner.write().expect("dashboard state lock");
         let funnel = &mut state.opportunity_funnel;
         match stage {
@@ -1461,6 +1547,31 @@ impl DashboardHandle {
                     latency.note.as_deref(),
                 );
             }
+        }
+
+        for latency in pending.latency_rollups.into_values() {
+            self.storage.record_latency_rollup(
+                &latency.bucket,
+                &latency.stage,
+                latency.samples,
+                latency.total_ms,
+                latency.max_ms,
+                latency.last_ms,
+            );
+        }
+
+        for funnel in pending.funnel_rollups.into_values() {
+            self.storage
+                .record_funnel_rollup(&funnel.bucket, &funnel.stage, funnel.count);
+        }
+
+        for reject in pending.reject_reason_rollups.into_values() {
+            self.storage.record_reject_reason_rollup(
+                &reject.bucket,
+                &reject.stage,
+                &reject.reason,
+                reject.count,
+            );
         }
 
         for relay in pending.relay_updates {
