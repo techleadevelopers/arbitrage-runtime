@@ -2013,19 +2013,19 @@ fn adaptive_gas_cap_gwei(ev_upper_bound_usd: f64, notional_eth: f64, hard_cap_gw
     let tier_floor: f64 = if ev_upper_bound_usd >= 0.25 {
         1_000.0
     } else if ev_upper_bound_usd >= 0.14 {
-        hard_cap_gwei * 0.98
+        hard_cap_gwei * 0.98  // ~980 gwei
     } else if ev_upper_bound_usd >= 0.10 {
         850.0
     } else if ev_upper_bound_usd >= 0.05 {
         450.0
     } else if ev_upper_bound_usd >= 0.02 {
         350.0
-    } else if ev_upper_bound_usd >= 0.01 {
-        250.0
     } else if ev_upper_bound_usd >= 0.005 {
-        220.0
+        350.0  // ← ANTES era 220.0
+    } else if ev_upper_bound_usd >= 0.001 {
+        300.0  // ← ANTES era 180.0
     } else if ev_upper_bound_usd > 0.0 {
-        180.0
+        250.0  // ← ANTES era 180.0 (edge positivo mínimo)
     } else if ev_upper_bound_usd >= -0.02 {
         150.0
     } else {
