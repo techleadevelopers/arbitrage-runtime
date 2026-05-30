@@ -543,34 +543,41 @@ impl PayloadBuilder {
         };
 
         if scavenger {
-            let shadow_metrics = v3_scavenger_shadow_metrics(
-                amount_in,
-                amount_out,
-                fee_tier,
-                gas_cost,
-                path.len() == 43,
-            );
-            edge_metadata = v3_scavenger_shadow_sample(edge_metadata, shadow_metrics);
-            if !shadow_metrics.unit_safe || shadow_metrics.net_after_gas.is_zero() {
-                return Err(payload_error_with_edge_sample(
-                    "v3 scavenger payload disabled until repayment model is unit-safe",
-                    Some(edge_metadata),
-                ));
-            }
-            if config.allow_send {
-                edge_metadata.status = "blocked".to_string();
-                edge_metadata.reason = format!("{} live_send_blocked=true", edge_metadata.reason);
-                return Err(payload_error_with_edge_sample(
-                    "v3 scavenger payload shadow-ready but live send is disabled for V3",
-                    Some(edge_metadata),
-                ));
-            }
-            edge_metadata.status = "v3_shadow_ready".to_string();
-            edge_metadata.reason = format!(
-                "{} shadow_payload_built=true allow_send=false",
-                edge_metadata.reason
-            );
+    let shadow_metrics = v3_scavenger_shadow_metrics(
+        amount_in,
+        amount_out,
+        fee_tier,
+        gas_cost,
+        path.len() == 43,
+    );
+    edge_metadata = v3_scavenger_shadow_sample(edge_metadata, shadow_metrics);
+    
+    // NOVO: Permite shadow mesmo se não for unit-safe (telemetria)
+    if !config.allow_send {
+        // Modo shadow: aceita qualquer V3 para coleta de dados
+        edge_metadata.status = "v3_shadow_ready".to_string();
+        edge_metadata.reason = format!(
+            "{} shadow_payload_built=true allow_send=false unit_safe={} net_after_gas={}",
+            edge_metadata.reason,
+            shadow_metrics.unit_safe,
+            wei_to_eth_f64(shadow_metrics.net_after_gas)
+        );
+        // Continua para construir o payload shadow
+    } else {
+        // Modo live: só permite se for unit-safe e com lucro positivo
+        if !shadow_metrics.unit_safe || shadow_metrics.net_after_gas.is_zero() {
+            return Err(payload_error_with_edge_sample(
+                "v3 scavenger payload blocked for live send until repayment model is unit-safe",
+                Some(edge_metadata),
+            ));
         }
+        edge_metadata.status = "v3_live_ready".to_string();
+        edge_metadata.reason = format!(
+            "{} unit_safe=true live_send_allowed=true",
+            edge_metadata.reason
+        );
+    }
+}
 
         let executor = config.mev.mev_executor_v3.or(config.mev.mev_executor).ok_or_else(|| {
             payload_error_with_edge_sample(

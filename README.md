@@ -16,6 +16,23 @@ It is an execution system focused on one narrow problem:
 
 `pending swap -> deterministic impact -> EV/risk gate -> execution path -> realized PnL`
 
+## Integrated Runtime Updates - 2026-05-30
+
+This snapshot includes the latest Polygon runtime hardening work:
+
+- **Split V2/V3 executors:** V2 continues to use `MEV_EXECUTOR_ADDRESS`; V3 now uses `MEV_EXECUTOR_V3_ADDRESS`.
+- **V3-only executor contract:** `contracts/ArbitrageRuntimeExecutorV3.sol` was added so V3 can be deployed separately from the already-working V2 executor and avoid combined-contract size pressure.
+- **Polygon V2/V3 contract setup:** runtime expects QuickSwap V2 router/factory for V2 and Uniswap V3 SwapRouter/factory for V3.
+- **Executor allowlists:** V2 requires allowed operator, router, borrow tokens, and V2 pairs; V3 requires allowed operator, router, borrow tokens, V3 pools, and fee tiers.
+- **Universal Router improvements:** the decoder now handles direct V2/V3 commands, `execute_sub_plan`, multi-swap candidate ranking, monitored-token preference, and route-graph fallback into hop-level candidates.
+- **Executable router normalization:** Universal Router victim flow is decoded as signal source, but payload execution uses the canonical V2/V3 routers instead of trying to execute through the victim's Universal Router.
+- **Two-lane candidate handling:** post-lookup quick decode classifies small, medium, large, and universal candidates so tiny scavenger flow can be throttled without discarding medium/large flow.
+- **Adaptive gas cap curve:** positive `ev_upper` now raises the adaptive gas cap more aggressively near the configured hard cap; `ev_upper >= 0.14` can reach `98%` of `MEV_MAX_GAS_PRICE_GWEI_*`.
+- **Historical profile refresh:** profile refresh moved out of the hot path into a background refresher.
+- **Factory/env cleanup:** Polygon deployments should set `MEV_UNISWAP_V2_FACTORY`, `MEV_UNISWAP_V3_FACTORY`, `MEV_EXECUTOR_ADDRESS`, and `MEV_EXECUTOR_V3_ADDRESS` explicitly.
+
+Current production caveat: with `ALLOW_SEND=false`, the runtime remains in observation mode and will never submit, even if a payload reaches execution readiness.
+
 ## Objective
 
 The engine continuously observes pending transactions and attempts to identify swaps whose execution creates a short-lived, mathematically exploitable price dislocation in AMM liquidity.
@@ -919,9 +936,14 @@ These records are then reused for historical calibration.
 
 ## Executor ABI Expectations
 
-The Rust runtime now emits two execution call families.
+The Rust runtime emits two execution call families.
 
-The on-chain executor contract referenced by `MEV_EXECUTOR_ADDRESS` must support both if you want dual-path V2/V3 execution in production.
+V2 and V3 can be deployed as separate contracts:
+
+- `MEV_EXECUTOR_ADDRESS`: V2 executor, currently expected to expose `startV2FlashSwap`.
+- `MEV_EXECUTOR_V3_ADDRESS`: V3 executor, currently expected to expose `startV3FlashSwap`.
+
+The runtime falls back to `MEV_EXECUTOR_ADDRESS` for V3 only when `MEV_EXECUTOR_V3_ADDRESS` is not configured, but production Polygon deployments should configure both addresses explicitly.
 
 ### Expected V2 executor entrypoint
 
@@ -952,19 +974,23 @@ function startV3FlashSwap(
 
 ### Important note
 
-If the on-chain executor only supports the V2 selector, the runtime can still detect and model V3 opportunities, but live V3 execution will not succeed until the contract is upgraded to match the V3 ABI above.
+If the V3 executor is not deployed or `MEV_EXECUTOR_V3_ADDRESS` is missing, the runtime can still detect and model V3 opportunities, but live V3 execution will not succeed unless the fallback executor also supports the V3 ABI above.
 
-The canonical Solidity interface for this executor surface lives at:
+The canonical combined Solidity interface for this executor surface lives at:
 
 - `contracts/interfaces/IArbitrageRuntimeExecutor.sol`
 - `contracts/base/ArbitrageRuntimeExecutorBase.sol`
 - `contracts/ArbitrageRuntimeExecutor.sol`
+- `contracts/ArbitrageRuntimeExecutorV2.sol`
+- `contracts/ArbitrageRuntimeExecutorV3.sol`
 
 Contract roles:
 
 - `IArbitrageRuntimeExecutor.sol`: canonical ABI surface expected by the Rust runtime
 - `ArbitrageRuntimeExecutorBase.sol`: production-shaped state machine with authorization, callbacks, execution lifecycle, and min-profit enforcement hooks
 - `ArbitrageRuntimeExecutor.sol`: concrete ERC20-routed executor with V2 router execution, V3 exactInput execution, V2 flashswap repayment, and V3 callback settlement
+- `ArbitrageRuntimeExecutorV2.sol`: compact V2-only executor for fast deployment and V2 flashswap execution
+- `ArbitrageRuntimeExecutorV3.sol`: compact V3-only executor for separate V3 pool flashswap execution
 
 ## Replay Harness
 
@@ -1337,6 +1363,7 @@ For low-capital farelo runs, use `MEV_OPPORTUNITY_MODE=scavenger` first. Keep `c
 - `MEV_UNISWAP_V2_FACTORY`
 - `MEV_UNISWAP_V3_FACTORY`
 - `MEV_EXECUTOR_ADDRESS`
+- `MEV_EXECUTOR_V3_ADDRESS`
 
 ### Fork replay
 
