@@ -59,7 +59,10 @@ const ODOS_SWAP_COMPACT: [u8; 4] = [0x83, 0xbd, 0x37, 0xf9];
 const KYBER_SWAP: [u8; 4] = [0x3f, 0x2d, 0x5c, 0xf5];
 const SAFE_EXEC_TRANSACTION: [u8; 4] = [0x6a, 0x76, 0x12, 0x02];
 const TRANSIT_SWAP_V5: [u8; 4] = [0xd8, 0x08, 0xd8, 0x89];
+const AGGREGATOR_SELECTOR_01B7037C: [u8; 4] = [0x01, 0xb7, 0x03, 0x7c];
+const AGGREGATOR_SELECTOR_0A3C4405: [u8; 4] = [0x0a, 0x3c, 0x44, 0x05];
 const AGGREGATOR_SELECTOR_0A2B8F36: [u8; 4] = [0x0a, 0x2b, 0x8f, 0x36];
+const AGGREGATOR_SELECTOR_405CEC67: [u8; 4] = [0x40, 0x5c, 0xec, 0x67];
 const AGGREGATOR_SELECTOR_F2881E21: [u8; 4] = [0xf2, 0x88, 0x1e, 0x21];
 const SAFE_INNER_SELECTOR_8CC7104F: [u8; 4] = [0x8c, 0xc7, 0x10, 0x4f];
 const SAFE_INNER_SELECTOR_9E7212AD: [u8; 4] = [0x9e, 0x72, 0x12, 0xad];
@@ -3358,6 +3361,10 @@ fn record_payload_pool_reject(
         || detail.contains("pool_not_found")
         || detail.contains("factory_wrong_or_unavailable")
         || detail.contains("v3_fee_tier_or_pool_not_found")
+        || (signal.is_partial_decode()
+            && (detail.contains("payload_builder_unclassified")
+                || detail.contains("pool_state_unavailable")
+                || detail.contains("path_inverted_or_pool_token_mismatch")))
     {
         record_pool_shadow_stage(
             dashboard,
@@ -3563,7 +3570,15 @@ fn known_target_label(address: Address) -> Option<&'static str> {
             Some("unknown_high_frequency_polygon_target")
         }
         "0xada100db00ca00073811820692005400218fce1f" => Some("safe_inner_target"),
-        _ => None,
+        _ => decode_partial_swap_from_monitored_tokens(
+            selector,
+            target,
+            value,
+            args,
+            monitored_tokens,
+            0.55,
+            "safe_inner_token_hint",
+        ),
     }
 }
 
@@ -4407,7 +4422,12 @@ fn decode_known_aggregator_partial(
     monitored_tokens: &[MonitoredTokenConfig],
 ) -> Option<SwapSignal> {
     match selector {
-        TRANSIT_SWAP_V5 | AGGREGATOR_SELECTOR_0A2B8F36 | AGGREGATOR_SELECTOR_F2881E21 => {
+        TRANSIT_SWAP_V5
+        | AGGREGATOR_SELECTOR_01B7037C
+        | AGGREGATOR_SELECTOR_0A3C4405
+        | AGGREGATOR_SELECTOR_0A2B8F36
+        | AGGREGATOR_SELECTOR_405CEC67
+        | AGGREGATOR_SELECTOR_F2881E21 => {
             decode_partial_swap_from_monitored_tokens(
                 selector,
                 router,
@@ -4431,8 +4451,8 @@ fn decode_partial_swap_from_monitored_tokens(
     decode_confidence: f64,
     decode_source: &'static str,
 ) -> Option<SwapSignal> {
-    let path = monitored_token_addresses_in_input(monitored_tokens, args);
-    if path.len() < 2 {
+    let path = partial_path_from_monitored_tokens(monitored_tokens, args);
+    if path.len() < 2 || path[0] == path[1] {
         return None;
     }
     let amount_in = if value > U256::zero() {
@@ -4451,6 +4471,51 @@ fn decode_partial_swap_from_monitored_tokens(
         decode_confidence,
         decode_source,
     })
+}
+
+fn partial_path_from_monitored_tokens(
+    monitored_tokens: &[MonitoredTokenConfig],
+    args: &[u8],
+) -> Vec<Address> {
+    let mut path = monitored_token_addresses_in_input(monitored_tokens, args);
+    dedup_address_path(&mut path);
+    if path.len() >= 2 {
+        return path;
+    }
+
+    let Some(anchor) = path.first().copied() else {
+        return path;
+    };
+    for token in monitored_tokens {
+        if token.address != anchor {
+            path.push(token.address);
+            return path;
+        }
+    }
+    for fallback in polygon_partial_counterpart_tokens() {
+        if fallback != anchor {
+            path.push(fallback);
+            return path;
+        }
+    }
+    path
+}
+
+fn dedup_address_path(path: &mut Vec<Address>) {
+    let mut seen = HashSet::new();
+    path.retain(|address| seen.insert(*address));
+}
+
+fn polygon_partial_counterpart_tokens() -> Vec<Address> {
+    [
+        "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270",
+        "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619",
+        "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",
+        "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+    ]
+    .into_iter()
+    .filter_map(|value| value.parse::<Address>().ok())
+    .collect()
 }
 
 fn decode_universal_router_swap(
@@ -5063,6 +5128,12 @@ fn diagnose_decode_reject(
             | UNIVERSAL_ROUTER_EXECUTE_NO_DEADLINE
             | ZERO_EX_SELL_TO_UNISWAP
             | SAFE_EXEC_TRANSACTION
+            | TRANSIT_SWAP_V5
+            | AGGREGATOR_SELECTOR_01B7037C
+            | AGGREGATOR_SELECTOR_0A3C4405
+            | AGGREGATOR_SELECTOR_0A2B8F36
+            | AGGREGATOR_SELECTOR_405CEC67
+            | AGGREGATOR_SELECTOR_F2881E21
     );
 
     if matches!(

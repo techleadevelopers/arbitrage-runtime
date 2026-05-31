@@ -531,6 +531,7 @@ pub struct EdgeSampleSnapshot {
 pub struct ScavengerObserverReport {
     pub status: String,
     pub phase: String,
+    pub rpc_capacity_limited: bool,
     pub observed_secs: u64,
     pub sample_count: u64,
     pub healthy_rpc_now: u64,
@@ -720,6 +721,12 @@ fn build_scavenger_report(
     )
     .saturating_add(block_fail_delta);
     let block_fail_rate_pct = pct(block_fail_delta, block_total);
+    let rpc_capacity_limited = lookup_shed_delta > 0
+        && pending_delta > 0
+        && last.healthy_rpc >= 1
+        && last.penalized_rpc == 0
+        && max_block_age_secs <= 15
+        && block_fail_rate_pct <= 5.0;
 
     let mut notes = Vec::new();
     if observed_secs < 15 * 60 {
@@ -745,6 +752,12 @@ fn build_scavenger_report(
     }
     if shed_rate_pct < 25.0 && pending_delta > 1_000 {
         notes.push("shed rate low for high pending flow; rpc may be over-reading".to_string());
+    }
+    if rpc_capacity_limited {
+        notes.push(
+            "rpc_capacity_limited=true: pending shed is budget admission, not an RPC failure"
+                .to_string(),
+        );
     }
     if decode_pass_delta == 0 && lookup_ok_delta > 200 {
         notes.push("lookup ok but decode pass zero; parser/scope may be too narrow".to_string());
@@ -789,6 +802,7 @@ fn build_scavenger_report(
     ScavengerObserverReport {
         status,
         phase: phase.to_string(),
+        rpc_capacity_limited,
         observed_secs,
         sample_count,
         healthy_rpc_now: last.healthy_rpc,
