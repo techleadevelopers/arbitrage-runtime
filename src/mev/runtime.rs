@@ -1534,6 +1534,34 @@ async fn process_evaluation_task(
     }
 
     let payload_started = Instant::now();
+    if candidate.signal.is_partial_decode() {
+        dashboard.record_selector_performance(
+            &selector_hex(candidate.signal.selector),
+            &address_hex(candidate.signal.router),
+            candidate.signal.decode_source,
+            "partial_entered_payload_builder",
+            candidate.signal.decode_confidence,
+            gas_price_gwei(candidate.gas_price),
+        );
+        record_pool_shadow_stage(
+            &dashboard,
+            &candidate.signal,
+            "partial_entered_payload_builder",
+            "pending",
+            0.0,
+            0.0,
+            gas_price_gwei(candidate.gas_price),
+        );
+        record_pool_shadow_stage(
+            &dashboard,
+            &candidate.signal,
+            "partial_pool_discovery_attempted",
+            "pending",
+            0.0,
+            0.0,
+            gas_price_gwei(candidate.gas_price),
+        );
+    }
     let payload = match build_payload_with_fallback_parallel(
         rpc_fleet.clone(),
         config.clone(),
@@ -1558,13 +1586,15 @@ async fn process_evaluation_task(
             );
             let human_reason = human_payload_error(&err);
             let payload_detail = payload_error_detail(&err, &candidate.signal);
+            let edge_sample = extract_edge_sample(&err);
             record_payload_pool_reject(
                 &dashboard,
                 &candidate.signal,
                 &payload_detail,
+                edge_sample.as_ref(),
                 gas_price_gwei(candidate.gas_price),
             );
-            let sample = extract_edge_sample(&err)
+            let sample = edge_sample
                 .map(|sample| {
                     enrich_edge_explainer_sample(sample, tx_hash, &candidate.signal, &fast_gate)
                 })
@@ -3386,8 +3416,40 @@ fn record_payload_pool_reject(
     dashboard: &DashboardHandle,
     signal: &SwapSignal,
     payload_detail: &str,
+    edge_sample: Option<&EdgeMetadata>,
     gas_gwei: f64,
 ) {
+    if let Some(sample) = edge_sample {
+        let pool = sample.pool.trim();
+        if !pool.is_empty() && pool != "unknown" {
+            let expected_profit = sample.gross_edge_native.max(0.0);
+            record_pool_shadow_stage(
+                dashboard,
+                signal,
+                "pool_found",
+                pool,
+                expected_profit,
+                0.0,
+                gas_gwei,
+            );
+            let ev_stage = if sample.gross_edge_native > 0.0 {
+                "shadow_ev_positive"
+            } else {
+                "shadow_ev_negative"
+            };
+            record_pool_shadow_stage(
+                dashboard,
+                signal,
+                ev_stage,
+                pool,
+                expected_profit,
+                0.0,
+                gas_gwei,
+            );
+            return;
+        }
+    }
+
     let detail = payload_detail.to_ascii_lowercase();
     if detail.contains("pair_not_found")
         || detail.contains("pool_not_found")
@@ -4074,6 +4136,41 @@ async fn find_v3_pool<M: Middleware + 'static>(
     Err(compact_payload_errors(errors))
 }
 
+async fn find_v3_pool_with_shadow_fee_fallback<M: Middleware + 'static>(
+    provider: Arc<M>,
+    config: &Config,
+    signal: &SwapSignal,
+    token_in: Address,
+    token_out: Address,
+    fee_tier: u32,
+) -> Result<(Address, Address, u32), String> {
+    match find_v3_pool(provider.clone(), config, token_in, token_out, fee_tier).await {
+        Ok((factory, pool)) => Ok((factory, pool, fee_tier)),
+        Err(primary_err) => {
+            if config.allow_send || !signal.is_partial_decode() {
+                return Err(primary_err);
+            }
+            let mut errors = vec![primary_err];
+            for fallback_fee in polygon_v3_shadow_fee_tiers() {
+                if fallback_fee == fee_tier {
+                    continue;
+                }
+                match find_v3_pool(provider.clone(), config, token_in, token_out, fallback_fee)
+                    .await
+                {
+                    Ok((factory, pool)) => return Ok((factory, pool, fallback_fee)),
+                    Err(err) => errors.push(err),
+                }
+            }
+            Err(compact_payload_errors(errors))
+        }
+    }
+}
+
+fn polygon_v3_shadow_fee_tiers() -> [u32; 4] {
+    [100, 500, 3_000, 10_000]
+}
+
 fn default_v3_factories(network: &str) -> Vec<Address> {
     match network {
         "polygon" | "ethereum" | "arbitrum" => parse_default_addresses(&[
@@ -4109,9 +4206,21 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
         .get(1)
         .ok_or_else(|| "missing edge token_out".to_string())?;
 
-    let (factory, pool) =
-        find_v3_pool(provider.clone(), config, token_in, token_out, fee_tier).await?;
+    let (factory, pool, discovered_fee_tier) = find_v3_pool_with_shadow_fee_fallback(
+        provider.clone(),
+        config,
+        signal,
+        token_in,
+        token_out,
+        fee_tier,
+    )
+    .await?;
     let execution_router = execution_v3_router(config, signal.router);
+    let execution_path = if discovered_fee_tier == fee_tier {
+        encoded_path
+    } else {
+        encode_v3_path(token_out, discovered_fee_tier, token_in)
+    };
 
     if pool == Address::zero() {
         return Err("v3 pool not found".to_string());
@@ -4130,7 +4239,7 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
         sqrt_price_x96: cached_pool.sqrt_price_x96,
         liquidity: cached_pool.liquidity,
         current_tick: cached_pool.current_tick,
-        fee_bps: fee_tier as u64 / 100,
+        fee_bps: discovered_fee_tier as u64 / 100,
         initialized_ticks: Vec::new(),
     };
 
@@ -4188,8 +4297,8 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
             context_priority_score: context_signal.priority_score,
             context_toxicity_score: context_signal.toxicity_score,
             route_kind: AmmRouteKind::UniswapV3 {
-                fee_tier,
-                path: encoded_path,
+                fee_tier: discovered_fee_tier,
+                path: execution_path,
             },
             v2_swap_path: None,
             v2_swap_pools: Vec::new(),
@@ -4703,10 +4812,11 @@ fn dedup_address_path(path: &mut Vec<Address>) {
 
 fn polygon_partial_counterpart_tokens() -> Vec<Address> {
     [
+        "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+        "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",
         "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270",
         "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619",
-        "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",
-        "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+        "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063",
     ]
     .into_iter()
     .filter_map(|value| value.parse::<Address>().ok())
@@ -7014,6 +7124,67 @@ mod tests {
         assert_eq!(signal.router, router);
         assert_eq!(signal.amount_in, U256::from(2u64) * unit);
         assert_eq!(signal.path, vec![token_in, token_out]);
+        assert!(matches!(signal.kind, SwapKind::V2));
+    }
+
+    #[test]
+    fn partial_path_falls_back_to_polygon_priority_tokens() {
+        let usdt: Address = "0xc2132d05d31c914a87c6611c10748aeb04b58e8f"
+            .parse()
+            .unwrap();
+        let usdc: Address = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
+            .parse()
+            .unwrap();
+        let monitored = vec![MonitoredTokenConfig {
+            address: usdt,
+            decimals: 6,
+            price_eth: 0.0003,
+        }];
+        let args = encode(&[Token::Address(usdt), Token::Uint(U256::from(10_000u64))]);
+
+        let path = partial_path_from_monitored_tokens(&monitored, &args);
+
+        assert_eq!(path, vec![usdt, usdc]);
+    }
+
+    #[test]
+    fn transit_v2_selector_decodes_address_array_path_partial() {
+        let router = Address::from_low_u64_be(10);
+        let token_in = Address::from_low_u64_be(3);
+        let token_out = Address::from_low_u64_be(4);
+        let unit = U256::exp10(18);
+        let args = encode(&[
+            Token::Tuple(vec![
+                Token::Address(Address::from_low_u64_be(50)),
+                Token::Address(Address::from_low_u64_be(51)),
+                Token::Uint(U256::from(2u64) * unit),
+                Token::Uint(U256::from(1u64) * unit),
+                Token::Uint(U256::from(123u64)),
+                Token::Uint(U256::from(456u64)),
+                Token::Array(vec![Token::Address(token_in), Token::Address(token_out)]),
+                Token::Array(vec![Token::Address(Address::from_low_u64_be(52))]),
+                Token::Bytes(Vec::new()),
+                Token::String("transit".to_string()),
+            ]),
+            Token::Uint(U256::zero()),
+        ]);
+        let monitored = vec![MonitoredTokenConfig {
+            address: token_in,
+            decimals: 18,
+            price_eth: 1.0,
+        }];
+
+        let signal = decode_known_aggregator_partial(
+            TRANSIT_EXACT_INPUT_V2_SWAP,
+            router,
+            U256::zero(),
+            &args,
+            &monitored,
+        )
+        .unwrap();
+
+        assert_eq!(signal.path, vec![token_in, token_out]);
+        assert_eq!(signal.decode_source, "transit_v5_v2_path_partial");
         assert!(matches!(signal.kind, SwapKind::V2));
     }
 
