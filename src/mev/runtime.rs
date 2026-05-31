@@ -3570,15 +3570,7 @@ fn known_target_label(address: Address) -> Option<&'static str> {
             Some("unknown_high_frequency_polygon_target")
         }
         "0xada100db00ca00073811820692005400218fce1f" => Some("safe_inner_target"),
-        _ => decode_partial_swap_from_monitored_tokens(
-            selector,
-            target,
-            value,
-            args,
-            monitored_tokens,
-            0.55,
-            "safe_inner_token_hint",
-        ),
+        _ => None,
     }
 }
 
@@ -4410,7 +4402,15 @@ fn decode_safe_inner_aggregator_partial(
                 "safe_inner_partial",
             )
         }
-        _ => None,
+        _ => decode_partial_swap_from_monitored_tokens(
+            selector,
+            target,
+            value,
+            args,
+            monitored_tokens,
+            0.55,
+            "safe_inner_token_hint",
+        ),
     }
 }
 
