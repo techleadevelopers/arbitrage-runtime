@@ -60,10 +60,14 @@ const KYBER_SWAP: [u8; 4] = [0x3f, 0x2d, 0x5c, 0xf5];
 const SAFE_EXEC_TRANSACTION: [u8; 4] = [0x6a, 0x76, 0x12, 0x02];
 const TRANSIT_SWAP_V5: [u8; 4] = [0xd8, 0x08, 0xd8, 0x89];
 const TRANSIT_EXACT_INPUT_V3_SWAP: [u8; 4] = [0xb9, 0xb5, 0x14, 0x9b];
+const TRANSIT_EXACT_INPUT_V2_SWAP: [u8; 4] = [0x0d, 0xc4, 0xbd, 0xae];
 const AGGREGATOR_SELECTOR_01B7037C: [u8; 4] = [0x01, 0xb7, 0x03, 0x7c];
 const AGGREGATOR_SELECTOR_0A3C4405: [u8; 4] = [0x0a, 0x3c, 0x44, 0x05];
 const AGGREGATOR_SELECTOR_0A2B8F36: [u8; 4] = [0x0a, 0x2b, 0x8f, 0x36];
 const AGGREGATOR_SELECTOR_405CEC67: [u8; 4] = [0x40, 0x5c, 0xec, 0x67];
+const AGGREGATOR_SELECTOR_0060EA13: [u8; 4] = [0x00, 0x60, 0xea, 0x13];
+const AGGREGATOR_SELECTOR_448E340E: [u8; 4] = [0x44, 0x8e, 0x34, 0x0e];
+const AGGREGATOR_SELECTOR_9265BB9D: [u8; 4] = [0x92, 0x65, 0xbb, 0x9d];
 const AGGREGATOR_SELECTOR_C3192F1F: [u8; 4] = [0xc3, 0x19, 0x2f, 0x1f];
 const AGGREGATOR_SELECTOR_CDD1B25D: [u8; 4] = [0xcd, 0xd1, 0xb2, 0x5d];
 const AGGREGATOR_SELECTOR_F2881E21: [u8; 4] = [0xf2, 0x88, 0x1e, 0x21];
@@ -4480,11 +4484,29 @@ fn decode_known_aggregator_partial(
                 },
             )
         }
+        TRANSIT_EXACT_INPUT_V2_SWAP => {
+            decode_transit_v5_v2_partial(selector, router, value, args, monitored_tokens).or_else(
+                || {
+                    decode_partial_swap_from_monitored_tokens(
+                        selector,
+                        router,
+                        value,
+                        args,
+                        monitored_tokens,
+                        0.52,
+                        "transit_v5_v2_token_order_partial",
+                    )
+                },
+            )
+        }
         TRANSIT_SWAP_V5
         | AGGREGATOR_SELECTOR_01B7037C
         | AGGREGATOR_SELECTOR_0A3C4405
         | AGGREGATOR_SELECTOR_0A2B8F36
         | AGGREGATOR_SELECTOR_405CEC67
+        | AGGREGATOR_SELECTOR_0060EA13
+        | AGGREGATOR_SELECTOR_448E340E
+        | AGGREGATOR_SELECTOR_9265BB9D
         | AGGREGATOR_SELECTOR_C3192F1F
         | AGGREGATOR_SELECTOR_CDD1B25D
         | AGGREGATOR_SELECTOR_F2881E21 => decode_partial_swap_from_monitored_tokens(
@@ -4560,6 +4582,58 @@ fn decode_transit_v5_v3_partial(
         },
         decode_confidence: 0.72,
         decode_source: "transit_v5_v3_path_partial",
+    })
+}
+
+fn decode_transit_v5_v2_partial(
+    selector: [u8; 4],
+    router: Address,
+    value: U256,
+    args: &[u8],
+    monitored_tokens: &[MonitoredTokenConfig],
+) -> Option<SwapSignal> {
+    let decoded = abi::decode(
+        &[
+            ParamType::Tuple(vec![
+                ParamType::Address,
+                ParamType::Address,
+                ParamType::Uint(256),
+                ParamType::Uint(256),
+                ParamType::Uint(256),
+                ParamType::Uint(256),
+                ParamType::Array(Box::new(ParamType::Address)),
+                ParamType::Array(Box::new(ParamType::Address)),
+                ParamType::Bytes,
+                ParamType::String,
+            ]),
+            ParamType::Uint(256),
+        ],
+        args,
+    )
+    .ok()?;
+    let Token::Tuple(values) = decoded.first()? else {
+        return None;
+    };
+    let mut path = token_tree_find_address_path(values, monitored_tokens)?;
+    dedup_address_path(&mut path);
+    if path.len() < 2 || !path_contains_monitored_token(&path, monitored_tokens) {
+        return None;
+    }
+    let amount_in = if value > U256::zero() {
+        value
+    } else {
+        amount_hint_from_calldata(args).unwrap_or_else(U256::one)
+    };
+    Some(SwapSignal {
+        selector,
+        amount_in,
+        amount_out_min: None,
+        notional_wei: U256::zero(),
+        path,
+        router,
+        kind: SwapKind::V2,
+        decode_confidence: 0.68,
+        decode_source: "transit_v5_v2_path_partial",
     })
 }
 
@@ -5251,10 +5325,14 @@ fn diagnose_decode_reject(
             | SAFE_EXEC_TRANSACTION
             | TRANSIT_SWAP_V5
             | TRANSIT_EXACT_INPUT_V3_SWAP
+            | TRANSIT_EXACT_INPUT_V2_SWAP
             | AGGREGATOR_SELECTOR_01B7037C
             | AGGREGATOR_SELECTOR_0A3C4405
             | AGGREGATOR_SELECTOR_0A2B8F36
             | AGGREGATOR_SELECTOR_405CEC67
+            | AGGREGATOR_SELECTOR_0060EA13
+            | AGGREGATOR_SELECTOR_448E340E
+            | AGGREGATOR_SELECTOR_9265BB9D
             | AGGREGATOR_SELECTOR_C3192F1F
             | AGGREGATOR_SELECTOR_CDD1B25D
             | AGGREGATOR_SELECTOR_F2881E21
@@ -7078,6 +7156,37 @@ fn token_find_v3_path_bytes(token: &Token) -> Option<Vec<u8>> {
         Token::Array(values) | Token::FixedArray(values) | Token::Tuple(values) => {
             token_tree_find_v3_path_bytes(values)
         }
+        _ => None,
+    }
+}
+
+fn token_tree_find_address_path(
+    tokens: &[Token],
+    monitored_tokens: &[MonitoredTokenConfig],
+) -> Option<Vec<Address>> {
+    for token in tokens {
+        if let Some(path) = token_find_address_path(token, monitored_tokens) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn token_find_address_path(
+    token: &Token,
+    monitored_tokens: &[MonitoredTokenConfig],
+) -> Option<Vec<Address>> {
+    match token {
+        Token::Array(values) | Token::FixedArray(values) => {
+            let path: Option<Vec<Address>> = values.iter().map(token_as_address).collect();
+            if let Some(path) = path {
+                if path.len() >= 2 && path_contains_monitored_token(&path, monitored_tokens) {
+                    return Some(path);
+                }
+            }
+            token_tree_find_address_path(values, monitored_tokens)
+        }
+        Token::Tuple(values) => token_tree_find_address_path(values, monitored_tokens),
         _ => None,
     }
 }
