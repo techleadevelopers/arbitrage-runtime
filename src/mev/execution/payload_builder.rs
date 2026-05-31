@@ -143,6 +143,7 @@ impl PayloadBuilder {
         };
 
         let scavenger = config.mev.opportunity_mode() == OpportunityMode::Scavenger;
+        let shadow_research = payload_shadow_research_mode(config);
         if post_victim.slippage_impact_bps > effective_payload_price_impact_cap_bps(config) {
             return Err(format!(
                 "victim price impact too high: {}bps",
@@ -154,7 +155,7 @@ impl PayloadBuilder {
             .reserves_for(input.token_out, input.token_in)
             .ok_or_else(|| "pool after victim does not support reverse path".to_string())?;
 
-        let gas_estimate = if scavenger {
+        let gas_estimate = if shadow_research {
             config.mev.max_gas_per_tx.min(
                 config
                     .estimated_exec_gas
@@ -175,7 +176,7 @@ impl PayloadBuilder {
             .saturating_mul(U256::from(config.mev.gas_safety_margin_bps))
             / U256::from(10_000u64);
 
-        let sizing_fractions: &[u64] = if scavenger {
+        let sizing_fractions: &[u64] = if shadow_research {
             &[25, 50, 100, 200, 350, 500, 750, 1_000, 1_500]
         } else {
             &[1_000, 2_000, 3_500, 5_000, 7_500]
@@ -213,7 +214,7 @@ impl PayloadBuilder {
             "blocked",
             "no positive gross edge",
         );
-        let selected = if scavenger {
+        let selected = if shadow_research {
             select_scavenger_v2_candidate(&candidates).ok_or_else(|| {
                 let sample = blocked_sample.map(|sample| {
                     scavenger_shadow_sample(
@@ -245,7 +246,7 @@ impl PayloadBuilder {
             self_slippage_bps,
             ..
         } = selected;
-        let simulated_profit_wei = if scavenger {
+        let simulated_profit_wei = if shadow_research {
             gross_profit_wei
         } else {
             net_profit_wei
@@ -260,7 +261,7 @@ impl PayloadBuilder {
         let min_profit_wei = effective_payload_min_profit_wei(config)?;
         let min_profit_eth = wei_to_eth_f64(min_profit_wei);
 
-        if !scavenger && simulated_profit_wei < min_profit_wei {
+        if !shadow_research && simulated_profit_wei < min_profit_wei {
             return Err(format!(
                 "simulated profit {:.6} {} below minimum {:.6} {}",
                 wei_to_eth_f64(simulated_profit_wei),
@@ -392,6 +393,7 @@ impl PayloadBuilder {
         };
 
         let scavenger = config.mev.opportunity_mode() == OpportunityMode::Scavenger;
+        let shadow_research = payload_shadow_research_mode(config);
         if post_victim.slippage_impact_bps > effective_payload_price_impact_cap_bps(config) {
             return Err(format!(
                 "victim price impact too high: {}bps",
@@ -409,7 +411,7 @@ impl PayloadBuilder {
             fee_bps: pool_after.fee_bps,
             initialized_ticks: pool_after.initialized_ticks.clone(),
         };
-        let gas_estimate = if scavenger {
+        let gas_estimate = if shadow_research {
             config.mev.max_gas_per_tx.min(
                 config
                     .estimated_exec_gas
@@ -430,7 +432,7 @@ impl PayloadBuilder {
             .saturating_mul(U256::from(config.mev.gas_safety_margin_bps))
             / U256::from(10_000u64);
         let scavenger_zero_gas = U256::zero();
-        let sizing_fractions: &[u64] = if scavenger {
+        let sizing_fractions: &[u64] = if shadow_research {
             &[25, 50, 100, 200, 350, 500, 750, 1_000, 1_500]
         } else {
             &[1_000, 2_000, 3_500, 5_000, 7_500]
@@ -440,14 +442,14 @@ impl PayloadBuilder {
             input.token_out,
             input.token_in,
             input.capital_available_wei,
-            if scavenger {
+            if shadow_research {
                 scavenger_zero_gas
             } else {
                 gas_cost
             },
             sizing_fractions,
         );
-        let selected = if scavenger {
+        let selected = if shadow_research {
             select_scavenger_v3_candidate(&candidates).ok_or_else(|| {
                 let sample = best_v3_edge_metadata(
                     &candidates,
@@ -486,7 +488,7 @@ impl PayloadBuilder {
             self_slippage_bps,
             ..
         } = selected;
-        let simulated_profit_wei = if scavenger {
+        let simulated_profit_wei = if shadow_research {
             gross_profit_wei
         } else {
             net_profit_wei
@@ -498,7 +500,7 @@ impl PayloadBuilder {
         let min_profit_wei = effective_payload_min_profit_wei(config)?;
         let min_profit_eth = wei_to_eth_f64(min_profit_wei);
 
-        if !scavenger && simulated_profit_wei < min_profit_wei {
+        if !shadow_research && simulated_profit_wei < min_profit_wei {
             return Err(format!(
                 "simulated v3 profit {:.6} {} below minimum {:.6} {}",
                 wei_to_eth_f64(simulated_profit_wei),
@@ -554,7 +556,7 @@ impl PayloadBuilder {
             token_out: format!("{:?}", input.token_out),
         };
 
-        if scavenger {
+        if shadow_research {
             let shadow_metrics = v3_scavenger_shadow_metrics(
                 amount_in,
                 amount_out,
@@ -575,7 +577,7 @@ impl PayloadBuilder {
                     wei_to_eth_f64(shadow_metrics.net_after_gas)
                 );
                 // Continua para construir o payload shadow
-            } else {
+            } else if scavenger {
                 // Modo live: só permite se for unit-safe e com lucro positivo
                 if !shadow_metrics.unit_safe || shadow_metrics.net_after_gas.is_zero() {
                     return Err(payload_error_with_edge_sample(
@@ -651,13 +653,18 @@ fn payload_error_with_edge_sample(reason: &str, sample: Option<EdgeMetadata>) ->
     }
 }
 
+fn payload_shadow_research_mode(config: &Config) -> bool {
+    config.mev.opportunity_mode() == OpportunityMode::Scavenger
+        || (config.mev.opportunity_mode() == OpportunityMode::Aggressive && !config.allow_send)
+}
+
 fn scavenger_shadow_sample(
     config: &Config,
     mut sample: EdgeMetadata,
     status: &str,
     reason: &str,
 ) -> EdgeMetadata {
-    if config.mev.opportunity_mode() == OpportunityMode::Scavenger
+    if payload_shadow_research_mode(config)
         && sample.gross_edge_native >= -scavenger_shadow_negative_tolerance_native(config)
     {
         sample.status = status.to_string();

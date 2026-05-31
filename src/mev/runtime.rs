@@ -59,11 +59,17 @@ const ODOS_SWAP_COMPACT: [u8; 4] = [0x83, 0xbd, 0x37, 0xf9];
 const KYBER_SWAP: [u8; 4] = [0x3f, 0x2d, 0x5c, 0xf5];
 const SAFE_EXEC_TRANSACTION: [u8; 4] = [0x6a, 0x76, 0x12, 0x02];
 const TRANSIT_SWAP_V5: [u8; 4] = [0xd8, 0x08, 0xd8, 0x89];
+const TRANSIT_EXACT_INPUT_V3_SWAP: [u8; 4] = [0xb9, 0xb5, 0x14, 0x9b];
 const AGGREGATOR_SELECTOR_01B7037C: [u8; 4] = [0x01, 0xb7, 0x03, 0x7c];
 const AGGREGATOR_SELECTOR_0A3C4405: [u8; 4] = [0x0a, 0x3c, 0x44, 0x05];
 const AGGREGATOR_SELECTOR_0A2B8F36: [u8; 4] = [0x0a, 0x2b, 0x8f, 0x36];
 const AGGREGATOR_SELECTOR_405CEC67: [u8; 4] = [0x40, 0x5c, 0xec, 0x67];
+const AGGREGATOR_SELECTOR_C3192F1F: [u8; 4] = [0xc3, 0x19, 0x2f, 0x1f];
+const AGGREGATOR_SELECTOR_CDD1B25D: [u8; 4] = [0xcd, 0xd1, 0xb2, 0x5d];
 const AGGREGATOR_SELECTOR_F2881E21: [u8; 4] = [0xf2, 0x88, 0x1e, 0x21];
+const CONTEXT_WRAP_SELECTOR: [u8; 4] = [0x62, 0x35, 0x56, 0x38];
+const ENTRYPOINT_HANDLE_OPS: [u8; 4] = [0x76, 0x5e, 0x82, 0x7f];
+const SELECTOR_NOISE_00000008: [u8; 4] = [0x00, 0x00, 0x00, 0x08];
 const SAFE_INNER_SELECTOR_8CC7104F: [u8; 4] = [0x8c, 0xc7, 0x10, 0x4f];
 const SAFE_INNER_SELECTOR_9E7212AD: [u8; 4] = [0x9e, 0x72, 0x12, 0xad];
 
@@ -2379,6 +2385,28 @@ pub(crate) fn fast_preflight_gate(
         };
     }
 
+    if config.mev.opportunity_mode() == OpportunityMode::Aggressive {
+        let bloody_try_score =
+            scavenger_fast_try_score(signal, gas_ratio, notional_eth, config, context_signal);
+        let min_usd = config.mev.effective_min_profit_usd();
+        let reject_reason = if bloody_try_score < 0.24 && ev_upper_bound_usd < min_usd * 0.35 {
+            Some("bloody_score_below_research_threshold")
+        } else if gas_ratio > 1.85 && ev_upper_bound_usd < min_usd {
+            Some("bloody_gas_pressure_without_edge")
+        } else {
+            None
+        };
+        return FastPreflightDecision {
+            should_continue: reject_reason.is_none(),
+            reject_reason,
+            ev_upper_bound_usd,
+            estimated_gas_cost_usd,
+            competition_score_fast: 1.0 - bloody_try_score,
+            gas_ratio,
+            scavenger_try_score: bloody_try_score,
+        };
+    }
+
     let gas_pressure = ((gas_ratio - 1.0) / 0.8).clamp(0.0, 1.0);
     let size_pressure = match size_bucket {
         0 => 0.20,
@@ -3565,6 +3593,7 @@ fn known_target_label(address: Address) -> Option<&'static str> {
     match value.as_str() {
         "0x07964f135f276412b3182a3b2407b8dd45000000" => Some("transit_swap_router_v5"),
         "0x4337084d9e255ff0702461cf8895ce9e3b5ff108" => Some("entrypoint_v0_8"),
+        "0x0000000071727de22e5e9d8baf0edac6f37da032" => Some("entrypoint_v0_7"),
         "0x00000000000fb5c9adea0298d729a0cb3823cc07" => Some("aggregator_or_permit_router"),
         "0xd216153c06e857cd7f72665e0af1d7d82172f494" => {
             Some("unknown_high_frequency_polygon_target")
@@ -3572,6 +3601,13 @@ fn known_target_label(address: Address) -> Option<&'static str> {
         "0xada100db00ca00073811820692005400218fce1f" => Some("safe_inner_target"),
         _ => None,
     }
+}
+
+fn is_account_abstraction_target(address: Option<Address>) -> bool {
+    address
+        .and_then(known_target_label)
+        .map(|label| label.starts_with("entrypoint_"))
+        .unwrap_or(false)
 }
 
 fn format_target(address: Option<Address>) -> String {
@@ -4170,7 +4206,7 @@ pub(crate) fn decode_relevant_swap(
     let mut signal = decode_swap_signal(selector, router, tx.value, args, monitored_tokens)?;
 
     let notional_wei = estimate_notional_wei(&signal, monitored_tokens).or_else(|| {
-        if mode == OpportunityMode::Scavenger
+        if mode_allows_partial_shadow_decode(mode)
             && path_contains_monitored_token(&signal.path, monitored_tokens)
         {
             Some(min_large_swap_wei.max(U256::one()))
@@ -4186,6 +4222,13 @@ pub(crate) fn decode_relevant_swap(
     }
     signal.notional_wei = notional_wei;
     Some(signal)
+}
+
+fn mode_allows_partial_shadow_decode(mode: OpportunityMode) -> bool {
+    matches!(
+        mode,
+        OpportunityMode::Aggressive | OpportunityMode::Scavenger
+    )
 }
 
 fn decode_swap_signal(
@@ -4422,24 +4465,102 @@ fn decode_known_aggregator_partial(
     monitored_tokens: &[MonitoredTokenConfig],
 ) -> Option<SwapSignal> {
     match selector {
+        TRANSIT_EXACT_INPUT_V3_SWAP => {
+            decode_transit_v5_v3_partial(selector, router, value, args, monitored_tokens).or_else(
+                || {
+                    decode_partial_swap_from_monitored_tokens(
+                        selector,
+                        router,
+                        value,
+                        args,
+                        monitored_tokens,
+                        0.45,
+                        "transit_v5_token_order_partial",
+                    )
+                },
+            )
+        }
         TRANSIT_SWAP_V5
         | AGGREGATOR_SELECTOR_01B7037C
         | AGGREGATOR_SELECTOR_0A3C4405
         | AGGREGATOR_SELECTOR_0A2B8F36
         | AGGREGATOR_SELECTOR_405CEC67
-        | AGGREGATOR_SELECTOR_F2881E21 => {
-            decode_partial_swap_from_monitored_tokens(
-                selector,
-                router,
-                value,
-                args,
-                monitored_tokens,
-                0.35,
-                "token_order_partial",
-            )
-        }
+        | AGGREGATOR_SELECTOR_C3192F1F
+        | AGGREGATOR_SELECTOR_CDD1B25D
+        | AGGREGATOR_SELECTOR_F2881E21 => decode_partial_swap_from_monitored_tokens(
+            selector,
+            router,
+            value,
+            args,
+            monitored_tokens,
+            0.35,
+            "token_order_partial",
+        ),
         _ => None,
     }
+}
+
+fn decode_transit_v5_v3_partial(
+    selector: [u8; 4],
+    router: Address,
+    value: U256,
+    args: &[u8],
+    monitored_tokens: &[MonitoredTokenConfig],
+) -> Option<SwapSignal> {
+    let decoded = abi::decode(
+        &[ParamType::Tuple(vec![
+            ParamType::Address,
+            ParamType::Address,
+            ParamType::Address,
+            ParamType::Address,
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Array(Box::new(ParamType::Uint(256))),
+            ParamType::Bytes,
+            ParamType::String,
+        ])],
+        args,
+    )
+    .ok()?;
+    let Token::Tuple(values) = decoded.first()? else {
+        return None;
+    };
+    let path_bytes = token_tree_find_v3_path_bytes(values)?;
+    let parsed = parse_v3_path(&path_bytes)?;
+    let path = parse_v3_path_segments(&path_bytes)
+        .first()
+        .map(|segment| vec![segment.token_in, segment.token_out])
+        .unwrap_or_else(|| vec![parsed.token_in, parsed.edge_token_out]);
+    if !path_contains_monitored_token(&path, monitored_tokens) {
+        return None;
+    }
+    let amount_in = if value > U256::zero() {
+        value
+    } else {
+        amount_hint_from_calldata(args).unwrap_or_else(U256::one)
+    };
+    Some(SwapSignal {
+        selector,
+        amount_in,
+        amount_out_min: None,
+        notional_wei: U256::zero(),
+        path,
+        router,
+        kind: SwapKind::V3 {
+            fee_tier: parsed.first_fee_tier,
+            encoded_path: encode_v3_path(
+                parsed.edge_token_out,
+                parsed.first_fee_tier,
+                parsed.token_in,
+            ),
+            hops: parsed.hops,
+            exact_out: false,
+        },
+        decode_confidence: 0.72,
+        decode_source: "transit_v5_v3_path_partial",
+    })
 }
 
 fn decode_partial_swap_from_monitored_tokens(
@@ -5129,10 +5250,13 @@ fn diagnose_decode_reject(
             | ZERO_EX_SELL_TO_UNISWAP
             | SAFE_EXEC_TRANSACTION
             | TRANSIT_SWAP_V5
+            | TRANSIT_EXACT_INPUT_V3_SWAP
             | AGGREGATOR_SELECTOR_01B7037C
             | AGGREGATOR_SELECTOR_0A3C4405
             | AGGREGATOR_SELECTOR_0A2B8F36
             | AGGREGATOR_SELECTOR_405CEC67
+            | AGGREGATOR_SELECTOR_C3192F1F
+            | AGGREGATOR_SELECTOR_CDD1B25D
             | AGGREGATOR_SELECTOR_F2881E21
     );
 
@@ -5182,11 +5306,16 @@ fn diagnose_decode_reject(
     }
 
     if !supported_selector {
-        let unsupported_reason = if tx.to.and_then(known_target_label) == Some("entrypoint_v0_8") {
-            "account_abstraction_noise"
-        } else {
-            "selector_unsupported"
-        };
+        let unsupported_reason =
+            if is_account_abstraction_target(tx.to) || selector == ENTRYPOINT_HANDLE_OPS {
+                "account_abstraction_noise"
+            } else if selector == CONTEXT_WRAP_SELECTOR {
+                "context_command_not_swap"
+            } else if selector == SELECTOR_NOISE_00000008 {
+                "selector_noise_or_mev_trap"
+            } else {
+                "selector_unsupported"
+            };
         return DecodeRejectDiagnostic {
             reason: unsupported_reason,
             detail: format!(
@@ -5202,16 +5331,23 @@ fn diagnose_decode_reject(
                 tx.input.as_ref().len(),
                 calldata_prefix_hex(tx.input.as_ref())
             ),
-            hints: vec![if unsupported_reason == "account_abstraction_noise" {
-                format!(
+            hints: vec![match unsupported_reason {
+                "account_abstraction_noise" => format!(
                     "account abstraction entrypoint selector {selector_text} target={}",
                     format_target(tx.to)
-                )
-            } else {
-                format!(
+                ),
+                "context_command_not_swap" => format!(
+                    "context-only selector {selector_text} target={} is not an AMM swap",
+                    format_target(tx.to)
+                ),
+                "selector_noise_or_mev_trap" => format!(
+                    "noise selector {selector_text} target={} left out of pool discovery",
+                    format_target(tx.to)
+                ),
+                _ => format!(
                     "unsupported selector {selector_text} target={}",
                     format_target(tx.to)
-                )
+                ),
             }],
         };
     }
@@ -6921,6 +7057,27 @@ fn token_as_address(token: &Token) -> Option<Address> {
 fn token_as_address_vec(token: &Token) -> Option<Vec<Address>> {
     match token {
         Token::Array(values) => values.iter().map(token_as_address).collect(),
+        _ => None,
+    }
+}
+
+fn token_tree_find_v3_path_bytes(tokens: &[Token]) -> Option<Vec<u8>> {
+    for token in tokens {
+        if let Some(path) = token_find_v3_path_bytes(token) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn token_find_v3_path_bytes(token: &Token) -> Option<Vec<u8>> {
+    match token {
+        Token::Bytes(value) | Token::FixedBytes(value) => {
+            parse_v3_path(value).is_some().then(|| value.clone())
+        }
+        Token::Array(values) | Token::FixedArray(values) | Token::Tuple(values) => {
+            token_tree_find_v3_path_bytes(values)
+        }
         _ => None,
     }
 }
