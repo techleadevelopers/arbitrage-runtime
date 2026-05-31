@@ -15,6 +15,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::warn;
 
+const SELECTOR_POOL_PARTIAL_COLUMNS: [&str; 8] = [
+    "partial_entered_payload_builder_count",
+    "partial_pool_discovery_attempted_count",
+    "partial_pool_found_count",
+    "partial_pool_missing_count",
+    "partial_shadow_ev_positive_count",
+    "partial_shadow_ev_negative_count",
+    "partial_replay_candidate_created_count",
+    "partial_replay_candidate_rejected_count",
+];
+
 #[derive(Debug, Clone)]
 pub struct UnsupportedSelectorRecord {
     pub target: String,
@@ -58,6 +69,14 @@ pub struct SelectorPoolPerformanceSnapshot {
     pub payload_built: u64,
     pub shadow_ev_positive: u64,
     pub shadow_ev_negative: u64,
+    pub partial_entered_payload_builder: u64,
+    pub partial_pool_discovery_attempted: u64,
+    pub partial_pool_found: u64,
+    pub partial_pool_missing: u64,
+    pub partial_shadow_ev_positive: u64,
+    pub partial_shadow_ev_negative: u64,
+    pub partial_replay_candidate_created: u64,
+    pub partial_replay_candidate_rejected: u64,
     pub total: u64,
     pub avg_expected_profit: f64,
     pub avg_liquidity: f64,
@@ -322,6 +341,14 @@ impl Storage {
                 payload_built_count INTEGER NOT NULL DEFAULT 0,
                 shadow_ev_positive_count INTEGER NOT NULL DEFAULT 0,
                 shadow_ev_negative_count INTEGER NOT NULL DEFAULT 0,
+                partial_entered_payload_builder_count INTEGER NOT NULL DEFAULT 0,
+                partial_pool_discovery_attempted_count INTEGER NOT NULL DEFAULT 0,
+                partial_pool_found_count INTEGER NOT NULL DEFAULT 0,
+                partial_pool_missing_count INTEGER NOT NULL DEFAULT 0,
+                partial_shadow_ev_positive_count INTEGER NOT NULL DEFAULT 0,
+                partial_shadow_ev_negative_count INTEGER NOT NULL DEFAULT 0,
+                partial_replay_candidate_created_count INTEGER NOT NULL DEFAULT 0,
+                partial_replay_candidate_rejected_count INTEGER NOT NULL DEFAULT 0,
                 expected_profit_sum REAL NOT NULL DEFAULT 0,
                 liquidity_sum REAL NOT NULL DEFAULT 0,
                 gas_gwei_sum REAL NOT NULL DEFAULT 0,
@@ -379,6 +406,14 @@ impl Storage {
             "ALTER TABLE execution_outcomes ADD COLUMN network TEXT NOT NULL DEFAULT 'unknown'",
             [],
         );
+        for column in SELECTOR_POOL_PARTIAL_COLUMNS {
+            let _ = conn.execute(
+                &format!(
+                    "ALTER TABLE selector_pool_performance_rollups ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                ),
+                [],
+            );
+        }
 
         Ok(Self {
             backend: StorageBackend::Sqlite(Arc::new(Mutex::new(conn))),
@@ -620,6 +655,14 @@ impl Storage {
                 payload_built_count BIGINT NOT NULL DEFAULT 0,
                 shadow_ev_positive_count BIGINT NOT NULL DEFAULT 0,
                 shadow_ev_negative_count BIGINT NOT NULL DEFAULT 0,
+                partial_entered_payload_builder_count BIGINT NOT NULL DEFAULT 0,
+                partial_pool_discovery_attempted_count BIGINT NOT NULL DEFAULT 0,
+                partial_pool_found_count BIGINT NOT NULL DEFAULT 0,
+                partial_pool_missing_count BIGINT NOT NULL DEFAULT 0,
+                partial_shadow_ev_positive_count BIGINT NOT NULL DEFAULT 0,
+                partial_shadow_ev_negative_count BIGINT NOT NULL DEFAULT 0,
+                partial_replay_candidate_created_count BIGINT NOT NULL DEFAULT 0,
+                partial_replay_candidate_rejected_count BIGINT NOT NULL DEFAULT 0,
                 expected_profit_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
                 liquidity_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
                 gas_gwei_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
@@ -670,6 +713,12 @@ impl Storage {
 
         for statement in statements {
             sqlx::query(statement).execute(pool).await?;
+        }
+        for column in SELECTOR_POOL_PARTIAL_COLUMNS {
+            let statement = format!(
+                "ALTER TABLE selector_pool_performance_rollups ADD COLUMN IF NOT EXISTS {column} BIGINT NOT NULL DEFAULT 0"
+            );
+            sqlx::query(&statement).execute(pool).await?;
         }
         Ok(())
     }
@@ -1259,6 +1308,14 @@ impl Storage {
         payload_built_count: u64,
         shadow_ev_positive_count: u64,
         shadow_ev_negative_count: u64,
+        partial_entered_payload_builder_count: u64,
+        partial_pool_discovery_attempted_count: u64,
+        partial_pool_found_count: u64,
+        partial_pool_missing_count: u64,
+        partial_shadow_ev_positive_count: u64,
+        partial_shadow_ev_negative_count: u64,
+        partial_replay_candidate_created_count: u64,
+        partial_replay_candidate_rejected_count: u64,
         expected_profit_sum: f64,
         liquidity_sum: f64,
         gas_gwei_sum: f64,
@@ -1274,15 +1331,27 @@ impl Storage {
                             network, bucket, selector, target, token_pair, pool, dex_kind, fee_tier,
                             pool_found_count, pool_missing_count, payload_built_count,
                             shadow_ev_positive_count, shadow_ev_negative_count,
+                            partial_entered_payload_builder_count, partial_pool_discovery_attempted_count,
+                            partial_pool_found_count, partial_pool_missing_count,
+                            partial_shadow_ev_positive_count, partial_shadow_ev_negative_count,
+                            partial_replay_candidate_created_count, partial_replay_candidate_rejected_count,
                             expected_profit_sum, liquidity_sum, gas_gwei_sum, samples, last_seen
                         )
-                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
                         ON CONFLICT(network, bucket, selector, target, token_pair, pool, dex_kind, fee_tier) DO UPDATE SET
                             pool_found_count = pool_found_count + excluded.pool_found_count,
                             pool_missing_count = pool_missing_count + excluded.pool_missing_count,
                             payload_built_count = payload_built_count + excluded.payload_built_count,
                             shadow_ev_positive_count = shadow_ev_positive_count + excluded.shadow_ev_positive_count,
                             shadow_ev_negative_count = shadow_ev_negative_count + excluded.shadow_ev_negative_count,
+                            partial_entered_payload_builder_count = partial_entered_payload_builder_count + excluded.partial_entered_payload_builder_count,
+                            partial_pool_discovery_attempted_count = partial_pool_discovery_attempted_count + excluded.partial_pool_discovery_attempted_count,
+                            partial_pool_found_count = partial_pool_found_count + excluded.partial_pool_found_count,
+                            partial_pool_missing_count = partial_pool_missing_count + excluded.partial_pool_missing_count,
+                            partial_shadow_ev_positive_count = partial_shadow_ev_positive_count + excluded.partial_shadow_ev_positive_count,
+                            partial_shadow_ev_negative_count = partial_shadow_ev_negative_count + excluded.partial_shadow_ev_negative_count,
+                            partial_replay_candidate_created_count = partial_replay_candidate_created_count + excluded.partial_replay_candidate_created_count,
+                            partial_replay_candidate_rejected_count = partial_replay_candidate_rejected_count + excluded.partial_replay_candidate_rejected_count,
                             expected_profit_sum = expected_profit_sum + excluded.expected_profit_sum,
                             liquidity_sum = liquidity_sum + excluded.liquidity_sum,
                             gas_gwei_sum = gas_gwei_sum + excluded.gas_gwei_sum,
@@ -1303,6 +1372,14 @@ impl Storage {
                             payload_built_count as i64,
                             shadow_ev_positive_count as i64,
                             shadow_ev_negative_count as i64,
+                            partial_entered_payload_builder_count as i64,
+                            partial_pool_discovery_attempted_count as i64,
+                            partial_pool_found_count as i64,
+                            partial_pool_missing_count as i64,
+                            partial_shadow_ev_positive_count as i64,
+                            partial_shadow_ev_negative_count as i64,
+                            partial_replay_candidate_created_count as i64,
+                            partial_replay_candidate_rejected_count as i64,
                             expected_profit_sum,
                             liquidity_sum,
                             gas_gwei_sum,
@@ -1320,15 +1397,27 @@ impl Storage {
                             network, bucket, selector, target, token_pair, pool, dex_kind, fee_tier,
                             pool_found_count, pool_missing_count, payload_built_count,
                             shadow_ev_positive_count, shadow_ev_negative_count,
+                            partial_entered_payload_builder_count, partial_pool_discovery_attempted_count,
+                            partial_pool_found_count, partial_pool_missing_count,
+                            partial_shadow_ev_positive_count, partial_shadow_ev_negative_count,
+                            partial_replay_candidate_created_count, partial_replay_candidate_rejected_count,
                             expected_profit_sum, liquidity_sum, gas_gwei_sum, samples, last_seen
                         )
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
                         ON CONFLICT(network, bucket, selector, target, token_pair, pool, dex_kind, fee_tier) DO UPDATE SET
                             pool_found_count = selector_pool_performance_rollups.pool_found_count + EXCLUDED.pool_found_count,
                             pool_missing_count = selector_pool_performance_rollups.pool_missing_count + EXCLUDED.pool_missing_count,
                             payload_built_count = selector_pool_performance_rollups.payload_built_count + EXCLUDED.payload_built_count,
                             shadow_ev_positive_count = selector_pool_performance_rollups.shadow_ev_positive_count + EXCLUDED.shadow_ev_positive_count,
                             shadow_ev_negative_count = selector_pool_performance_rollups.shadow_ev_negative_count + EXCLUDED.shadow_ev_negative_count,
+                            partial_entered_payload_builder_count = selector_pool_performance_rollups.partial_entered_payload_builder_count + EXCLUDED.partial_entered_payload_builder_count,
+                            partial_pool_discovery_attempted_count = selector_pool_performance_rollups.partial_pool_discovery_attempted_count + EXCLUDED.partial_pool_discovery_attempted_count,
+                            partial_pool_found_count = selector_pool_performance_rollups.partial_pool_found_count + EXCLUDED.partial_pool_found_count,
+                            partial_pool_missing_count = selector_pool_performance_rollups.partial_pool_missing_count + EXCLUDED.partial_pool_missing_count,
+                            partial_shadow_ev_positive_count = selector_pool_performance_rollups.partial_shadow_ev_positive_count + EXCLUDED.partial_shadow_ev_positive_count,
+                            partial_shadow_ev_negative_count = selector_pool_performance_rollups.partial_shadow_ev_negative_count + EXCLUDED.partial_shadow_ev_negative_count,
+                            partial_replay_candidate_created_count = selector_pool_performance_rollups.partial_replay_candidate_created_count + EXCLUDED.partial_replay_candidate_created_count,
+                            partial_replay_candidate_rejected_count = selector_pool_performance_rollups.partial_replay_candidate_rejected_count + EXCLUDED.partial_replay_candidate_rejected_count,
                             expected_profit_sum = selector_pool_performance_rollups.expected_profit_sum + EXCLUDED.expected_profit_sum,
                             liquidity_sum = selector_pool_performance_rollups.liquidity_sum + EXCLUDED.liquidity_sum,
                             gas_gwei_sum = selector_pool_performance_rollups.gas_gwei_sum + EXCLUDED.gas_gwei_sum,
@@ -1349,6 +1438,14 @@ impl Storage {
                     .bind(payload_built_count as i64)
                     .bind(shadow_ev_positive_count as i64)
                     .bind(shadow_ev_negative_count as i64)
+                    .bind(partial_entered_payload_builder_count as i64)
+                    .bind(partial_pool_discovery_attempted_count as i64)
+                    .bind(partial_pool_found_count as i64)
+                    .bind(partial_pool_missing_count as i64)
+                    .bind(partial_shadow_ev_positive_count as i64)
+                    .bind(partial_shadow_ev_negative_count as i64)
+                    .bind(partial_replay_candidate_created_count as i64)
+                    .bind(partial_replay_candidate_rejected_count as i64)
                     .bind(expected_profit_sum)
                     .bind(liquidity_sum)
                     .bind(gas_gwei_sum)
@@ -1376,6 +1473,14 @@ impl Storage {
                         SUM(payload_built_count) AS payload_built,
                         SUM(shadow_ev_positive_count) AS shadow_ev_positive,
                         SUM(shadow_ev_negative_count) AS shadow_ev_negative,
+                        SUM(partial_entered_payload_builder_count) AS partial_entered_payload_builder,
+                        SUM(partial_pool_discovery_attempted_count) AS partial_pool_discovery_attempted,
+                        SUM(partial_pool_found_count) AS partial_pool_found,
+                        SUM(partial_pool_missing_count) AS partial_pool_missing,
+                        SUM(partial_shadow_ev_positive_count) AS partial_shadow_ev_positive,
+                        SUM(partial_shadow_ev_negative_count) AS partial_shadow_ev_negative,
+                        SUM(partial_replay_candidate_created_count) AS partial_replay_candidate_created,
+                        SUM(partial_replay_candidate_rejected_count) AS partial_replay_candidate_rejected,
                         SUM(samples) AS total,
                         SUM(expected_profit_sum) AS expected_profit_sum,
                         SUM(liquidity_sum) AS liquidity_sum,
@@ -1401,10 +1506,18 @@ impl Storage {
                         row.get::<_, i64>(9)?.max(0) as u64,
                         row.get::<_, i64>(10)?.max(0) as u64,
                         row.get::<_, i64>(11)?.max(0) as u64,
-                        row.get::<_, f64>(12)?,
-                        row.get::<_, f64>(13)?,
-                        row.get::<_, f64>(14)?,
-                        row.get(15)?,
+                        row.get::<_, i64>(12)?.max(0) as u64,
+                        row.get::<_, i64>(13)?.max(0) as u64,
+                        row.get::<_, i64>(14)?.max(0) as u64,
+                        row.get::<_, i64>(15)?.max(0) as u64,
+                        row.get::<_, i64>(16)?.max(0) as u64,
+                        row.get::<_, i64>(17)?.max(0) as u64,
+                        row.get::<_, i64>(18)?.max(0) as u64,
+                        row.get::<_, i64>(19)?.max(0) as u64,
+                        row.get::<_, f64>(20)?,
+                        row.get::<_, f64>(21)?,
+                        row.get::<_, f64>(22)?,
+                        row.get(23)?,
                     ))
                 })?;
                 let mut out = Vec::new();
@@ -1424,6 +1537,14 @@ impl Storage {
                             SUM(payload_built_count)::bigint AS payload_built,
                             SUM(shadow_ev_positive_count)::bigint AS shadow_ev_positive,
                             SUM(shadow_ev_negative_count)::bigint AS shadow_ev_negative,
+                            SUM(partial_entered_payload_builder_count)::bigint AS partial_entered_payload_builder,
+                            SUM(partial_pool_discovery_attempted_count)::bigint AS partial_pool_discovery_attempted,
+                            SUM(partial_pool_found_count)::bigint AS partial_pool_found,
+                            SUM(partial_pool_missing_count)::bigint AS partial_pool_missing,
+                            SUM(partial_shadow_ev_positive_count)::bigint AS partial_shadow_ev_positive,
+                            SUM(partial_shadow_ev_negative_count)::bigint AS partial_shadow_ev_negative,
+                            SUM(partial_replay_candidate_created_count)::bigint AS partial_replay_candidate_created,
+                            SUM(partial_replay_candidate_rejected_count)::bigint AS partial_replay_candidate_rejected,
                             SUM(samples)::bigint AS total,
                             SUM(expected_profit_sum)::double precision AS expected_profit_sum,
                             SUM(liquidity_sum)::double precision AS liquidity_sum,
@@ -1453,6 +1574,15 @@ impl Storage {
                             row.get::<i64, _>("payload_built").max(0) as u64,
                             row.get::<i64, _>("shadow_ev_positive").max(0) as u64,
                             row.get::<i64, _>("shadow_ev_negative").max(0) as u64,
+                            row.get::<i64, _>("partial_entered_payload_builder").max(0) as u64,
+                            row.get::<i64, _>("partial_pool_discovery_attempted").max(0) as u64,
+                            row.get::<i64, _>("partial_pool_found").max(0) as u64,
+                            row.get::<i64, _>("partial_pool_missing").max(0) as u64,
+                            row.get::<i64, _>("partial_shadow_ev_positive").max(0) as u64,
+                            row.get::<i64, _>("partial_shadow_ev_negative").max(0) as u64,
+                            row.get::<i64, _>("partial_replay_candidate_created").max(0) as u64,
+                            row.get::<i64, _>("partial_replay_candidate_rejected")
+                                .max(0) as u64,
                             row.get::<i64, _>("total").max(0) as u64,
                             row.try_get::<Option<f64>, _>("expected_profit_sum")
                                 .unwrap_or(None)
@@ -3019,6 +3149,14 @@ fn build_selector_pool_performance_snapshot(
     payload_built: u64,
     shadow_ev_positive: u64,
     shadow_ev_negative: u64,
+    partial_entered_payload_builder: u64,
+    partial_pool_discovery_attempted: u64,
+    partial_pool_found: u64,
+    partial_pool_missing: u64,
+    partial_shadow_ev_positive: u64,
+    partial_shadow_ev_negative: u64,
+    partial_replay_candidate_created: u64,
+    partial_replay_candidate_rejected: u64,
     total: u64,
     expected_profit_sum: f64,
     liquidity_sum: f64,
@@ -3064,6 +3202,14 @@ fn build_selector_pool_performance_snapshot(
         payload_built,
         shadow_ev_positive,
         shadow_ev_negative,
+        partial_entered_payload_builder,
+        partial_pool_discovery_attempted,
+        partial_pool_found,
+        partial_pool_missing,
+        partial_shadow_ev_positive,
+        partial_shadow_ev_negative,
+        partial_replay_candidate_created,
+        partial_replay_candidate_rejected,
         total,
         avg_expected_profit,
         avg_liquidity,

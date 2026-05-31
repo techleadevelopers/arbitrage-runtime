@@ -3345,6 +3345,9 @@ fn record_pool_shadow_stage(
     liquidity_native: f64,
     gas_gwei: f64,
 ) {
+    if stage.starts_with("partial_") {
+        dashboard.record_opportunity_funnel(stage);
+    }
     let (dex_kind, fee_tier) = signal_dex_kind_and_fee_tier(signal);
     dashboard.record_selector_pool_performance(
         &selector_hex(signal.selector),
@@ -3379,7 +3382,11 @@ fn record_payload_pool_shadow(
     record_pool_shadow_stage(
         dashboard,
         signal,
-        "pool_found",
+        if signal.is_partial_decode() {
+            "partial_pool_found"
+        } else {
+            "pool_found"
+        },
         &pool,
         expected_profit,
         liquidity,
@@ -3397,7 +3404,13 @@ fn record_payload_pool_shadow(
         );
     }
     let ev_stage = if expected_profit > 0.0 && economic_payload {
-        "shadow_ev_positive"
+        if signal.is_partial_decode() {
+            "partial_shadow_ev_positive"
+        } else {
+            "shadow_ev_positive"
+        }
+    } else if signal.is_partial_decode() {
+        "partial_shadow_ev_negative"
     } else {
         "shadow_ev_negative"
     };
@@ -3426,14 +3439,24 @@ fn record_payload_pool_reject(
             record_pool_shadow_stage(
                 dashboard,
                 signal,
-                "pool_found",
+                if signal.is_partial_decode() {
+                    "partial_pool_found"
+                } else {
+                    "pool_found"
+                },
                 pool,
                 expected_profit,
                 0.0,
                 gas_gwei,
             );
             let ev_stage = if sample.gross_edge_native > 0.0 {
-                "shadow_ev_positive"
+                if signal.is_partial_decode() {
+                    "partial_shadow_ev_positive"
+                } else {
+                    "shadow_ev_positive"
+                }
+            } else if signal.is_partial_decode() {
+                "partial_shadow_ev_negative"
             } else {
                 "shadow_ev_negative"
             };
@@ -3463,7 +3486,11 @@ fn record_payload_pool_reject(
         record_pool_shadow_stage(
             dashboard,
             signal,
-            "pool_missing",
+            if signal.is_partial_decode() {
+                "partial_pool_missing"
+            } else {
+                "pool_missing"
+            },
             "unknown",
             0.0,
             0.0,
@@ -3482,14 +3509,47 @@ fn maybe_enqueue_replay_candidate(
     block_number: u64,
     dashboard: &DashboardHandle,
 ) {
+    let expected_profit = wei_to_eth_f64(payload.expected_profit_wei);
     let Some(replay_tx) = replay_tx else {
+        if signal.is_partial_decode() {
+            record_pool_shadow_stage(
+                dashboard,
+                signal,
+                "partial_replay_candidate_rejected",
+                "unknown",
+                expected_profit,
+                0.0,
+                gas_price_gwei(gas_price),
+            );
+        }
         return;
     };
-    let expected_profit = wei_to_eth_f64(payload.expected_profit_wei);
     if !economic_payload || expected_profit <= 0.0 {
+        if signal.is_partial_decode() {
+            record_pool_shadow_stage(
+                dashboard,
+                signal,
+                "partial_replay_candidate_rejected",
+                "unknown",
+                expected_profit,
+                0.0,
+                gas_price_gwei(gas_price),
+            );
+        }
         return;
     }
     if signal.decode_confidence < replay_min_confidence() {
+        if signal.is_partial_decode() {
+            record_pool_shadow_stage(
+                dashboard,
+                signal,
+                "partial_replay_candidate_rejected",
+                "unknown",
+                expected_profit,
+                0.0,
+                gas_price_gwei(gas_price),
+            );
+        }
         return;
     }
     let pool = payload
@@ -3500,6 +3560,17 @@ fn maybe_enqueue_replay_candidate(
         .map(str::to_string)
         .unwrap_or_else(|| address_hex(payload.pair));
     if pool == "unknown" {
+        if signal.is_partial_decode() {
+            record_pool_shadow_stage(
+                dashboard,
+                signal,
+                "partial_replay_candidate_rejected",
+                "unknown",
+                expected_profit,
+                0.0,
+                gas_price_gwei(gas_price),
+            );
+        }
         return;
     }
     let key = format!(
@@ -3510,13 +3581,24 @@ fn maybe_enqueue_replay_candidate(
     );
     let repeat_count = replay_repeat_count(&key);
     if repeat_count < replay_min_repeat_count() {
+        if signal.is_partial_decode() {
+            record_pool_shadow_stage(
+                dashboard,
+                signal,
+                "partial_replay_candidate_rejected",
+                &pool,
+                expected_profit,
+                0.0,
+                gas_price_gwei(gas_price),
+            );
+        }
         return;
     }
     let candidate = ReplayCandidate {
         tx_hash,
         selector: selector_hex(signal.selector),
         target: address_hex(signal.router),
-        pool,
+        pool: pool.clone(),
         path: signal.path.clone(),
         amount_in: signal.amount_in,
         amount_out_min: signal.amount_out_min,
@@ -3531,6 +3613,17 @@ fn maybe_enqueue_replay_candidate(
         Ok(()) => {
             dashboard.record_opportunity_funnel("replay_candidate");
             dashboard.record_reject_reason("replay_queue", "queued");
+            if signal.is_partial_decode() {
+                record_pool_shadow_stage(
+                    dashboard,
+                    signal,
+                    "partial_replay_candidate_created",
+                    &pool,
+                    expected_profit,
+                    0.0,
+                    gas_price_gwei(gas_price),
+                );
+            }
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
             dashboard.record_reject_reason("replay_queue", "full_drop");
@@ -4609,15 +4702,10 @@ fn decode_known_aggregator_partial(
             )
         }
         TRANSIT_SWAP_V5
-        | AGGREGATOR_SELECTOR_01B7037C
-        | AGGREGATOR_SELECTOR_0A3C4405
         | AGGREGATOR_SELECTOR_0A2B8F36
-        | AGGREGATOR_SELECTOR_405CEC67
         | AGGREGATOR_SELECTOR_0060EA13
         | AGGREGATOR_SELECTOR_448E340E
         | AGGREGATOR_SELECTOR_9265BB9D
-        | AGGREGATOR_SELECTOR_C3192F1F
-        | AGGREGATOR_SELECTOR_CDD1B25D
         | AGGREGATOR_SELECTOR_F2881E21 => decode_partial_swap_from_monitored_tokens(
             selector,
             router,
@@ -4627,8 +4715,73 @@ fn decode_known_aggregator_partial(
             0.35,
             "token_order_partial",
         ),
+        AGGREGATOR_SELECTOR_C3192F1F => {
+            decode_swap_exact_eth_for_token_partial(selector, router, value, args, monitored_tokens)
+                .or_else(|| {
+                    decode_partial_swap_from_monitored_tokens(
+                        selector,
+                        router,
+                        value,
+                        args,
+                        monitored_tokens,
+                        0.35,
+                        "token_order_partial",
+                    )
+                })
+        }
         _ => None,
     }
+}
+
+fn decode_swap_exact_eth_for_token_partial(
+    selector: [u8; 4],
+    router: Address,
+    value: U256,
+    args: &[u8],
+    monitored_tokens: &[MonitoredTokenConfig],
+) -> Option<SwapSignal> {
+    let decoded = abi::decode(
+        &[
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Address,
+            ParamType::Address,
+            ParamType::Bytes,
+            ParamType::Uint(256),
+        ],
+        args,
+    )
+    .ok()?;
+    let amount_in = token_as_uint(decoded.first()?)?;
+    let amount_out_min = decoded.get(1).and_then(token_as_uint);
+    let token_out = token_as_address(decoded.get(2)?)?;
+    let path_bytes = match decoded.get(4)? {
+        Token::Bytes(value) => value.as_slice(),
+        _ => return None,
+    };
+    let mut path = monitored_token_addresses_in_input(monitored_tokens, path_bytes);
+    if !path.contains(&token_out) {
+        path.push(token_out);
+    }
+    dedup_address_path(&mut path);
+    if path.len() < 2 || !path_contains_monitored_token(&path, monitored_tokens) {
+        return None;
+    }
+    Some(SwapSignal {
+        selector,
+        amount_in: if value > U256::zero() {
+            value
+        } else {
+            amount_in.max(U256::one())
+        },
+        amount_out_min,
+        notional_wei: U256::zero(),
+        path,
+        router,
+        kind: SwapKind::V2,
+        decode_confidence: 0.62,
+        decode_source: "swap_exact_eth_for_token_path_partial",
+    })
 }
 
 fn decode_transit_v5_v3_partial(
@@ -5436,15 +5589,11 @@ fn diagnose_decode_reject(
             | TRANSIT_SWAP_V5
             | TRANSIT_EXACT_INPUT_V3_SWAP
             | TRANSIT_EXACT_INPUT_V2_SWAP
-            | AGGREGATOR_SELECTOR_01B7037C
-            | AGGREGATOR_SELECTOR_0A3C4405
             | AGGREGATOR_SELECTOR_0A2B8F36
-            | AGGREGATOR_SELECTOR_405CEC67
             | AGGREGATOR_SELECTOR_0060EA13
             | AGGREGATOR_SELECTOR_448E340E
             | AGGREGATOR_SELECTOR_9265BB9D
             | AGGREGATOR_SELECTOR_C3192F1F
-            | AGGREGATOR_SELECTOR_CDD1B25D
             | AGGREGATOR_SELECTOR_F2881E21
     );
 
@@ -5499,6 +5648,8 @@ fn diagnose_decode_reject(
                 "account_abstraction_noise"
             } else if selector == CONTEXT_WRAP_SELECTOR {
                 "context_command_not_swap"
+            } else if is_context_only_or_helper_selector(selector) {
+                "router_helper_or_context_only"
             } else if selector == SELECTOR_NOISE_00000008 {
                 "selector_noise_or_mev_trap"
             } else {
@@ -5526,6 +5677,10 @@ fn diagnose_decode_reject(
                 ),
                 "context_command_not_swap" => format!(
                     "context-only selector {selector_text} target={} is not an AMM swap",
+                    format_target(tx.to)
+                ),
+                "router_helper_or_context_only" => format!(
+                    "helper/context selector {selector_text} target={} is not decoded as replayable swap",
                     format_target(tx.to)
                 ),
                 "selector_noise_or_mev_trap" => format!(
@@ -5626,6 +5781,17 @@ fn diagnose_decode_reject(
             vec!["decode rejected after monitored token hint".to_string()]
         },
     }
+}
+
+fn is_context_only_or_helper_selector(selector: [u8; 4]) -> bool {
+    matches!(
+        selector,
+        AGGREGATOR_SELECTOR_01B7037C
+            | AGGREGATOR_SELECTOR_0A3C4405
+            | AGGREGATOR_SELECTOR_405CEC67
+            | AGGREGATOR_SELECTOR_CDD1B25D
+            | CONTEXT_WRAP_SELECTOR
+    )
 }
 
 fn diagnose_safe_exec_decode(
@@ -7186,6 +7352,86 @@ mod tests {
         assert_eq!(signal.path, vec![token_in, token_out]);
         assert_eq!(signal.decode_source, "transit_v5_v2_path_partial");
         assert!(matches!(signal.kind, SwapKind::V2));
+    }
+
+    #[test]
+    fn swap_exact_eth_for_token_selector_decodes_nested_path_partial() {
+        let router = Address::from_low_u64_be(10);
+        let token_in: Address = "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270"
+            .parse()
+            .unwrap();
+        let token_out: Address = "0xc2132d05d31c914a87c6611c10748aeb04b58e8f"
+            .parse()
+            .unwrap();
+        let amount_in = U256::from(1_000_000u64);
+        let path_bytes = [token_in.as_bytes(), token_out.as_bytes()].concat();
+        let args = encode(&[
+            Token::Uint(amount_in),
+            Token::Uint(U256::from(900_000u64)),
+            Token::Address(token_out),
+            Token::Address(Address::from_low_u64_be(99)),
+            Token::Bytes(path_bytes),
+            Token::Uint(U256::from(123u64)),
+        ]);
+        let monitored = vec![MonitoredTokenConfig {
+            address: token_in,
+            decimals: 18,
+            price_eth: 1.0,
+        }];
+
+        let signal = decode_known_aggregator_partial(
+            AGGREGATOR_SELECTOR_C3192F1F,
+            router,
+            U256::zero(),
+            &args,
+            &monitored,
+        )
+        .unwrap();
+
+        assert_eq!(signal.path, vec![token_in, token_out]);
+        assert_eq!(signal.amount_in, amount_in);
+        assert_eq!(
+            signal.decode_source,
+            "swap_exact_eth_for_token_path_partial"
+        );
+        assert!(matches!(signal.kind, SwapKind::V2));
+    }
+
+    #[test]
+    fn helper_selectors_do_not_become_partial_replay_candidates() {
+        let router = Address::from_low_u64_be(10);
+        let usdc: Address = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
+            .parse()
+            .unwrap();
+        let wpol: Address = "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270"
+            .parse()
+            .unwrap();
+        let monitored = vec![MonitoredTokenConfig {
+            address: usdc,
+            decimals: 6,
+            price_eth: 0.0004,
+        }];
+        let args = encode(&[
+            Token::Address(usdc),
+            Token::Address(wpol),
+            Token::Uint(U256::from(1_000u64)),
+        ]);
+
+        for selector in [
+            AGGREGATOR_SELECTOR_01B7037C,
+            AGGREGATOR_SELECTOR_0A3C4405,
+            AGGREGATOR_SELECTOR_405CEC67,
+            AGGREGATOR_SELECTOR_CDD1B25D,
+            CONTEXT_WRAP_SELECTOR,
+            ENTRYPOINT_HANDLE_OPS,
+        ] {
+            assert!(
+                decode_known_aggregator_partial(selector, router, U256::zero(), &args, &monitored,)
+                    .is_none(),
+                "selector {} should remain noise/helper",
+                selector_hex(selector)
+            );
+        }
     }
 
     #[test]

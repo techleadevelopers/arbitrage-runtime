@@ -107,6 +107,14 @@ struct PendingSelectorPoolPerformanceRollup {
     payload_built_count: u64,
     shadow_ev_positive_count: u64,
     shadow_ev_negative_count: u64,
+    partial_entered_payload_builder_count: u64,
+    partial_pool_discovery_attempted_count: u64,
+    partial_pool_found_count: u64,
+    partial_pool_missing_count: u64,
+    partial_shadow_ev_positive_count: u64,
+    partial_shadow_ev_negative_count: u64,
+    partial_replay_candidate_created_count: u64,
+    partial_replay_candidate_rejected_count: u64,
     expected_profit_sum: f64,
     liquidity_sum: f64,
     gas_gwei_sum: f64,
@@ -1395,6 +1403,14 @@ impl DashboardHandle {
                     payload_built_count: 0,
                     shadow_ev_positive_count: 0,
                     shadow_ev_negative_count: 0,
+                    partial_entered_payload_builder_count: 0,
+                    partial_pool_discovery_attempted_count: 0,
+                    partial_pool_found_count: 0,
+                    partial_pool_missing_count: 0,
+                    partial_shadow_ev_positive_count: 0,
+                    partial_shadow_ev_negative_count: 0,
+                    partial_replay_candidate_created_count: 0,
+                    partial_replay_candidate_rejected_count: 0,
                     expected_profit_sum: 0.0,
                     liquidity_sum: 0.0,
                     gas_gwei_sum: 0.0,
@@ -1415,6 +1431,48 @@ impl DashboardHandle {
                 "shadow_ev_negative" => {
                     entry.shadow_ev_negative_count =
                         entry.shadow_ev_negative_count.saturating_add(1)
+                }
+                "partial_entered_payload_builder" => {
+                    entry.partial_entered_payload_builder_count = entry
+                        .partial_entered_payload_builder_count
+                        .saturating_add(1)
+                }
+                "partial_pool_discovery_attempted" => {
+                    entry.partial_pool_discovery_attempted_count = entry
+                        .partial_pool_discovery_attempted_count
+                        .saturating_add(1)
+                }
+                "partial_pool_found" => {
+                    entry.partial_pool_found_count =
+                        entry.partial_pool_found_count.saturating_add(1);
+                    entry.pool_found_count = entry.pool_found_count.saturating_add(1);
+                }
+                "partial_pool_missing" => {
+                    entry.partial_pool_missing_count =
+                        entry.partial_pool_missing_count.saturating_add(1);
+                    entry.pool_missing_count = entry.pool_missing_count.saturating_add(1);
+                }
+                "partial_shadow_ev_positive" => {
+                    entry.partial_shadow_ev_positive_count =
+                        entry.partial_shadow_ev_positive_count.saturating_add(1);
+                    entry.shadow_ev_positive_count =
+                        entry.shadow_ev_positive_count.saturating_add(1);
+                }
+                "partial_shadow_ev_negative" => {
+                    entry.partial_shadow_ev_negative_count =
+                        entry.partial_shadow_ev_negative_count.saturating_add(1);
+                    entry.shadow_ev_negative_count =
+                        entry.shadow_ev_negative_count.saturating_add(1);
+                }
+                "partial_replay_candidate_created" => {
+                    entry.partial_replay_candidate_created_count = entry
+                        .partial_replay_candidate_created_count
+                        .saturating_add(1)
+                }
+                "partial_replay_candidate_rejected" => {
+                    entry.partial_replay_candidate_rejected_count = entry
+                        .partial_replay_candidate_rejected_count
+                        .saturating_add(1)
                 }
                 _ => {}
             }
@@ -1774,6 +1832,14 @@ impl DashboardHandle {
                 pool.payload_built_count,
                 pool.shadow_ev_positive_count,
                 pool.shadow_ev_negative_count,
+                pool.partial_entered_payload_builder_count,
+                pool.partial_pool_discovery_attempted_count,
+                pool.partial_pool_found_count,
+                pool.partial_pool_missing_count,
+                pool.partial_shadow_ev_positive_count,
+                pool.partial_shadow_ev_negative_count,
+                pool.partial_replay_candidate_created_count,
+                pool.partial_replay_candidate_rejected_count,
                 pool.expected_profit_sum,
                 pool.liquidity_sum,
                 pool.gas_gwei_sum,
