@@ -71,6 +71,7 @@ const AGGREGATOR_SELECTOR_9265BB9D: [u8; 4] = [0x92, 0x65, 0xbb, 0x9d];
 const AGGREGATOR_SELECTOR_C3192F1F: [u8; 4] = [0xc3, 0x19, 0x2f, 0x1f];
 const AGGREGATOR_SELECTOR_CDD1B25D: [u8; 4] = [0xcd, 0xd1, 0xb2, 0x5d];
 const AGGREGATOR_SELECTOR_F2881E21: [u8; 4] = [0xf2, 0x88, 0x1e, 0x21];
+const BALANCER_SELECTOR_46495152: [u8; 4] = [0x46, 0x49, 0x51, 0x52];
 const CONTEXT_WRAP_SELECTOR: [u8; 4] = [0x62, 0x35, 0x56, 0x38];
 const ENTRYPOINT_HANDLE_OPS: [u8; 4] = [0x76, 0x5e, 0x82, 0x7f];
 const SELECTOR_NOISE_00000008: [u8; 4] = [0x00, 0x00, 0x00, 0x08];
@@ -294,8 +295,23 @@ impl CandidateLatencyTrace {
 
 struct PendingHashTask {
     tx_hash: H256,
+    pending_tx: Option<Transaction>,
     candidate_started: Instant,
     enqueued_at: Instant,
+}
+
+enum PendingMempoolItem {
+    Hash(H256),
+    Full(Transaction),
+}
+
+impl PendingMempoolItem {
+    fn hash(&self) -> H256 {
+        match self {
+            PendingMempoolItem::Hash(hash) => *hash,
+            PendingMempoolItem::Full(tx) => tx.hash,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -623,32 +639,58 @@ pub async fn run(
 
     loop {
         tokio::select! {
-            Some(tx_hash) = tx_hash_stream.recv() => {
+            Some(mempool_item) = tx_hash_stream.recv() => {
                 let scan_started = Instant::now();
                 if dashboard.runtime_paused() {
                     continue;
                 }
+                let tx_hash = mempool_item.hash();
                 if mark_seen_tx(&mut seen_hashes, &mut seen_order, tx_hash) {
-                    dashboard.record_opportunity_funnel("pending_hashes_received");
-                    if !pending_lookup_backpressure.should_enqueue(
-                        &config,
-                        &rpc_fleet,
-                        lookup_decode_tx.capacity(),
-                        &dashboard,
-                    ) {
-                        dashboard.record_latency(
-                            "scan_cycle",
-                            elapsed_ms_ceil(scan_started),
-                            None,
-                            Some("mempool_hash_shed"),
-                        );
-                        continue;
-                    }
+                    let pending_tx = match mempool_item {
+                        PendingMempoolItem::Hash(_) => {
+                            dashboard.record_opportunity_funnel("pending_hashes_received");
+                            if !pending_lookup_backpressure.should_enqueue(
+                                &config,
+                                &rpc_fleet,
+                                lookup_decode_tx.capacity(),
+                                &dashboard,
+                            ) {
+                                dashboard.record_latency(
+                                    "scan_cycle",
+                                    elapsed_ms_ceil(scan_started),
+                                    None,
+                                    Some("mempool_hash_shed"),
+                                );
+                                continue;
+                            }
+                            None
+                        }
+                        PendingMempoolItem::Full(tx) => {
+                            dashboard.record_opportunity_funnel("pending_full_tx_received");
+                            if let Some(reason) = pre_decode_tx_gate(&config, &tx) {
+                                dashboard.record_opportunity_funnel("pre_lookup_reject");
+                                dashboard.record_reject_reason("pre_lookup_gate", reason);
+                                dashboard.record_reject_reason(
+                                    "decode_selector",
+                                    &decode_reject_selector_reason(&tx),
+                                );
+                                dashboard.record_latency(
+                                    "scan_cycle",
+                                    elapsed_ms_ceil(scan_started),
+                                    None,
+                                    Some("mempool_full_pre_lookup_reject"),
+                                );
+                                continue;
+                            }
+                            Some(tx)
+                        }
+                    };
                     let enqueue_started = Instant::now();
                     let task_started = Instant::now();
                     let send_result = lookup_decode_tx
                         .send(PendingHashTask {
                             tx_hash,
+                            pending_tx,
                             candidate_started: task_started,
                             enqueued_at: Instant::now(),
                         })
@@ -667,7 +709,7 @@ pub async fn run(
                     "scan_cycle",
                     elapsed_ms_ceil(scan_started),
                     None,
-                    Some("mempool_hash"),
+                    Some("mempool_scan"),
                 );
             }
             Some(candidate) = ready_rx.recv() => {
@@ -714,7 +756,7 @@ fn build_opportunity(
 fn connect_mempool_fan_in(
     ws_urls: &[String],
     dashboard: &DashboardHandle,
-) -> mpsc::UnboundedReceiver<H256> {
+) -> mpsc::UnboundedReceiver<PendingMempoolItem> {
     let (tx, rx) = mpsc::unbounded_channel();
     for ws_url in ws_urls.iter().cloned() {
         if is_blocked_bnb_alchemy_ws(&ws_url) {
@@ -739,14 +781,55 @@ fn connect_mempool_fan_in(
                         reconnect_failures = 0;
                         dashboard.event("info", format!("mempool ws connected {}", ws_url));
                         let provider = Provider::new(ws);
-                        let subscribe_result = provider.subscribe_pending_txs().await;
-                        match subscribe_result {
+                        if full_pending_tx_subscription_enabled() {
+                            match provider.subscribe_full_pending_txs().await {
+                                Ok(mut stream) => {
+                                    dashboard.event(
+                                        "info",
+                                        format!(
+                                            "mempool full pending tx subscription active {}",
+                                            ws_url
+                                        ),
+                                    );
+                                    while let Some(pending_tx) = stream.next().await {
+                                        if dashboard.runtime_paused() {
+                                            break;
+                                        }
+                                        if tx.send(PendingMempoolItem::Full(pending_tx)).is_err() {
+                                            return;
+                                        }
+                                    }
+                                    dashboard.event(
+                                        "warn",
+                                        format!("mempool full pending tx stream ended {}", ws_url),
+                                    );
+                                    continue;
+                                }
+                                Err(err) => {
+                                    dashboard.event(
+                                        "warn",
+                                        format!(
+                                            "mempool full pending tx subscribe failed {}; falling back to hash stream: {}",
+                                            ws_url, err
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        match provider.subscribe_pending_txs().await {
                             Ok(mut stream) => {
+                                dashboard.event(
+                                    "info",
+                                    format!(
+                                        "mempool hash pending tx subscription active {}",
+                                        ws_url
+                                    ),
+                                );
                                 while let Some(hash) = stream.next().await {
                                     if dashboard.runtime_paused() {
                                         break;
                                     }
-                                    if tx.send(hash).is_err() {
+                                    if tx.send(PendingMempoolItem::Hash(hash)).is_err() {
                                         return;
                                     }
                                 }
@@ -807,6 +890,10 @@ fn is_provider_capacity_exhausted(error: &str) -> bool {
         || lower.contains("capacity limit exceeded")
         || lower.contains("quota exceeded")
         || lower.contains("billing")
+}
+
+fn full_pending_tx_subscription_enabled() -> bool {
+    env_bool("MEV_FULL_PENDING_TX_ENABLED", true)
 }
 
 fn mempool_ws_reconnect_delay(ws_url: &str, failures: u32) -> Duration {
@@ -909,21 +996,38 @@ async fn process_lookup_decode_task(
 ) -> Option<LookupDecodedCandidate> {
     let mut latency_trace = CandidateLatencyTrace::default();
     let lookup_started = Instant::now();
-    let Some(tx) = lookup_pending_tx_parallel(rpc_fleet.clone(), task.tx_hash).await else {
-        dashboard.record_opportunity_funnel("tx_lookup_miss");
-        return None;
-    };
-    dashboard.record_opportunity_funnel("tx_lookup_success");
-    latency_trace.lookup_pending_tx_us = Some(elapsed_us(lookup_started));
+    let tx = if let Some(tx) = task.pending_tx {
+        dashboard.record_opportunity_funnel("tx_lookup_skipped_full_pending");
+        latency_trace.lookup_pending_tx_us = Some(0);
+        dashboard.record_latency("fee_pending_lookup", 0, None, Some("full_pending_tx"));
+        tx
+    } else {
+        let Some(tx) = lookup_pending_tx_parallel(rpc_fleet.clone(), task.tx_hash).await else {
+            dashboard.record_opportunity_funnel("tx_lookup_miss");
+            return None;
+        };
+        dashboard.record_opportunity_funnel("tx_lookup_success");
+        latency_trace.lookup_pending_tx_us = Some(elapsed_us(lookup_started));
 
-    dashboard.record_latency(
-        "fee_pending_lookup",
-        lookup_started.elapsed().as_millis(),
-        None,
-        None,
-    );
-    if let Ok(mut model) = adaptive.lock() {
-        model.observe_lookup_latency(lookup_started.elapsed().as_millis() as f64);
+        dashboard.record_latency(
+            "fee_pending_lookup",
+            lookup_started.elapsed().as_millis(),
+            None,
+            None,
+        );
+        if let Ok(mut model) = adaptive.lock() {
+            model.observe_lookup_latency(lookup_started.elapsed().as_millis() as f64);
+        }
+        tx
+    };
+
+    if let Some(reason) = pre_decode_tx_gate(&config, &tx) {
+        latency_trace.total_internal_us = Some(elapsed_us(task.candidate_started));
+        dashboard.record_opportunity_funnel("decode_reject");
+        dashboard.record_reject_reason("pre_decode_gate", reason);
+        dashboard.record_reject_reason("decode_selector", &decode_reject_selector_reason(&tx));
+        latency_trace.emit(&config, &dashboard, task.tx_hash, "reject", reason);
+        return None;
     }
 
     let decode_started = Instant::now();
@@ -4705,8 +4809,7 @@ fn decode_known_aggregator_partial(
         | AGGREGATOR_SELECTOR_0A2B8F36
         | AGGREGATOR_SELECTOR_0060EA13
         | AGGREGATOR_SELECTOR_448E340E
-        | AGGREGATOR_SELECTOR_9265BB9D
-        | AGGREGATOR_SELECTOR_F2881E21 => decode_partial_swap_from_monitored_tokens(
+        | AGGREGATOR_SELECTOR_9265BB9D => decode_partial_swap_from_monitored_tokens(
             selector,
             router,
             value,
@@ -5428,6 +5531,48 @@ fn decode_reject_selector_reason(tx: &Transaction) -> String {
     )
 }
 
+fn pre_decode_tx_gate(config: &Config, tx: &Transaction) -> Option<&'static str> {
+    pre_decode_tx_gate_with_cap(tx, config.mev.max_gas_price_gwei)
+}
+
+fn pre_decode_tx_gate_with_cap(
+    tx: &Transaction,
+    max_gas_price_gwei: Option<u64>,
+) -> Option<&'static str> {
+    let selector = selector(tx)?;
+    if is_account_abstraction_target(tx.to) || selector == ENTRYPOINT_HANDLE_OPS {
+        return Some("account_abstraction_noise");
+    }
+    if selector == CONTEXT_WRAP_SELECTOR {
+        return Some("context_command_not_swap");
+    }
+    if is_context_only_or_helper_selector(selector) {
+        return Some("router_helper_or_context_only");
+    }
+    if selector == SELECTOR_NOISE_00000008 {
+        return Some("selector_noise_or_mev_trap");
+    }
+
+    let gas_price = tx.max_fee_per_gas.or(tx.gas_price).unwrap_or_default();
+    if gas_price.is_zero() {
+        return Some("zero_gas_price");
+    }
+
+    if let Some(max_gas_price_gwei) = max_gas_price_gwei {
+        let multiplier = std::env::var("MEV_PRE_DECODE_GAS_CAP_MULTIPLIER")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 1.0)
+            .unwrap_or(2.0);
+        let cap_gwei = max_gas_price_gwei as f64 * multiplier;
+        if wei_to_gwei_f64(gas_price) > cap_gwei {
+            return Some("victim_gas_price_above_pre_decode_cap");
+        }
+    }
+
+    None
+}
+
 fn aggregator_name_from_tx(tx: &Transaction) -> Option<&'static str> {
     match selector(tx)? {
         UNIVERSAL_ROUTER_EXECUTE | UNIVERSAL_ROUTER_EXECUTE_NO_DEADLINE => Some("universal_router"),
@@ -5594,7 +5739,7 @@ fn diagnose_decode_reject(
             | AGGREGATOR_SELECTOR_448E340E
             | AGGREGATOR_SELECTOR_9265BB9D
             | AGGREGATOR_SELECTOR_C3192F1F
-            | AGGREGATOR_SELECTOR_F2881E21
+            | BALANCER_SELECTOR_46495152
     );
 
     if matches!(
@@ -5699,6 +5844,10 @@ fn diagnose_decode_reject(
         return diagnose_safe_exec_decode(tx, tx_hash, selector_text.as_str(), path_hint);
     }
 
+    if selector == BALANCER_SELECTOR_46495152 {
+        return diagnose_balancer_decode(tx, tx_hash, selector_text.as_str(), path_hint);
+    }
+
     if let Some(diagnostic) = diagnose_direct_router_decode(
         config,
         tx,
@@ -5783,6 +5932,43 @@ fn diagnose_decode_reject(
     }
 }
 
+fn diagnose_balancer_decode(
+    tx: &Transaction,
+    tx_hash: H256,
+    selector_text: &str,
+    path_hint: Vec<String>,
+) -> DecodeRejectDiagnostic {
+    let input = tx.input.as_ref();
+    let balancer_vault = "0xba12222222228d8ba445958a75a0704d566bf2c8"
+        .parse::<Address>()
+        .ok();
+    let vault_hint = balancer_vault
+        .filter(|vault| input_contains_address(input, *vault))
+        .map(|vault| format!("{vault:?}"))
+        .unwrap_or_else(|| "not_in_calldata".to_string());
+    DecodeRejectDiagnostic {
+        reason: "balancer_pool_type_unsupported",
+        detail: format!(
+            "tx={} selector={} to={} vault_hint={} monitored_token_hint={} input_bytes={} calldata_prefix={}",
+            short_hash(tx_hash),
+            selector_text,
+            format_target(tx.to),
+            vault_hint,
+            if path_hint.is_empty() {
+                "none".to_string()
+            } else {
+                path_hint.join(",")
+            },
+            input.len(),
+            calldata_prefix_hex(input)
+        ),
+        hints: vec![
+            "Balancer route detected; current payload builder only supports V2/V3 factory pool discovery".to_string(),
+            "blocked before pool discovery to avoid false Uniswap pair paths".to_string(),
+        ],
+    }
+}
+
 fn is_context_only_or_helper_selector(selector: [u8; 4]) -> bool {
     matches!(
         selector,
@@ -5790,6 +5976,7 @@ fn is_context_only_or_helper_selector(selector: [u8; 4]) -> bool {
             | AGGREGATOR_SELECTOR_0A3C4405
             | AGGREGATOR_SELECTOR_405CEC67
             | AGGREGATOR_SELECTOR_CDD1B25D
+            | AGGREGATOR_SELECTOR_F2881E21
             | CONTEXT_WRAP_SELECTOR
     )
 }
@@ -6792,6 +6979,10 @@ fn monitored_token_addresses_in_input(
         .collect()
 }
 
+fn input_contains_address(input: &[u8], address: Address) -> bool {
+    input.windows(20).any(|window| window == address.as_bytes())
+}
+
 fn amount_hint_from_calldata(input: &[u8]) -> Option<U256> {
     let min = U256::from(10_000u64);
     let max = U256::from_dec_str("1000000000000000000000000000000").ok()?;
@@ -7047,6 +7238,9 @@ fn spawn_historical_profile_refresher(
 mod tests {
     use super::*;
     use ethers::abi::encode;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn adaptive_gas_cap_allows_positive_two_cent_edge_near_hard_cap() {
@@ -7422,6 +7616,7 @@ mod tests {
             AGGREGATOR_SELECTOR_0A3C4405,
             AGGREGATOR_SELECTOR_405CEC67,
             AGGREGATOR_SELECTOR_CDD1B25D,
+            AGGREGATOR_SELECTOR_F2881E21,
             CONTEXT_WRAP_SELECTOR,
             ENTRYPOINT_HANDLE_OPS,
         ] {
@@ -7432,6 +7627,106 @@ mod tests {
                 selector_hex(selector)
             );
         }
+    }
+
+    #[test]
+    fn pre_decode_gate_rejects_helper_noise_and_extreme_gas_before_decode() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("MEV_PRE_DECODE_GAS_CAP_MULTIPLIER", "2");
+        }
+
+        let helper_tx = Transaction {
+            input: CONTEXT_WRAP_SELECTOR.to_vec().into(),
+            gas_price: Some(U256::from(50_000_000_000u64)),
+            ..Default::default()
+        };
+        assert_eq!(
+            pre_decode_tx_gate_with_cap(&helper_tx, Some(100)),
+            Some("context_command_not_swap")
+        );
+
+        let noisy_tx = Transaction {
+            input: SELECTOR_NOISE_00000008.to_vec().into(),
+            gas_price: Some(U256::from(50_000_000_000u64)),
+            ..Default::default()
+        };
+        assert_eq!(
+            pre_decode_tx_gate_with_cap(&noisy_tx, Some(100)),
+            Some("selector_noise_or_mev_trap")
+        );
+
+        let expensive_swap_tx = Transaction {
+            input: SWAP_EXACT_TOKENS_FOR_TOKENS.to_vec().into(),
+            gas_price: Some(U256::from(250_000_000_000u64)),
+            ..Default::default()
+        };
+        assert_eq!(
+            pre_decode_tx_gate_with_cap(&expensive_swap_tx, Some(100)),
+            Some("victim_gas_price_above_pre_decode_cap")
+        );
+
+        let normal_swap_tx = Transaction {
+            input: SWAP_EXACT_TOKENS_FOR_TOKENS.to_vec().into(),
+            gas_price: Some(U256::from(50_000_000_000u64)),
+            ..Default::default()
+        };
+        assert_eq!(
+            pre_decode_tx_gate_with_cap(&normal_swap_tx, Some(100)),
+            None
+        );
+
+        unsafe {
+            std::env::remove_var("MEV_PRE_DECODE_GAS_CAP_MULTIPLIER");
+        }
+    }
+
+    #[test]
+    fn balancer_selector_is_classified_without_pool_discovery() {
+        let target: Address = "0x26b5e0e5de9195f3358c6fa8ba6c3686a3333b64"
+            .parse()
+            .unwrap();
+        let vault: Address = "0xba12222222228d8ba445958a75a0704d566bf2c8"
+            .parse()
+            .unwrap();
+        let usdc: Address = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
+            .parse()
+            .unwrap();
+        let wpol: Address = "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270"
+            .parse()
+            .unwrap();
+        let calldata = [
+            BALANCER_SELECTOR_46495152.to_vec(),
+            encode(&[
+                Token::Address(vault),
+                Token::Address(usdc),
+                Token::Address(wpol),
+                Token::Uint(U256::from(1_000_000u64)),
+            ]),
+        ]
+        .concat();
+        let tx = Transaction {
+            hash: H256::from_low_u64_be(1),
+            to: Some(target),
+            input: calldata.into(),
+            ..Default::default()
+        };
+
+        let diagnostic = diagnose_balancer_decode(
+            &tx,
+            tx.hash,
+            "0x46495152",
+            vec![format!("{usdc:?}"), format!("{wpol:?}")],
+        );
+
+        assert_eq!(diagnostic.reason, "balancer_pool_type_unsupported");
+        assert!(diagnostic
+            .detail
+            .contains("0xba12222222228d8ba445958a75a0704d566bf2c8"));
+        assert!(diagnostic
+            .hints
+            .iter()
+            .any(|hint| hint.contains("blocked before pool discovery")));
     }
 
     #[test]

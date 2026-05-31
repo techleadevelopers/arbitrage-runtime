@@ -3182,6 +3182,8 @@ fn build_selector_pool_performance_snapshot(
         "evolve_decoder"
     } else if payload_built > 0 {
         "pool_real_payload_ready"
+    } else if pool_found > 0 && shadow_ev_negative > 0 {
+        "pool_real_no_edge"
     } else if pool_found > 0 && pool_missing == 0 {
         "pool_real_watch"
     } else if pool_missing > pool_found {
