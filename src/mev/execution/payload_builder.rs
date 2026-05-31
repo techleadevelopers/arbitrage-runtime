@@ -136,7 +136,12 @@ impl PayloadBuilder {
             input.token_out,
             input.victim_amount_in,
         )
-        .ok_or_else(|| "victim post-swap simulation failed".to_string())?;
+        .ok_or_else(|| {
+            format!(
+                "victim post-swap simulation failed token_in={:?} token_out={:?} amount_in={} pair={:?} state_before={:?}",
+                input.token_in, input.token_out, input.victim_amount_in, input.pair, input.state_before
+            )
+        })?;
 
         let AmmState::UniswapV2(pool_after) = post_victim.state_after else {
             return Err("v2 payload requires UniswapV2 simulated state".to_string());
@@ -386,7 +391,12 @@ impl PayloadBuilder {
             input.token_out,
             input.victim_amount_in,
         )
-        .ok_or_else(|| "victim post-swap simulation failed".to_string())?;
+        .ok_or_else(|| {
+            format!(
+                "victim post-swap simulation failed token_in={:?} token_out={:?} amount_in={} pool={:?} state_before={:?}",
+                input.token_in, input.token_out, input.victim_amount_in, input.pair, input.state_before
+            )
+        })?;
 
         let AmmState::UniswapV3(pool_after) = post_victim.state_after else {
             return Err("v3 payload requires UniswapV3 simulated state".to_string());

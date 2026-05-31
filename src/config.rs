@@ -787,9 +787,13 @@ fn parse_mempool_ws_urls(
             "MEMPOOL_WS_URL_POLYGON_2",
             "MEMPOOL_WS_URL_POLYGON_3",
             "MEMPOOL_WS_URL_POLYGON_4",
+            "MEMPOOL_WS_URL_POLYGON_5",
+            "MEMPOOL_WS_URL_POLYGON_6",
             "MEMPOOL_WS_URL_POLYGON2",
             "MEMPOOL_WS_URL_POLYGON3",
             "MEMPOOL_WS_URL_POLYGON4",
+            "MEMPOOL_WS_URL_POLYGON5",
+            "MEMPOOL_WS_URL_POLYGON6",
         ],
     ) {
         if let Ok(value) = env::var(key) {
@@ -841,6 +845,8 @@ fn parse_rpc_urls(network: &str) -> Vec<(String, String)> {
             "RPC_URL_POLYGON_2",
             "RPC_URL_POLYGON_3",
             "RPC_URL_POLYGON_4",
+            "RPC_URL_POLYGON_5",
+            "RPC_URL_POLYGON_6",
             "RPC_URL_ETHEREUM",
             "RPC_URL_ARBITRUM",
         ],
@@ -859,6 +865,8 @@ fn parse_rpc_urls(network: &str) -> Vec<(String, String)> {
             "GETBLOCK_RPC_URL_POLYGON_2",
             "GETBLOCK_RPC_URL_POLYGON_3",
             "GETBLOCK_RPC_URL_POLYGON_4",
+            "GETBLOCK_RPC_URL_POLYGON_5",
+            "GETBLOCK_RPC_URL_POLYGON_6",
             "GETBLOCK_RPC_URL_ETHEREUM",
             "GETBLOCK_RPC_URL_ARBITRUM",
             "GETBLOCK_BSC",
@@ -867,6 +875,8 @@ fn parse_rpc_urls(network: &str) -> Vec<(String, String)> {
             "GETBLOCK_POLYGON_2",
             "GETBLOCK_POLYGON_3",
             "GETBLOCK_POLYGON_4",
+            "GETBLOCK_POLYGON_5",
+            "GETBLOCK_POLYGON_6",
             "GETBLOCK_ETHEREUM",
             "GETBLOCK_ARBITRUM",
         ],
@@ -1370,6 +1380,124 @@ mod tests {
             env::remove_var("MEMPOOL_WS_URL_POLYGON");
             env::remove_var("MEMPOOL_WS_URL_POLYGON_2");
             env::remove_var("MEMPOOL_WS_URL_POLYGON3");
+        }
+    }
+
+    #[test]
+    fn polygon_rpc_accepts_six_numbered_urls() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            for key in [
+                "RPC_URL",
+                "RPC_URL_2",
+                "RPC_URL_3",
+                "RPC_URL_4",
+                "RPC_URL_POLYGON",
+                "RPC_URL_POLYGON_2",
+                "RPC_URL_POLYGON_3",
+                "RPC_URL_POLYGON_4",
+                "RPC_URL_POLYGON_5",
+                "RPC_URL_POLYGON_6",
+                "GETBLOCK_RPC_URL_POLYGON",
+                "GETBLOCK_RPC_URL_POLYGON_2",
+                "GETBLOCK_RPC_URL_POLYGON_3",
+                "GETBLOCK_RPC_URL_POLYGON_4",
+                "GETBLOCK_RPC_URL_POLYGON_5",
+                "GETBLOCK_RPC_URL_POLYGON_6",
+            ] {
+                env::remove_var(key);
+            }
+            for idx in 1..=6 {
+                let key = if idx == 1 {
+                    "RPC_URL_POLYGON".to_string()
+                } else {
+                    format!("RPC_URL_POLYGON_{idx}")
+                };
+                env::set_var(key, format!("https://polygon-rpc-{idx}.example"));
+            }
+        }
+
+        let urls = parse_rpc_urls("polygon");
+
+        assert_eq!(urls.len(), 6);
+        assert_eq!(
+            urls[0],
+            (
+                "rpc-1".to_string(),
+                "https://polygon-rpc-1.example".to_string()
+            )
+        );
+        assert_eq!(
+            urls[5],
+            (
+                "rpc-6".to_string(),
+                "https://polygon-rpc-6.example".to_string()
+            )
+        );
+
+        unsafe {
+            for idx in 1..=6 {
+                let key = if idx == 1 {
+                    "RPC_URL_POLYGON".to_string()
+                } else {
+                    format!("RPC_URL_POLYGON_{idx}")
+                };
+                env::remove_var(key);
+            }
+        }
+    }
+
+    #[test]
+    fn polygon_mempool_ws_accepts_four_underscored_urls() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            for key in [
+                "MEMPOOL_WS_URL",
+                "MEMPOOL_WS_URL_2",
+                "MEMPOOL_WS_URL_3",
+                "MEMPOOL_WS_URL_4",
+                "MEMPOOL_WS_URL_POLYGON",
+                "MEMPOOL_WS_URL_POLYGON_2",
+                "MEMPOOL_WS_URL_POLYGON_3",
+                "MEMPOOL_WS_URL_POLYGON_4",
+                "MEMPOOL_WS_URL_POLYGON2",
+                "MEMPOOL_WS_URL_POLYGON3",
+                "MEMPOOL_WS_URL_POLYGON4",
+                "MEMPOOL_WS_DISABLE_DEFAULT_ALCHEMY",
+            ] {
+                env::remove_var(key);
+            }
+            for idx in 1..=4 {
+                let key = if idx == 1 {
+                    "MEMPOOL_WS_URL_POLYGON".to_string()
+                } else {
+                    format!("MEMPOOL_WS_URL_POLYGON_{idx}")
+                };
+                env::set_var(key, format!("wss://polygon-ws-{idx}.example"));
+            }
+        }
+
+        let urls = parse_mempool_ws_urls("polygon", false, &[]);
+
+        assert_eq!(
+            urls,
+            vec![
+                "wss://polygon-ws-1.example".to_string(),
+                "wss://polygon-ws-2.example".to_string(),
+                "wss://polygon-ws-3.example".to_string(),
+                "wss://polygon-ws-4.example".to_string(),
+            ]
+        );
+
+        unsafe {
+            for idx in 1..=4 {
+                let key = if idx == 1 {
+                    "MEMPOOL_WS_URL_POLYGON".to_string()
+                } else {
+                    format!("MEMPOOL_WS_URL_POLYGON_{idx}")
+                };
+                env::remove_var(key);
+            }
         }
     }
 

@@ -23,6 +23,7 @@ use chrono::Timelike;
 use ethers::abi::{self, ParamType, Token};
 use ethers::providers::{Middleware, Provider, StreamExt, Ws};
 use ethers::types::{Address, Transaction, H256, U256};
+use serde_json::json;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, OnceLock};
@@ -782,6 +783,53 @@ fn connect_mempool_fan_in(
                         dashboard.event("info", format!("mempool ws connected {}", ws_url));
                         let provider = Provider::new(ws);
                         if full_pending_tx_subscription_enabled() {
+                            if is_alchemy_ws(&ws_url) {
+                                let params = vec![
+                                    json!("alchemy_pendingTransactions"),
+                                    json!({ "hashesOnly": false }),
+                                ];
+                                let alchemy_subscribe_result =
+                                    provider.subscribe::<_, Transaction>(params).await;
+                                match alchemy_subscribe_result {
+                                    Ok(mut stream) => {
+                                        dashboard.event(
+                                            "info",
+                                            format!(
+                                                "alchemy full pending tx subscription active {}",
+                                                ws_url
+                                            ),
+                                        );
+                                        while let Some(pending_tx) = stream.next().await {
+                                            if dashboard.runtime_paused() {
+                                                break;
+                                            }
+                                            if tx
+                                                .send(PendingMempoolItem::Full(pending_tx))
+                                                .is_err()
+                                            {
+                                                return;
+                                            }
+                                        }
+                                        dashboard.event(
+                                            "warn",
+                                            format!(
+                                                "alchemy full pending tx stream ended {}",
+                                                ws_url
+                                            ),
+                                        );
+                                        continue;
+                                    }
+                                    Err(err) => {
+                                        dashboard.event(
+                                            "warn",
+                                            format!(
+                                                "alchemy full pending tx subscribe failed {}; trying generic full pending: {}",
+                                                ws_url, err
+                                            ),
+                                        );
+                                    }
+                                };
+                            }
                             match provider.subscribe_full_pending_txs().await {
                                 Ok(mut stream) => {
                                     dashboard.event(
@@ -816,7 +864,8 @@ fn connect_mempool_fan_in(
                                 }
                             }
                         }
-                        match provider.subscribe_pending_txs().await {
+                        let subscribe_result = provider.subscribe_pending_txs().await;
+                        match subscribe_result {
                             Ok(mut stream) => {
                                 dashboard.event(
                                     "info",
@@ -843,7 +892,7 @@ fn connect_mempool_fan_in(
                                     format!("mempool ws subscribe failed {}: {}", ws_url, err),
                                 );
                             }
-                        }
+                        };
                     }
                     Err(err) => {
                         reconnect_failures = reconnect_failures.saturating_add(1);
@@ -920,6 +969,10 @@ fn is_blocked_bnb_alchemy_ws(url: &str) -> bool {
     let normalized = url.to_ascii_lowercase();
     normalized.starts_with("wss://bnb-mainnet.g.alchemy.com/")
         || normalized.starts_with("wss://bnb-mainnet.g.alchemy.com:")
+}
+
+fn is_alchemy_ws(url: &str) -> bool {
+    url.to_ascii_lowercase().contains(".alchemy.com/")
 }
 
 fn mark_seen_tx(
@@ -2944,7 +2997,18 @@ async fn build_payload_with_fallback_parallel(
     block_number: u64,          // NOVO
 ) -> Result<ExecutionPayload, String> {
     let mut join_set = JoinSet::new();
-    for handle in rpc_fleet.read_candidates(payload_build_fanout(&config)) {
+    let handles = rpc_fleet.read_candidates(payload_build_fanout(&config));
+    if handles.is_empty() {
+        return Err(format!(
+            "payload_builder_no_rpc_read_candidates route_kind={} amount_in={} path={} block={}",
+            signal_route_kind_label(&signal),
+            signal.amount_in,
+            signal_path_label(&signal),
+            block_number
+        ));
+    }
+
+    for handle in handles {
         let rpc_fleet = rpc_fleet.clone();
         let provider = handle.provider.clone();
         let signal = signal.clone();
@@ -2971,7 +3035,13 @@ async fn build_payload_with_fallback_parallel(
                 }
                 Err(err) => {
                     rpc_fleet.record_failure(handle.id, RpcFleet::classify_failure(&err));
-                    Err(err)
+                    Err(format!(
+                        "rpc={} route_kind={} block={} {}",
+                        handle.name,
+                        signal_route_kind_label(&signal),
+                        block_number,
+                        err
+                    ))
                 }
             }
         });
@@ -2988,7 +3058,38 @@ async fn build_payload_with_fallback_parallel(
             Err(err) => errors.push(err.to_string()),
         }
     }
-    Err(compact_payload_errors(errors))
+    if errors.is_empty() {
+        Err(format!(
+            "payload_builder_no_result route_kind={} amount_in={} path={} block={}",
+            signal_route_kind_label(&signal),
+            signal.amount_in,
+            signal_path_label(&signal),
+            block_number
+        ))
+    } else {
+        Err(compact_payload_errors(errors))
+    }
+}
+
+fn signal_route_kind_label(signal: &SwapSignal) -> String {
+    match &signal.kind {
+        SwapKind::V2 => "v2".to_string(),
+        SwapKind::V3 { fee_tier, .. } => format!("v3 fee_tier={fee_tier}"),
+    }
+}
+
+fn signal_path_label(signal: &SwapSignal) -> String {
+    let path = signal
+        .path
+        .iter()
+        .map(|address| format!("{address:?}"))
+        .collect::<Vec<_>>()
+        .join(">");
+    if path.is_empty() {
+        "unknown".to_string()
+    } else {
+        path
+    }
 }
 
 fn payload_build_fanout(config: &Config) -> usize {
@@ -3039,8 +3140,21 @@ fn human_payload_error(error: &str) -> String {
         "factory not configured"
     } else if lower.contains("pair not found") || lower.contains("pool not found") {
         "pool not found"
-    } else if lower.contains("failed to fetch pool state") {
+    } else if lower.contains("failed to fetch pool state")
+        || lower.contains("pool_state_unavailable")
+    {
         "pool state unavailable"
+    } else if lower.contains("pool_token_mismatch") {
+        "pool token mismatch"
+    } else if lower.contains("zero_reserves")
+        || lower.contains("empty_liquidity")
+        || lower.contains("liquidity_or_price")
+    {
+        "pool has no usable liquidity"
+    } else if lower.contains("payload_builder_no_rpc_read_candidates") {
+        "no RPC builder available"
+    } else if lower.contains("payload_builder_no_result") {
+        "payload builder returned no result"
     } else if lower.contains("no positive gross") {
         "no exploitable micro edge"
     } else if lower.contains("no roi-positive") {
@@ -3090,8 +3204,20 @@ fn payload_error_detail(error: &str, signal: &SwapSignal) -> String {
         || lower.contains("reverse path")
     {
         "path_inverted_or_pool_token_mismatch"
-    } else if lower.contains("failed to fetch pool state") {
+    } else if lower.contains("failed to fetch pool state")
+        || lower.contains("pool_state_unavailable")
+    {
         "pool_state_unavailable"
+    } else if lower.contains("pool_token_mismatch") {
+        "path_inverted_or_pool_token_mismatch"
+    } else if lower.contains("zero_reserves") {
+        "pool_real_zero_reserves"
+    } else if lower.contains("empty_liquidity") || lower.contains("liquidity_or_price") {
+        "pool_real_no_liquidity"
+    } else if lower.contains("payload_builder_no_rpc_read_candidates") {
+        "payload_builder_no_rpc_read_candidates"
+    } else if lower.contains("payload_builder_no_result") {
+        "payload_builder_no_result"
     } else if lower.contains("victim price impact too high") {
         "victim_price_impact_too_high"
     } else if lower.contains("no positive gross") {
@@ -3117,7 +3243,7 @@ fn payload_error_detail(error: &str, signal: &SwapSignal) -> String {
         } else {
             path
         },
-        compact_text(&clean_error, 120)
+        compact_text(&clean_error, 240)
     )
 }
 
@@ -3932,7 +4058,28 @@ pub(crate) async fn build_v2_payload<M: Middleware + 'static>(
     let cached_pool = pool_cache
         .get_or_fetch_v2(pair, provider.clone(), block_number)
         .await
-        .ok_or_else(|| "failed to fetch pool state".to_string())?;
+        .ok_or_else(|| {
+            format!(
+                "v2_pool_state_unavailable pair={pair:?} factory={factory:?} token_in={token_in:?} token_out={token_out:?} block={block_number}"
+            )
+        })?;
+
+    if !pool_tokens_match(cached_pool.token0, cached_pool.token1, token_in, token_out) {
+        return Err(format!(
+            "v2_pool_token_mismatch pair={pair:?} factory={factory:?} pool_token0={:?} pool_token1={:?} signal_token_in={token_in:?} signal_token_out={token_out:?}",
+            cached_pool.token0, cached_pool.token1
+        ));
+    }
+
+    if cached_pool.reserve0.is_zero() || cached_pool.reserve1.is_zero() {
+        return Err(format!(
+            "v2_zero_reserves pair={pair:?} factory={factory:?} token0={:?} token1={:?} reserve0={} reserve1={} signal_token_in={token_in:?} signal_token_out={token_out:?}",
+            cached_pool.token0,
+            cached_pool.token1,
+            cached_pool.reserve0,
+            cached_pool.reserve1
+        ));
+    }
 
     let pool = V2PoolState {
         pair,
@@ -4427,7 +4574,28 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
     let cached_pool = pool_cache
         .get_or_fetch_v3(pool, provider.clone(), block_number)
         .await
-        .ok_or_else(|| "failed to fetch v3 pool state".to_string())?;
+        .ok_or_else(|| {
+            format!(
+                "v3_pool_state_unavailable pool={pool:?} factory={factory:?} fee_tier={discovered_fee_tier} token_in={token_in:?} token_out={token_out:?} block={block_number}"
+            )
+        })?;
+
+    if !pool_tokens_match(cached_pool.token0, cached_pool.token1, token_in, token_out) {
+        return Err(format!(
+            "v3_pool_token_mismatch pool={pool:?} factory={factory:?} fee_tier={discovered_fee_tier} pool_token0={:?} pool_token1={:?} signal_token_in={token_in:?} signal_token_out={token_out:?}",
+            cached_pool.token0, cached_pool.token1
+        ));
+    }
+
+    if cached_pool.liquidity.is_zero() || cached_pool.sqrt_price_x96.is_zero() {
+        return Err(format!(
+            "v3_empty_liquidity_or_price pool={pool:?} factory={factory:?} fee_tier={discovered_fee_tier} token0={:?} token1={:?} liquidity={} sqrt_price_x96={} signal_token_in={token_in:?} signal_token_out={token_out:?}",
+            cached_pool.token0,
+            cached_pool.token1,
+            cached_pool.liquidity,
+            cached_pool.sqrt_price_x96
+        ));
+    }
 
     let state = V3PoolState {
         pool,
@@ -4501,6 +4669,16 @@ pub(crate) async fn build_v3_payload<M: Middleware + 'static>(
             v2_swap_pools: Vec::new(),
         },
     )
+}
+
+fn pool_tokens_match(
+    pool_token0: Address,
+    pool_token1: Address,
+    token_in: Address,
+    token_out: Address,
+) -> bool {
+    (pool_token0 == token_in && pool_token1 == token_out)
+        || (pool_token0 == token_out && pool_token1 == token_in)
 }
 
 pub(crate) fn decode_relevant_swap(
@@ -7679,6 +7857,36 @@ mod tests {
         unsafe {
             std::env::remove_var("MEV_PRE_DECODE_GAS_CAP_MULTIPLIER");
         }
+    }
+
+    #[test]
+    fn payload_error_detail_classifies_real_pool_failures() {
+        let signal = SwapSignal {
+            selector: SWAP_EXACT_TOKENS_FOR_TOKENS,
+            amount_in: U256::from(1_000u64),
+            amount_out_min: None,
+            notional_wei: U256::from(1_000u64),
+            path: vec![Address::from_low_u64_be(1), Address::from_low_u64_be(2)],
+            router: Address::from_low_u64_be(3),
+            kind: SwapKind::V2,
+            decode_confidence: 1.0,
+            decode_source: "test",
+        };
+
+        let token_mismatch = payload_error_detail(
+            "v2_pool_token_mismatch pair=0x0000000000000000000000000000000000000004",
+            &signal,
+        );
+        assert!(token_mismatch.starts_with("path_inverted_or_pool_token_mismatch"));
+
+        let zero_reserves = payload_error_detail(
+            "v2_zero_reserves pair=0x0000000000000000000000000000000000000004 reserve0=0 reserve1=123",
+            &signal,
+        );
+        assert!(zero_reserves.starts_with("pool_real_zero_reserves"));
+
+        let no_rpc = payload_error_detail("payload_builder_no_rpc_read_candidates", &signal);
+        assert!(no_rpc.starts_with("payload_builder_no_rpc_read_candidates"));
     }
 
     #[test]
