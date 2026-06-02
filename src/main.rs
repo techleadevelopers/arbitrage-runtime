@@ -404,5 +404,5 @@ fn executor_buffer_status(config: &Config, balance_eth: f64) -> &'static str {
 }
 
 fn wei_to_eth_f64(value: U256) -> f64 {
-    value.as_u128() as f64 / 1e18
+    value.to_string().parse::<f64>().unwrap_or(0.0) / 1e18
 }

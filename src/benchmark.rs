@@ -413,7 +413,7 @@ async fn benchmark_bundle_submission(
             let flashbots =
                 FlashbotsMiddleware::new(flashbots_client, relay_url.clone(), relay_signer.clone());
             let bundle = BundleRequest::new()
-                .set_block(latest_block + 1)
+                .set_block(U64::from(latest_block.as_u64().saturating_add(1)))
                 .push_transaction(signed_tx);
 
             flashbots

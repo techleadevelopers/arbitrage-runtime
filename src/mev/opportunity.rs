@@ -29,7 +29,10 @@ pub fn roi_bps(profit_wei: U256, cost_wei: U256) -> u64 {
     if cost_wei.is_zero() {
         return 0;
     }
-    let profit = profit_wei.as_u128() as f64;
-    let cost = cost_wei.as_u128() as f64;
-    ((profit / cost) * 10_000.0) as u64
+    let profit = profit_wei.to_string().parse::<f64>().unwrap_or(0.0);
+    let cost = cost_wei.to_string().parse::<f64>().unwrap_or(0.0);
+    if !profit.is_finite() || !cost.is_finite() || cost <= 0.0 {
+        return 0;
+    }
+    ((profit / cost) * 10_000.0).min(u64::MAX as f64) as u64
 }

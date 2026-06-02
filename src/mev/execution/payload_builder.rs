@@ -1048,7 +1048,7 @@ fn v2_repayment_amount_in_profit_token(
     if denominator.is_zero() {
         None
     } else {
-        Some(numerator / denominator + U256::from(1u64))
+        Some((numerator / denominator).saturating_add(U256::one()))
     }
 }
 

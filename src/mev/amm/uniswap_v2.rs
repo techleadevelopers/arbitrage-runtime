@@ -216,7 +216,11 @@ fn sizing_score(
     context_priority_score: f64,
     context_toxicity_score: f64,
 ) -> f64 {
-    let net_profit = candidate.net_profit_wei.as_u128() as f64;
+    let net_profit = candidate
+        .net_profit_wei
+        .to_string()
+        .parse::<f64>()
+        .unwrap_or(0.0);
     let roi_component = candidate.roi_bps as f64 / 10_000.0;
     let size_component = candidate.capital_fraction_bps as f64 / 10_000.0;
     let slippage_penalty = candidate.self_slippage_bps as f64 / 10_000.0;

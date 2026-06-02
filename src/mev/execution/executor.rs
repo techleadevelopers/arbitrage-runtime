@@ -304,7 +304,7 @@ impl ExecutionEngine {
             );
             return Ok(());
         }
-        let target_block = (send_context.block + 1).as_u64();
+        let target_block = send_context.block.as_u64().saturating_add(1);
         let cluster = ClusterKey {
             router: opportunity.router,
             token_in: opportunity.token_in,
@@ -1586,7 +1586,8 @@ impl ExecutionEngine {
         opportunity: &MevOpportunity,
         payload: &crate::mev::execution::payload_builder::ExecutionPayload,
     ) -> BundleRequest {
-        let mut bundle = BundleRequest::new().set_block(block + 1);
+        let mut bundle =
+            BundleRequest::new().set_block(U64::from(block.as_u64().saturating_add(1)));
         if let Some(victim) = opportunity.victim_transaction.clone() {
             bundle = bundle.push_revertible_transaction(victim);
         }
