@@ -2,7 +2,7 @@
 
 // Arquivo: src/mev/execution/payload_builder.rs
 
-use crate::config::{Config, OpportunityMode};
+use crate::config::{Config, MonitoredTokenConfig, OpportunityMode};
 use crate::mev::amm::uniswap_v2::{
     amount_out_exact_in, select_best_size_candidate, SizeCandidate, V2PoolState,
 };
@@ -195,23 +195,27 @@ impl PayloadBuilder {
         } else {
             input.v2_swap_pools.clone()
         };
+        let capital_cap_token =
+            native_wei_to_token_amount(config, input.token_out, input.capital_available_wei)
+                .unwrap_or(input.capital_available_wei);
         let candidates = fee_extraction_v2_size_candidates(
             reserve_in,
             reserve_out,
             &swap_path,
             &route_pools,
-            input.capital_available_wei,
+            capital_cap_token,
             gas_cost,
             pool_after.fee_bps,
             sizing_fractions,
             scavenger,
         );
         let blocked_sample = best_v2_edge_metadata(
+            config,
             reserve_in,
             reserve_out,
             &swap_path,
             &route_pools,
-            input.capital_available_wei,
+            capital_cap_token,
             pool_after.fee_bps,
             sizing_fractions,
             &input,
@@ -251,14 +255,26 @@ impl PayloadBuilder {
             self_slippage_bps,
             ..
         } = selected;
-        let simulated_profit_wei = if shadow_research {
-            gross_profit_wei
-        } else {
-            net_profit_wei
-        };
-
         let repayment_wei = v2_repayment_amount_in_profit_token(reserve_in, reserve_out, amount_in)
             .unwrap_or_else(U256::zero);
+        let gross_profit_native_wei =
+            token_amount_to_native_wei(config, input.token_in, gross_profit_wei)
+                .unwrap_or(gross_profit_wei);
+        let net_profit_native_wei = token_amount_to_native_wei(config, input.token_in, net_profit_wei)
+            .unwrap_or(net_profit_wei);
+        let repayment_native =
+            token_amount_to_native_f64(config, input.token_in, repayment_wei)
+                .unwrap_or_else(|| wei_to_eth_f64(repayment_wei));
+        let gross_edge_native =
+            token_amount_to_native_f64(config, input.token_in, gross_profit_wei)
+                .unwrap_or_else(|| wei_to_eth_f64(gross_profit_wei));
+
+        let simulated_profit_wei = if shadow_research {
+            gross_profit_native_wei
+        } else {
+            net_profit_native_wei
+        };
+
         let min_amount_out = amount_out.saturating_mul(U256::from(
             10_000u64.saturating_sub(effective_payload_slippage_bps(config)),
         )) / U256::from(10_000u64);
@@ -295,7 +311,7 @@ impl PayloadBuilder {
             pool_imbalance_score: 0.0,
             cross_dex_deviation_bps: 0,
             gas_estimate,
-            simulated_extraction_native: wei_to_eth_f64(gross_profit_wei),
+            simulated_extraction_native: gross_edge_native,
             aggregator_type: "direct_router".to_string(),
             route_complexity: swap_path.len().saturating_sub(1) as u64,
             split_ratio_bps: 0,
@@ -306,16 +322,16 @@ impl PayloadBuilder {
                 format!("amount_in={amount_in}"),
                 format!("amount_out={amount_out}"),
                 format!("repayment={repayment_wei}"),
-                format!("gross_edge={gross_profit_wei}"),
+                format!("gross_edge_native_wei={gross_profit_native_wei}"),
                 format!("route_kind=v2 fee_bps={}", pool_after.fee_bps),
             ],
             best_size_bps: capital_fraction_bps,
             amount_in_wei: amount_in.to_string(),
             amount_out_wei: amount_out.to_string(),
-            gross_edge_wei: gross_profit_wei.to_string(),
-            gross_edge_native: wei_to_eth_f64(gross_profit_wei),
+            gross_edge_wei: gross_profit_native_wei.to_string(),
+            gross_edge_native,
             repayment_wei: repayment_wei.to_string(),
-            repayment_native: wei_to_eth_f64(repayment_wei),
+            repayment_native,
             price_impact_bps,
             self_slippage_bps,
             pool: format!("{:?}", input.pair),
@@ -447,11 +463,14 @@ impl PayloadBuilder {
         } else {
             &[1_000, 2_000, 3_500, 5_000, 7_500]
         };
+        let capital_cap_token =
+            native_wei_to_token_amount(config, input.token_out, input.capital_available_wei)
+                .unwrap_or(input.capital_available_wei);
         let candidates = size_candidates_v3(
             &reverse_pool,
             input.token_out,
             input.token_in,
-            input.capital_available_wei,
+            capital_cap_token,
             if shadow_research {
                 scavenger_zero_gas
             } else {
@@ -462,6 +481,7 @@ impl PayloadBuilder {
         let selected = if shadow_research {
             select_scavenger_v3_candidate(&candidates).ok_or_else(|| {
                 let sample = best_v3_edge_metadata(
+                    config,
                     &candidates,
                     &input,
                     post_victim.slippage_impact_bps,
@@ -498,10 +518,40 @@ impl PayloadBuilder {
             self_slippage_bps,
             ..
         } = selected;
+        let repayment_wei = v3_flash_repayment_wei(amount_in, fee_tier);
+        let Some(amount_out_native_wei) = token_amount_to_native_wei(config, input.token_in, amount_out)
+        else {
+            return Err(format!(
+                "missing token metadata for v3 output token {:?}; cannot normalize profit",
+                input.token_in
+            ));
+        };
+        let Some(repayment_native_wei) =
+            token_amount_to_native_wei(config, input.token_out, repayment_wei)
+        else {
+            return Err(format!(
+                "missing token metadata for v3 borrow token {:?}; cannot normalize repayment",
+                input.token_out
+            ));
+        };
+        let gross_profit_native_wei =
+            amount_out_native_wei.saturating_sub(repayment_native_wei);
+        let net_profit_native_wei = gross_profit_native_wei.saturating_sub(gas_cost);
+        if gross_profit_native_wei.is_zero() {
+            return Err("no positive normalized v3 gross edge".to_string());
+        }
+        let amount_out_native =
+            token_amount_to_native_f64(config, input.token_in, amount_out)
+                .unwrap_or_else(|| wei_to_eth_f64(amount_out_native_wei));
+        let repayment_native =
+            token_amount_to_native_f64(config, input.token_out, repayment_wei)
+                .unwrap_or_else(|| wei_to_eth_f64(repayment_native_wei));
+        let gross_edge_native = wei_to_eth_f64(gross_profit_native_wei);
+
         let simulated_profit_wei = if shadow_research {
-            gross_profit_wei
+            gross_profit_native_wei
         } else {
-            net_profit_wei
+            net_profit_native_wei
         };
         let min_amount_out = amount_out.saturating_mul(U256::from(
             10_000u64.saturating_sub(effective_payload_slippage_bps(config)),
@@ -536,7 +586,7 @@ impl PayloadBuilder {
             pool_imbalance_score: 0.0,
             cross_dex_deviation_bps: 0,
             gas_estimate,
-            simulated_extraction_native: wei_to_eth_f64(gross_profit_wei),
+            simulated_extraction_native: gross_edge_native,
             aggregator_type: "direct_router".to_string(),
             route_complexity: 1,
             split_ratio_bps: 0,
@@ -546,17 +596,19 @@ impl PayloadBuilder {
             hop_profitability_rank: vec![
                 format!("amount_in={amount_in}"),
                 format!("amount_out={amount_out}"),
-                format!("repayment={amount_in}"),
-                format!("gross_edge={gross_profit_wei}"),
+                format!("repayment={repayment_wei}"),
+                format!("amount_out_native={amount_out_native:.12}"),
+                format!("repayment_native={repayment_native:.12}"),
+                format!("gross_edge_native_wei={gross_profit_native_wei}"),
                 format!("route_kind=v3 fee_tier={fee_tier}"),
             ],
             best_size_bps: capital_fraction_bps,
             amount_in_wei: amount_in.to_string(),
             amount_out_wei: amount_out.to_string(),
-            gross_edge_wei: gross_profit_wei.to_string(),
-            gross_edge_native: wei_to_eth_f64(gross_profit_wei),
-            repayment_wei: amount_in.to_string(),
-            repayment_native: wei_to_eth_f64(amount_in),
+            gross_edge_wei: gross_profit_native_wei.to_string(),
+            gross_edge_native,
+            repayment_wei: repayment_wei.to_string(),
+            repayment_native,
             price_impact_bps,
             self_slippage_bps,
             pool: format!("{:?}", input.pair),
@@ -729,11 +781,6 @@ fn v3_scavenger_shadow_sample(
         "v3_shadow_repayment_wei={} v3_shadow_gross_edge={} v3_shadow_net_after_gas={} unit_safe={}",
         metrics.repayment, metrics.gross_edge, metrics.net_after_gas, metrics.unit_safe
     );
-    sample.simulated_extraction_native = wei_to_eth_f64(metrics.gross_edge);
-    sample.gross_edge_wei = metrics.gross_edge.to_string();
-    sample.gross_edge_native = wei_to_eth_f64(metrics.gross_edge);
-    sample.repayment_wei = metrics.repayment.to_string();
-    sample.repayment_native = wei_to_eth_f64(metrics.repayment);
     sample.hop_profitability_rank = vec![
         format!("v3_shadow_repayment_wei={}", metrics.repayment),
         format!("v3_shadow_gross_edge={}", metrics.gross_edge),
@@ -762,6 +809,7 @@ fn format_optional_address(address: Option<Address>) -> String {
 }
 
 fn best_v2_edge_metadata(
+    config: &Config,
     borrow_reserve: U256,
     profit_reserve: U256,
     route_path: &[Address],
@@ -791,11 +839,27 @@ fn best_v2_edge_metadata(
         };
         let (positive, edge_abs, gross_edge_wei, gross_edge_native) = if amount_out >= repayment {
             let edge = amount_out.saturating_sub(repayment);
-            (true, edge, edge.to_string(), wei_to_eth_f64(edge))
+            let edge_native_wei =
+                token_amount_to_native_wei(config, input.token_in, edge).unwrap_or(edge);
+            (
+                true,
+                edge,
+                edge_native_wei.to_string(),
+                wei_to_eth_f64(edge_native_wei),
+            )
         } else {
             let edge = repayment.saturating_sub(amount_out);
-            (false, edge, format!("-{edge}"), -wei_to_eth_f64(edge))
+            let edge_native_wei =
+                token_amount_to_native_wei(config, input.token_in, edge).unwrap_or(edge);
+            (
+                false,
+                edge,
+                format!("-{edge_native_wei}"),
+                -wei_to_eth_f64(edge_native_wei),
+            )
         };
+        let repayment_native = token_amount_to_native_f64(config, input.token_in, repayment)
+            .unwrap_or_else(|| wei_to_eth_f64(repayment));
         let self_slippage_bps = crate::mev::amm::uniswap_v2::price_impact_bps(
             amount_in,
             amount_out,
@@ -835,7 +899,7 @@ fn best_v2_edge_metadata(
             gross_edge_wei,
             gross_edge_native,
             repayment_wei: repayment.to_string(),
-            repayment_native: wei_to_eth_f64(repayment),
+            repayment_native,
             price_impact_bps,
             self_slippage_bps,
             pool: format!("{:?}", input.pair),
@@ -865,6 +929,7 @@ fn best_v2_edge_metadata(
 }
 
 fn best_v3_edge_metadata(
+    config: &Config,
     candidates: &[V3SizeCandidate],
     input: &FeeExtractionBuildInput,
     price_impact_bps: u64,
@@ -874,6 +939,19 @@ fn best_v3_edge_metadata(
     let candidate = candidates
         .iter()
         .max_by_key(|candidate| candidate.gross_profit_wei)?;
+    let fee_tier = match &input.route_kind {
+        AmmRouteKind::UniswapV3 { fee_tier, .. } => *fee_tier,
+        _ => 0,
+    };
+    let repayment = v3_flash_repayment_wei(candidate.amount_in, fee_tier);
+    let amount_out_native_wei =
+        token_amount_to_native_wei(config, input.token_in, candidate.amount_out)
+            .unwrap_or(candidate.amount_out);
+    let repayment_native_wei =
+        token_amount_to_native_wei(config, input.token_out, repayment).unwrap_or(repayment);
+    let gross_native_wei = amount_out_native_wei.saturating_sub(repayment_native_wei);
+    let amount_out_native = wei_to_eth_f64(amount_out_native_wei);
+    let repayment_native = wei_to_eth_f64(repayment_native_wei);
     Some(EdgeMetadata {
         victim_tx: String::new(),
         selector: String::new(),
@@ -890,7 +968,7 @@ fn best_v3_edge_metadata(
         pool_imbalance_score: 0.0,
         cross_dex_deviation_bps: 0,
         gas_estimate: 0,
-        simulated_extraction_native: wei_to_eth_f64(candidate.gross_profit_wei),
+        simulated_extraction_native: wei_to_eth_f64(gross_native_wei),
         aggregator_type: "direct_router".to_string(),
         route_complexity: 1,
         split_ratio_bps: 0,
@@ -900,17 +978,19 @@ fn best_v3_edge_metadata(
         hop_profitability_rank: vec![
             format!("amount_in={}", candidate.amount_in),
             format!("amount_out={}", candidate.amount_out),
-            format!("repayment={}", candidate.amount_in),
-            format!("gross_edge={}", candidate.gross_profit_wei),
+            format!("repayment={repayment}"),
+            format!("amount_out_native={amount_out_native:.12}"),
+            format!("repayment_native={repayment_native:.12}"),
+            format!("gross_edge_native_wei={gross_native_wei}"),
             "route_kind=v3".to_string(),
         ],
         best_size_bps: candidate.capital_fraction_bps,
         amount_in_wei: candidate.amount_in.to_string(),
         amount_out_wei: candidate.amount_out.to_string(),
-        gross_edge_wei: candidate.gross_profit_wei.to_string(),
-        gross_edge_native: wei_to_eth_f64(candidate.gross_profit_wei),
-        repayment_wei: candidate.amount_in.to_string(),
-        repayment_native: wei_to_eth_f64(candidate.amount_in),
+        gross_edge_wei: gross_native_wei.to_string(),
+        gross_edge_native: wei_to_eth_f64(gross_native_wei),
+        repayment_wei: repayment.to_string(),
+        repayment_native,
         price_impact_bps,
         self_slippage_bps: candidate.self_slippage_bps,
         pool: format!("{:?}", input.pair),
@@ -1083,6 +1163,46 @@ fn effective_payload_slippage_bps(config: &Config) -> u64 {
     } else {
         config.mev.slippage_protection_bps
     }
+}
+
+fn token_metadata(config: &Config, token: Address) -> Option<&MonitoredTokenConfig> {
+    config
+        .monitored_tokens
+        .iter()
+        .find(|candidate| candidate.address == token)
+}
+
+fn u256_to_f64(value: U256) -> Option<f64> {
+    value.to_string().parse::<f64>().ok()
+}
+
+fn f64_to_u256_floor(value: f64) -> Option<U256> {
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    U256::from_dec_str(&format!("{:.0}", value.floor())).ok()
+}
+
+fn token_amount_to_native_f64(config: &Config, token: Address, amount: U256) -> Option<f64> {
+    let metadata = token_metadata(config, token)?;
+    let raw = u256_to_f64(amount)?;
+    let units = raw / 10f64.powi(i32::from(metadata.decimals));
+    Some(units * metadata.price_eth)
+}
+
+fn token_amount_to_native_wei(config: &Config, token: Address, amount: U256) -> Option<U256> {
+    let native = token_amount_to_native_f64(config, token, amount)?;
+    f64_to_u256_floor(native * 1e18)
+}
+
+fn native_wei_to_token_amount(config: &Config, token: Address, native_wei: U256) -> Option<U256> {
+    let metadata = token_metadata(config, token)?;
+    if metadata.price_eth <= 0.0 {
+        return None;
+    }
+    let native = wei_to_eth_f64(native_wei);
+    let token_units = native / metadata.price_eth;
+    f64_to_u256_floor(token_units * 10f64.powi(i32::from(metadata.decimals)))
 }
 
 fn effective_payload_price_impact_cap_bps(config: &Config) -> u64 {
