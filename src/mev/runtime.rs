@@ -76,6 +76,10 @@ const BALANCER_SELECTOR_46495152: [u8; 4] = [0x46, 0x49, 0x51, 0x52];
 const CONTEXT_WRAP_SELECTOR: [u8; 4] = [0x62, 0x35, 0x56, 0x38];
 const ENTRYPOINT_HANDLE_OPS: [u8; 4] = [0x76, 0x5e, 0x82, 0x7f];
 const SELECTOR_NOISE_00000008: [u8; 4] = [0x00, 0x00, 0x00, 0x08];
+const PRIVATE_MEV_SELECTOR_A00597A0: [u8; 4] = [0xa0, 0x05, 0x97, 0xa0];
+const PRIVATE_MEV_SELECTOR_EAA79076: [u8; 4] = [0xea, 0xa7, 0x90, 0x76];
+const PRIVATE_MEV_SELECTOR_34EE9791: [u8; 4] = [0x34, 0xee, 0x97, 0x91];
+const PRIVATE_MEV_SELECTOR_669DC5B6: [u8; 4] = [0x66, 0x9d, 0xc5, 0xb6];
 const SAFE_INNER_SELECTOR_8CC7104F: [u8; 4] = [0x8c, 0xc7, 0x10, 0x4f];
 const SAFE_INNER_SELECTOR_9E7212AD: [u8; 4] = [0x9e, 0x72, 0x12, 0xad];
 
@@ -1945,6 +1949,22 @@ async fn process_evaluation_task(
                 "ev_gate_reject",
                 &ev_diag,
             ));
+            dashboard.event(
+                "warn",
+                format!(
+                    "EV gate reject tx={} selector={} reason={} gross={:.12} {} gas={:.12} {} floor={:.12} {} roi={}bps",
+                    short_hash(tx_hash),
+                    selector_hex(candidate.signal.selector),
+                    ev_diag.reason,
+                    wei_to_eth_f64(ev_diag.expected_profit_wei),
+                    config.native_asset_symbol(),
+                    wei_to_eth_f64(ev_diag.execution_cost_wei),
+                    config.native_asset_symbol(),
+                    wei_to_eth_f64(ev_diag.min_profit_wei),
+                    config.native_asset_symbol(),
+                    ev_diag.roi_bps
+                ),
+            );
             candidate.latency_trace.ev_gate_us = Some(0);
             candidate.latency_trace.total_internal_us =
                 Some(elapsed_us(candidate.candidate_started));
@@ -1973,6 +1993,22 @@ async fn process_evaluation_task(
                 "ev_gate_reject",
                 &ev_diag,
             ));
+            dashboard.event(
+                "warn",
+                format!(
+                    "EV gate reject tx={} selector={} reason={} gross={:.12} {} gas={:.12} {} floor={:.12} {} roi={}bps",
+                    short_hash(tx_hash),
+                    selector_hex(candidate.signal.selector),
+                    ev_diag.reason,
+                    wei_to_eth_f64(ev_diag.expected_profit_wei),
+                    config.native_asset_symbol(),
+                    wei_to_eth_f64(ev_diag.execution_cost_wei),
+                    config.native_asset_symbol(),
+                    wei_to_eth_f64(ev_diag.min_profit_wei),
+                    config.native_asset_symbol(),
+                    ev_diag.roi_bps
+                ),
+            );
             candidate.latency_trace.ev_gate_us = Some(elapsed_us(sanity_started));
             candidate.latency_trace.total_internal_us =
                 Some(elapsed_us(candidate.candidate_started));
@@ -2065,6 +2101,22 @@ async fn process_evaluation_task(
             "ev_gate_reject",
             &ev_diag,
         ));
+        dashboard.event(
+            "warn",
+            format!(
+                "EV gate reject tx={} selector={} reason={} gross={:.12} {} gas={:.12} {} floor={:.12} {} roi={}bps",
+                short_hash(tx_hash),
+                selector_hex(candidate.signal.selector),
+                ev_diag.reason,
+                wei_to_eth_f64(ev_diag.expected_profit_wei),
+                config.native_asset_symbol(),
+                wei_to_eth_f64(ev_diag.execution_cost_wei),
+                config.native_asset_symbol(),
+                wei_to_eth_f64(ev_diag.min_profit_wei),
+                config.native_asset_symbol(),
+                ev_diag.roi_bps
+            ),
+        );
         candidate
             .latency_trace
             .emit(&config, &dashboard, tx_hash, "reject", ev_diag.reason);
@@ -3364,9 +3416,16 @@ fn ev_gate_edge_sample(
     sample.status = status.to_string();
     sample.reason = format!("{} {}", diagnostic.reason, diagnostic.detail);
     sample.gas_estimate = payload.gas_limit;
-    sample.simulated_extraction_native = wei_to_eth_f64(diagnostic.expected_profit_wei);
-    sample.gross_edge_wei = diagnostic.expected_profit_wei.to_string();
-    sample.gross_edge_native = wei_to_eth_f64(diagnostic.expected_profit_wei);
+    let expected_native = wei_to_eth_f64(diagnostic.expected_profit_wei);
+    let gas_native = wei_to_eth_f64(diagnostic.execution_cost_wei);
+    let floor_native = wei_to_eth_f64(diagnostic.min_profit_wei);
+    let edge_minus_floor_native = expected_native - floor_native;
+    let net_after_gas_native = expected_native - gas_native;
+    sample.simulated_extraction_native = expected_native;
+    if sample.gross_edge_wei.trim().is_empty() || sample.gross_edge_wei == "0" {
+        sample.gross_edge_wei = diagnostic.expected_profit_wei.to_string();
+        sample.gross_edge_native = expected_native;
+    }
     sample.price_impact_bps = payload.price_impact_bps;
     sample.pool = format!("{:?}", payload.pair);
     sample.router = format!("{:?}", signal.router);
@@ -3380,6 +3439,11 @@ fn ev_gate_edge_sample(
     sample.hops = sample.hops.max(signal.path_len().saturating_sub(1) as u64);
     sample.hop_profitability_rank = vec![
         format!("gate_reason={}", diagnostic.reason),
+        format!("gross_edge_native={expected_native:.12}"),
+        format!("gas_cost_native={gas_native:.12}"),
+        format!("floor_native={floor_native:.12}"),
+        format!("edge_minus_floor_native={edge_minus_floor_native:.12}"),
+        format!("net_after_gas_native={net_after_gas_native:.12}"),
         format!("expected_profit_wei={}", diagnostic.expected_profit_wei),
         format!("execution_cost_wei={}", diagnostic.execution_cost_wei),
         format!("min_profit_or_floor_wei={}", diagnostic.min_profit_wei),
@@ -3987,6 +4051,15 @@ fn known_target_label(address: Address) -> Option<&'static str> {
         "0xd216153c06e857cd7f72665e0af1d7d82172f494" => {
             Some("unknown_high_frequency_polygon_target")
         }
+        "0x278d858f05b94576c1e6f73285886876ff6ef8d2" => {
+            Some("private_mev_executor_polygon_a")
+        }
+        "0xc37184b6ab8d18be826af019cfa6bb71c6a0ab39" => {
+            Some("private_mev_executor_polygon_b")
+        }
+        "0xab45c5a4b0c941a2f231c04c3f49182e1a254052" => {
+            Some("private_mev_executor_polygon_c")
+        }
         "0xada100db00ca00073811820692005400218fce1f" => Some("safe_inner_target"),
         _ => None,
     }
@@ -3997,6 +4070,20 @@ fn is_account_abstraction_target(address: Option<Address>) -> bool {
         .and_then(known_target_label)
         .map(|label| label.starts_with("entrypoint_"))
         .unwrap_or(false)
+}
+
+fn is_private_mev_executor_noise(address: Option<Address>, selector: [u8; 4]) -> bool {
+    let Some(label) = address.and_then(known_target_label) else {
+        return false;
+    };
+    label.starts_with("private_mev_executor_")
+        && matches!(
+            selector,
+            PRIVATE_MEV_SELECTOR_A00597A0
+                | PRIVATE_MEV_SELECTOR_EAA79076
+                | PRIVATE_MEV_SELECTOR_34EE9791
+                | PRIVATE_MEV_SELECTOR_669DC5B6
+        )
 }
 
 fn format_target(address: Option<Address>) -> String {
@@ -5720,6 +5807,9 @@ fn pre_decode_tx_gate_with_cap(
     let selector = selector(tx)?;
     if is_account_abstraction_target(tx.to) || selector == ENTRYPOINT_HANDLE_OPS {
         return Some("account_abstraction_noise");
+    }
+    if is_private_mev_executor_noise(tx.to, selector) {
+        return Some("private_mev_executor_noise");
     }
     if selector == CONTEXT_WRAP_SELECTOR {
         return Some("context_command_not_swap");
