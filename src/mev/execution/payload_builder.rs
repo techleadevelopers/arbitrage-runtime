@@ -513,8 +513,6 @@ impl PayloadBuilder {
             capital_fraction_bps,
             amount_in,
             amount_out,
-            gross_profit_wei,
-            net_profit_wei,
             self_slippage_bps,
             ..
         } = selected;
