@@ -83,7 +83,14 @@ const MULTICALL_BYTES: [u8; 4] = [0xac, 0x96, 0x50, 0xd8];
 const MULTICALL_DEADLINE_BYTES: [u8; 4] = [0x5a, 0xe4, 0x01, 0xdc];
 const CONTEXT_WRAP_SELECTOR: [u8; 4] = [0x62, 0x35, 0x56, 0x38];
 const ENTRYPOINT_HANDLE_OPS: [u8; 4] = [0x76, 0x5e, 0x82, 0x7f];
+const SELECTOR_NOISE_00000000: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
 const SELECTOR_NOISE_00000008: [u8; 4] = [0x00, 0x00, 0x00, 0x08];
+const OBSERVED_UNSUPPORTED_SELECTOR_5F052516: [u8; 4] = [0x5f, 0x05, 0x25, 0x16];
+const OBSERVED_UNSUPPORTED_SELECTOR_3D6684A8: [u8; 4] = [0x3d, 0x66, 0x84, 0xa8];
+const OBSERVED_UNSUPPORTED_SELECTOR_3A66E301: [u8; 4] = [0x3a, 0x66, 0xe3, 0x01];
+const OBSERVED_UNSUPPORTED_SELECTOR_4A502F39: [u8; 4] = [0x4a, 0x50, 0x2f, 0x39];
+const OBSERVED_UNSUPPORTED_SELECTOR_E3EAD59E: [u8; 4] = [0xe3, 0xea, 0xd5, 0x9e];
+const OBSERVED_UNSUPPORTED_SELECTOR_3C02F856: [u8; 4] = [0x3c, 0x02, 0xf8, 0x56];
 const PRIVATE_MEV_SELECTOR_A00597A0: [u8; 4] = [0xa0, 0x05, 0x97, 0xa0];
 const PRIVATE_MEV_SELECTOR_EAA79076: [u8; 4] = [0xea, 0xa7, 0x90, 0x76];
 const PRIVATE_MEV_SELECTOR_34EE9791: [u8; 4] = [0x34, 0xee, 0x97, 0x91];
@@ -2058,11 +2065,11 @@ async fn process_evaluation_task(
         if !economic_payload {
             let ev_diag =
                 scavenger_economic_edge_diagnostic(&config, &payload, candidate.gas_price);
-            dashboard.record_reject_reason("ev_gate", ev_diag.reason);
+            dashboard.record_reject_reason("shadow_research", ev_diag.reason);
             record_selector_stage(
                 &dashboard,
                 &candidate.signal,
-                "ev_gate_reject",
+                "shadow_research_reject",
                 candidate.gas_price,
             );
             dashboard.record_edge_sample(ev_gate_edge_sample(
@@ -2070,13 +2077,13 @@ async fn process_evaluation_task(
                 &candidate.signal,
                 &payload,
                 candidate.gas_price,
-                "ev_gate_reject",
+                "shadow_research_reject",
                 &ev_diag,
             ));
             dashboard.event(
                 "warn",
                 format!(
-                    "EV gate reject tx={} selector={} reason={} gross={:.12} {} gas={:.12} {} floor={:.12} {} roi={}bps",
+                    "shadow research reject tx={} selector={} reason={} gross={:.12} {} gas={:.12} {} floor={:.12} {} roi={}bps",
                     short_hash(tx_hash),
                     selector_hex(candidate.signal.selector),
                     ev_diag.reason,
@@ -2092,14 +2099,14 @@ async fn process_evaluation_task(
             candidate.latency_trace.ev_gate_us = Some(0);
             candidate.latency_trace.total_internal_us =
                 Some(elapsed_us(candidate.candidate_started));
-            dashboard.record_opportunity_funnel("ev_gate_reject");
+            dashboard.record_opportunity_funnel("shadow_research_reject");
             record_payload_lifecycle(
                 &dashboard,
                 tx_hash,
                 &candidate.signal,
                 &payload,
                 candidate.gas_price,
-                "ev_gate_reject",
+                "shadow_research_reject",
                 "not_attempted",
                 "economic_payload_failed",
                 "",
@@ -6233,17 +6240,16 @@ fn decode_safe_inner_aggregator_partial(
     monitored_tokens: &[MonitoredTokenConfig],
 ) -> Option<SwapSignal> {
     match selector {
-        SAFE_INNER_SELECTOR_8CC7104F | SAFE_INNER_SELECTOR_9E7212AD => {
-            decode_partial_swap_from_monitored_tokens(
-                selector,
-                target,
-                value,
-                args,
-                monitored_tokens,
-                0.75,
-                "safe_inner_partial",
-            )
-        }
+        SAFE_INNER_SELECTOR_9E7212AD => None,
+        SAFE_INNER_SELECTOR_8CC7104F => decode_partial_swap_from_monitored_tokens(
+            selector,
+            target,
+            value,
+            args,
+            monitored_tokens,
+            0.75,
+            "safe_inner_partial",
+        ),
         _ => decode_partial_swap_from_monitored_tokens(
             selector,
             target,
@@ -7074,6 +7080,9 @@ fn pre_decode_tx_gate_with_cap(
     if selector == SELECTOR_NOISE_00000008 {
         return Some("selector_noise_or_mev_trap");
     }
+    if is_observed_unsupported_selector_noise(selector) {
+        return Some("observed_unsupported_selector_noise");
+    }
 
     let gas_price = tx.max_fee_per_gas.or(tx.gas_price).unwrap_or_default();
     if gas_price.is_zero() {
@@ -7566,6 +7575,19 @@ fn is_context_only_or_helper_selector(selector: [u8; 4]) -> bool {
             | AGGREGATOR_SELECTOR_CDD1B25D
             | AGGREGATOR_SELECTOR_F2881E21
             | CONTEXT_WRAP_SELECTOR
+    )
+}
+
+fn is_observed_unsupported_selector_noise(selector: [u8; 4]) -> bool {
+    matches!(
+        selector,
+        SELECTOR_NOISE_00000000
+            | OBSERVED_UNSUPPORTED_SELECTOR_5F052516
+            | OBSERVED_UNSUPPORTED_SELECTOR_3D6684A8
+            | OBSERVED_UNSUPPORTED_SELECTOR_3A66E301
+            | OBSERVED_UNSUPPORTED_SELECTOR_4A502F39
+            | OBSERVED_UNSUPPORTED_SELECTOR_E3EAD59E
+            | OBSERVED_UNSUPPORTED_SELECTOR_3C02F856
     )
 }
 
@@ -9415,8 +9437,16 @@ mod tests {
             AGGREGATOR_SELECTOR_405CEC67,
             AGGREGATOR_SELECTOR_CDD1B25D,
             AGGREGATOR_SELECTOR_F2881E21,
+            SAFE_INNER_SELECTOR_9E7212AD,
             CONTEXT_WRAP_SELECTOR,
             ENTRYPOINT_HANDLE_OPS,
+            SELECTOR_NOISE_00000000,
+            OBSERVED_UNSUPPORTED_SELECTOR_5F052516,
+            OBSERVED_UNSUPPORTED_SELECTOR_3D6684A8,
+            OBSERVED_UNSUPPORTED_SELECTOR_3A66E301,
+            OBSERVED_UNSUPPORTED_SELECTOR_4A502F39,
+            OBSERVED_UNSUPPORTED_SELECTOR_E3EAD59E,
+            OBSERVED_UNSUPPORTED_SELECTOR_3C02F856,
         ] {
             assert!(
                 decode_known_aggregator_partial(selector, router, U256::zero(), &args, &monitored,)
@@ -9453,6 +9483,35 @@ mod tests {
             pre_decode_tx_gate_with_cap(&noisy_tx, Some(100)),
             Some("selector_noise_or_mev_trap")
         );
+
+        for selector in [
+            SELECTOR_NOISE_00000000,
+            OBSERVED_UNSUPPORTED_SELECTOR_5F052516,
+            OBSERVED_UNSUPPORTED_SELECTOR_3D6684A8,
+            OBSERVED_UNSUPPORTED_SELECTOR_3A66E301,
+            OBSERVED_UNSUPPORTED_SELECTOR_4A502F39,
+            OBSERVED_UNSUPPORTED_SELECTOR_E3EAD59E,
+            OBSERVED_UNSUPPORTED_SELECTOR_3C02F856,
+        ] {
+            let observed_noise_tx = Transaction {
+                input: selector.to_vec().into(),
+                gas_price: Some(U256::from(50_000_000_000u64)),
+                ..Default::default()
+            };
+            assert_eq!(
+                pre_decode_tx_gate_with_cap(&observed_noise_tx, Some(100)),
+                Some("observed_unsupported_selector_noise"),
+                "selector {} should be rejected before decode",
+                selector_hex(selector)
+            );
+        }
+
+        let safe_tx = Transaction {
+            input: SAFE_EXEC_TRANSACTION.to_vec().into(),
+            gas_price: Some(U256::from(50_000_000_000u64)),
+            ..Default::default()
+        };
+        assert_eq!(pre_decode_tx_gate_with_cap(&safe_tx, Some(100)), None);
 
         let expensive_swap_tx = Transaction {
             input: SWAP_EXACT_TOKENS_FOR_TOKENS.to_vec().into(),
