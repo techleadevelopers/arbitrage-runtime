@@ -3149,6 +3149,12 @@ fn scavenger_payload_has_economic_edge(
     let min_edge_from_usd = ethers::utils::parse_ether(format!("{:.18}", min_edge_native))
         .unwrap_or_else(|_| U256::zero());
     let floor = min_edge_wei.max(min_edge_from_usd);
+    let require_net_positive = env_bool("MEV_SCAVENGER_REQUIRE_NET_POSITIVE", true);
+    let required_edge = if require_net_positive {
+        gas_cost_wei.saturating_add(floor)
+    } else {
+        floor
+    };
     debug!(
         expected_profit_wei = %payload.expected_profit_wei,
         gas_cost_wei = %gas_cost_wei,
@@ -3157,10 +3163,12 @@ fn scavenger_payload_has_economic_edge(
         min_edge_wei = %min_edge_wei,
         min_edge_from_usd = %min_edge_from_usd,
         floor_wei = %floor,
-        has_edge = payload.expected_profit_wei >= floor,
+        required_edge_wei = %required_edge,
+        require_net_positive,
+        has_edge = payload.expected_profit_wei >= required_edge,
         "scavenger edge check"
     );
-    payload.expected_profit_wei >= floor
+    payload.expected_profit_wei >= required_edge
 }
 
 fn scavenger_economic_edge_diagnostic(
@@ -3185,7 +3193,13 @@ fn scavenger_economic_edge_diagnostic(
     let min_edge_from_usd = ethers::utils::parse_ether(format!("{:.18}", min_edge_native))
         .unwrap_or_else(|_| U256::zero());
     let floor = min_edge_wei.max(min_edge_from_usd);
-    let pass = payload.expected_profit_wei >= floor;
+    let require_net_positive = env_bool("MEV_SCAVENGER_REQUIRE_NET_POSITIVE", true);
+    let required_edge = if require_net_positive {
+        gas_cost_wei.saturating_add(floor)
+    } else {
+        floor
+    };
+    let pass = payload.expected_profit_wei >= required_edge;
     GateDiagnostic {
         pass,
         reason: if payload.expected_profit_wei.is_zero() {
@@ -3196,10 +3210,12 @@ fn scavenger_economic_edge_diagnostic(
             "ev_gate_pass"
         },
         detail: format!(
-            "expected_profit_wei={} floor_wei={} gas_cost_wei={} min_gas_fraction_bps={} min_edge_usd={:.6} min_edge_from_usd_wei={} gas_price_wei={} gas_limit={}",
+            "expected_profit_wei={} required_edge_wei={} floor_wei={} gas_cost_wei={} require_net_positive={} min_gas_fraction_bps={} min_edge_usd={:.6} min_edge_from_usd_wei={} gas_price_wei={} gas_limit={}",
             payload.expected_profit_wei,
+            required_edge,
             floor,
             gas_cost_wei,
+            require_net_positive,
             min_gas_fraction_bps,
             min_edge_usd,
             min_edge_from_usd,
@@ -3208,8 +3224,9 @@ fn scavenger_economic_edge_diagnostic(
         ),
         expected_profit_wei: payload.expected_profit_wei,
         execution_cost_wei: gas_cost_wei,
-        min_profit_wei: floor,
-        net_ev_usd: wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price,
+        min_profit_wei: required_edge,
+        net_ev_usd: wei_to_eth_f64(payload.expected_profit_wei.saturating_sub(gas_cost_wei))
+            * config.mev.eth_usd_price,
         roi_bps: roi_bps(payload.expected_profit_wei, gas_cost_wei),
     }
 }
