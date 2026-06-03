@@ -383,6 +383,14 @@ pub struct RejectReasonSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct RejectBreakdownSnapshot {
+    pub category: String,
+    pub count: u64,
+    pub pct: f64,
+    pub top_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct RelaySnapshot {
     pub relay: String,
     pub score: f64,
@@ -891,6 +899,7 @@ pub struct DashboardState {
     pub selector_replay_scores: Vec<SelectorReplayScoreSnapshot>,
     pub scavenger_observer: ScavengerObserverReport,
     pub reject_reasons: Vec<RejectReasonSnapshot>,
+    pub reject_breakdown: Vec<RejectBreakdownSnapshot>,
     pub relay_rankings: Vec<RelaySnapshot>,
     pub toxicity_profiles: Vec<ToxicitySnapshot>,
     pub treasury_rebalance_trail: Vec<TreasurySnapshot>,
@@ -1114,6 +1123,7 @@ impl DashboardHandle {
                 selector_replay_scores: storage.selector_replay_scores(12).unwrap_or_default(),
                 scavenger_observer: ScavengerObserverReport::default(),
                 reject_reasons: Vec::new(),
+                reject_breakdown: Vec::new(),
                 relay_rankings,
                 toxicity_profiles,
                 treasury_rebalance_trail,
@@ -1210,6 +1220,7 @@ impl DashboardHandle {
                 .unwrap_or_default(),
             &state.rpc_endpoints,
         );
+        state.reject_breakdown = build_reject_breakdown(&state.reject_reasons);
         state.scavenger_observer = self.observe_scavenger_window(&state);
         state
     }
@@ -1926,6 +1937,69 @@ impl DashboardHandle {
         for unsupported in pending.unsupported_selectors {
             self.storage.record_unsupported_selector(&unsupported);
         }
+    }
+}
+
+fn build_reject_breakdown(reasons: &[RejectReasonSnapshot]) -> Vec<RejectBreakdownSnapshot> {
+    let mut buckets: HashMap<&'static str, (u64, String, u64)> = HashMap::new();
+    for reason in reasons {
+        let category = reject_breakdown_category(&reason.stage, &reason.reason);
+        let entry = buckets
+            .entry(category)
+            .or_insert_with(|| (0, String::new(), 0));
+        entry.0 = entry.0.saturating_add(reason.count);
+        if reason.count >= entry.2 {
+            entry.1 = format!("{}:{}", reason.stage, reason.reason);
+            entry.2 = reason.count;
+        }
+    }
+    let total = buckets.values().map(|(count, _, _)| *count).sum::<u64>().max(1);
+    let mut rows = buckets
+        .into_iter()
+        .map(|(category, (count, top_reason, _))| RejectBreakdownSnapshot {
+            category: category.to_string(),
+            count,
+            pct: (count as f64 / total as f64) * 100.0,
+            top_reason,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| right.count.cmp(&left.count));
+    rows.truncate(8);
+    rows
+}
+
+fn reject_breakdown_category(stage: &str, reason: &str) -> &'static str {
+    let haystack = format!("{stage} {reason}").to_ascii_lowercase();
+    if haystack.contains("gas_price_cap")
+        || haystack.contains("adaptive_cap")
+        || haystack.contains("gas price")
+        || haystack.contains("gas_too_high")
+        || haystack.contains("gas_limit")
+    {
+        "gas_cap"
+    } else if haystack.contains("economic_no_positive_gross_edge")
+        || haystack.contains("no_positive")
+        || haystack.contains("no positive")
+        || haystack.contains("gross_edge")
+        || haystack.contains("edge_below")
+        || haystack.contains("profit_below")
+    {
+        "economic_no_edge"
+    } else if haystack.contains("price_impact")
+        || haystack.contains("impact too high")
+        || haystack.contains("impact_above")
+    {
+        "price_impact"
+    } else if haystack.contains("decode") || haystack.contains("selector") {
+        "decode_fail"
+    } else if haystack.contains("adaptive") || haystack.contains("quote") {
+        "adaptive_quote"
+    } else if haystack.contains("submit") || haystack.contains("relay") || haystack.contains("rpc_submit") {
+        "submit"
+    } else if haystack.contains("preflight") {
+        "preflight"
+    } else {
+        "other"
     }
 }
 
