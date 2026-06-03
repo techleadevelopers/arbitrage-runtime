@@ -47,6 +47,10 @@ pub struct SelectorPerformanceSnapshot {
     pub payload_built: u64,
     pub payload_reject: u64,
     pub confidence_reject: u64,
+    pub ev_gate_pass: u64,
+    pub ev_gate_reject: u64,
+    pub execution_ready: u64,
+    pub submit_attempted: u64,
     pub total: u64,
     pub avg_confidence: f64,
     pub avg_gas_gwei: f64,
@@ -1193,6 +1197,10 @@ impl Storage {
                         SUM(CASE WHEN stage = 'shadow_payload_built' THEN count ELSE 0 END) AS shadow_payload_built,
                         SUM(CASE WHEN stage = 'payload_reject' THEN count ELSE 0 END) AS payload_reject,
                         SUM(CASE WHEN stage = 'confidence_reject' THEN count ELSE 0 END) AS confidence_reject,
+                        SUM(CASE WHEN stage = 'ev_gate_pass' THEN count ELSE 0 END) AS ev_gate_pass,
+                        SUM(CASE WHEN stage = 'ev_gate_reject' THEN count ELSE 0 END) AS ev_gate_reject,
+                        SUM(CASE WHEN stage = 'execution_ready' THEN count ELSE 0 END) AS execution_ready,
+                        SUM(CASE WHEN stage = 'submit_attempted' THEN count ELSE 0 END) AS submit_attempted,
                         SUM(count) AS total,
                         SUM(confidence_sum) AS confidence_sum,
                         SUM(gas_gwei_sum) AS gas_gwei_sum,
@@ -1209,9 +1217,13 @@ impl Storage {
                         (row.get::<_, i64>(4)? + row.get::<_, i64>(5)?).max(0) as u64;
                     let payload_reject = row.get::<_, i64>(6)?.max(0) as u64;
                     let confidence_reject = row.get::<_, i64>(7)?.max(0) as u64;
-                    let total = row.get::<_, i64>(8)?.max(0) as u64;
-                    let confidence_sum = row.get::<_, f64>(9)?;
-                    let gas_gwei_sum = row.get::<_, f64>(10)?;
+                    let ev_gate_pass = row.get::<_, i64>(8)?.max(0) as u64;
+                    let ev_gate_reject = row.get::<_, i64>(9)?.max(0) as u64;
+                    let execution_ready = row.get::<_, i64>(10)?.max(0) as u64;
+                    let submit_attempted = row.get::<_, i64>(11)?.max(0) as u64;
+                    let total = row.get::<_, i64>(12)?.max(0) as u64;
+                    let confidence_sum = row.get::<_, f64>(13)?;
+                    let gas_gwei_sum = row.get::<_, f64>(14)?;
                     Ok(build_selector_performance_snapshot(
                         row.get(0)?,
                         row.get(1)?,
@@ -1220,10 +1232,14 @@ impl Storage {
                         payload_built,
                         payload_reject,
                         confidence_reject,
+                        ev_gate_pass,
+                        ev_gate_reject,
+                        execution_ready,
+                        submit_attempted,
                         total,
                         confidence_sum,
                         gas_gwei_sum,
-                        row.get(11)?,
+                        row.get(15)?,
                     ))
                 })?;
 
@@ -1246,6 +1262,10 @@ impl Storage {
                             SUM(CASE WHEN stage = 'shadow_payload_built' THEN count ELSE 0 END)::bigint AS shadow_payload_built,
                             SUM(CASE WHEN stage = 'payload_reject' THEN count ELSE 0 END)::bigint AS payload_reject,
                             SUM(CASE WHEN stage = 'confidence_reject' THEN count ELSE 0 END)::bigint AS confidence_reject,
+                            SUM(CASE WHEN stage = 'ev_gate_pass' THEN count ELSE 0 END)::bigint AS ev_gate_pass,
+                            SUM(CASE WHEN stage = 'ev_gate_reject' THEN count ELSE 0 END)::bigint AS ev_gate_reject,
+                            SUM(CASE WHEN stage = 'execution_ready' THEN count ELSE 0 END)::bigint AS execution_ready,
+                            SUM(CASE WHEN stage = 'submit_attempted' THEN count ELSE 0 END)::bigint AS submit_attempted,
                             SUM(count)::bigint AS total,
                             SUM(confidence_sum)::double precision AS confidence_sum,
                             SUM(gas_gwei_sum)::double precision AS gas_gwei_sum,
@@ -1269,6 +1289,10 @@ impl Storage {
                         let payload_reject = row.get::<i64, _>("payload_reject").max(0) as u64;
                         let confidence_reject =
                             row.get::<i64, _>("confidence_reject").max(0) as u64;
+                        let ev_gate_pass = row.get::<i64, _>("ev_gate_pass").max(0) as u64;
+                        let ev_gate_reject = row.get::<i64, _>("ev_gate_reject").max(0) as u64;
+                        let execution_ready = row.get::<i64, _>("execution_ready").max(0) as u64;
+                        let submit_attempted = row.get::<i64, _>("submit_attempted").max(0) as u64;
                         let total = row.get::<i64, _>("total").max(0) as u64;
                         build_selector_performance_snapshot(
                             row.get("selector"),
@@ -1278,6 +1302,10 @@ impl Storage {
                             payload_built,
                             payload_reject,
                             confidence_reject,
+                            ev_gate_pass,
+                            ev_gate_reject,
+                            execution_ready,
+                            submit_attempted,
                             total,
                             row.try_get::<Option<f64>, _>("confidence_sum")
                                 .unwrap_or(None)
@@ -3087,6 +3115,10 @@ fn build_selector_performance_snapshot(
     payload_built: u64,
     payload_reject: u64,
     confidence_reject: u64,
+    ev_gate_pass: u64,
+    ev_gate_reject: u64,
+    execution_ready: u64,
+    submit_attempted: u64,
     total: u64,
     confidence_sum: f64,
     gas_gwei_sum: f64,
@@ -3126,6 +3158,10 @@ fn build_selector_performance_snapshot(
         payload_built,
         payload_reject,
         confidence_reject,
+        ev_gate_pass,
+        ev_gate_reject,
+        execution_ready,
+        submit_attempted,
         total,
         avg_confidence,
         avg_gas_gwei,

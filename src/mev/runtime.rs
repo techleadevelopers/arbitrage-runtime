@@ -754,6 +754,8 @@ fn build_opportunity(
         token_in: signal.path[0],
         token_out: *signal.path.last().unwrap_or(&signal.path[0]),
         selector: signal.selector,
+        decode_source: signal.decode_source,
+        decode_confidence: signal.decode_confidence,
         preferred_relay,
     }
 }
@@ -1931,6 +1933,7 @@ async fn process_evaluation_task(
             let ev_diag =
                 scavenger_economic_edge_diagnostic(&config, &payload, candidate.gas_price);
             dashboard.record_reject_reason("ev_gate", ev_diag.reason);
+            record_selector_stage(&dashboard, &candidate.signal, "ev_gate_reject", candidate.gas_price);
             dashboard.record_edge_sample(ev_gate_edge_sample(
                 tx_hash,
                 &candidate.signal,
@@ -1975,6 +1978,7 @@ async fn process_evaluation_task(
             let ev_diag =
                 scavenger_sanity_diagnostic(&config, &payload, candidate.lookup_latency, reason);
             dashboard.record_reject_reason("ev_gate", ev_diag.reason);
+            record_selector_stage(&dashboard, &candidate.signal, "ev_gate_reject", candidate.gas_price);
             dashboard.record_edge_sample(ev_gate_edge_sample(
                 tx_hash,
                 &candidate.signal,
@@ -2013,6 +2017,7 @@ async fn process_evaluation_task(
         candidate.latency_trace.quality_gate_us = Some(0);
         candidate.latency_trace.adaptive_quote_us = Some(0);
         dashboard.record_opportunity_funnel("ev_gate_pass");
+        record_selector_stage(&dashboard, &candidate.signal, "ev_gate_pass", candidate.gas_price);
         dashboard.record_opportunity_funnel("adaptive_quote_candidate");
         dashboard.record_opportunity_funnel("adaptive_quote_pass");
         dashboard.record_opportunity_funnel("execution_ready_candidate");
@@ -2039,6 +2044,7 @@ async fn process_evaluation_task(
             "scavenger_sanity_fast_path",
         );
         dashboard.record_opportunity_funnel("execution_ready");
+        record_selector_stage(&dashboard, &candidate.signal, "execution_ready", candidate.gas_price);
         dashboard.record_edge_sample(execution_ready_edge_sample(
             tx_hash,
             &candidate.signal,
@@ -2096,6 +2102,7 @@ async fn process_evaluation_task(
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
         dashboard.record_opportunity_funnel("ev_gate_reject");
         dashboard.record_reject_reason("ev_gate", ev_diag.reason);
+        record_selector_stage(&dashboard, &candidate.signal, "ev_gate_reject", candidate.gas_price);
         dashboard.record_edge_sample(ev_gate_edge_sample(
             tx_hash,
             &candidate.signal,
@@ -2126,6 +2133,7 @@ async fn process_evaluation_task(
         return None;
     }
     dashboard.record_opportunity_funnel("ev_gate_pass");
+    record_selector_stage(&dashboard, &candidate.signal, "ev_gate_pass", candidate.gas_price);
     candidate.latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
 
     let execution_cost_wei = candidate
@@ -2180,6 +2188,7 @@ async fn process_evaluation_task(
     } else {
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
         dashboard.record_opportunity_funnel("adaptive_quote_error");
+        record_selector_stage(&dashboard, &candidate.signal, "adaptive_quote_error", candidate.gas_price);
         dashboard.record_opportunity_funnel("execution_ready_candidate");
         dashboard.record_opportunity_funnel("execution_ready_reject");
         dashboard.record_reject_reason("adaptive", "adaptive_model_lock_failed");
@@ -2210,6 +2219,7 @@ async fn process_evaluation_task(
     if !quote.should_execute && !mode_override {
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
         dashboard.record_opportunity_funnel("adaptive_quote_reject");
+        record_selector_stage(&dashboard, &candidate.signal, "adaptive_quote_reject", candidate.gas_price);
         dashboard.record_opportunity_funnel("execution_ready_candidate");
         dashboard.record_opportunity_funnel("execution_ready_reject");
         if let Some(reason) = quote.reject_reason {
@@ -2236,6 +2246,7 @@ async fn process_evaluation_task(
         return None;
     }
     dashboard.record_opportunity_funnel("adaptive_quote_pass");
+    record_selector_stage(&dashboard, &candidate.signal, "adaptive_quote_pass", candidate.gas_price);
     dashboard.record_edge_sample(adaptive_quote_edge_sample(
         tx_hash,
         &candidate.signal,
@@ -2316,6 +2327,7 @@ async fn process_evaluation_task(
     );
     dashboard.record_opportunity_funnel("execution_ready_candidate");
     dashboard.record_opportunity_funnel("execution_ready");
+    record_selector_stage(&dashboard, &candidate.signal, "execution_ready", candidate.gas_price);
     dashboard.record_edge_sample(execution_ready_edge_sample(
         tx_hash,
         &candidate.signal,
@@ -3805,6 +3817,22 @@ fn gas_price_gwei(gas_price: U256) -> f64 {
 
 fn address_hex(address: Address) -> String {
     format!("{address:?}")
+}
+
+fn record_selector_stage(
+    dashboard: &DashboardHandle,
+    signal: &SwapSignal,
+    stage: &str,
+    gas_price: U256,
+) {
+    dashboard.record_selector_performance(
+        &selector_hex(signal.selector),
+        &address_hex(signal.router),
+        signal.decode_source,
+        stage,
+        signal.decode_confidence,
+        gas_price_gwei(gas_price),
+    );
 }
 
 fn token_pair_label(signal: &SwapSignal) -> String {

@@ -12,6 +12,8 @@ pub struct MevOpportunity {
     pub token_in: Address,
     pub token_out: Address,
     pub selector: [u8; 4],
+    pub decode_source: &'static str,
+    pub decode_confidence: f64,
     pub preferred_relay: Option<String>,
 }
 

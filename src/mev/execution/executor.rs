@@ -511,6 +511,7 @@ impl ExecutionEngine {
             let mut submit_set = JoinSet::new();
             for endpoint in submit_endpoints {
                 self.dashboard.record_opportunity_funnel("submit_attempted");
+                record_submit_selector_stage(&self.dashboard, &opportunity, send_context.gas_price);
                 let tx = payload.tx.clone();
                 let endpoint_id = endpoint.id;
                 let endpoint_name = endpoint.name.clone();
@@ -673,6 +674,7 @@ impl ExecutionEngine {
             };
             let relay_signer = wallet.clone();
             self.dashboard.record_opportunity_funnel("submit_attempted");
+            record_submit_selector_stage(&self.dashboard, &opportunity, send_context.gas_price);
             let flashbots_client =
                 SignerMiddleware::new(send_context.endpoint.provider.clone(), wallet.clone());
             let flashbots = FlashbotsMiddleware::new(flashbots_client, relay_url, relay_signer);
@@ -1851,6 +1853,28 @@ fn signed_tx_hash(raw: &Bytes) -> H256 {
 
 fn wei_to_gwei_f64(value: U256) -> f64 {
     value.to_string().parse::<f64>().unwrap_or(0.0) / 1e9
+}
+
+fn selector_hex(selector: [u8; 4]) -> String {
+    format!(
+        "0x{:02x}{:02x}{:02x}{:02x}",
+        selector[0], selector[1], selector[2], selector[3]
+    )
+}
+
+fn record_submit_selector_stage(
+    dashboard: &DashboardHandle,
+    opportunity: &MevOpportunity,
+    gas_price: U256,
+) {
+    dashboard.record_selector_performance(
+        &selector_hex(opportunity.selector),
+        &format!("{:?}", opportunity.router),
+        opportunity.decode_source,
+        "submit_attempted",
+        opportunity.decode_confidence,
+        wei_to_gwei_f64(gas_price),
+    );
 }
 
 fn is_insufficient_funds_error(message: &str) -> bool {
