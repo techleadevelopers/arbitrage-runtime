@@ -17,7 +17,7 @@ use crate::mev::opportunity::{roi_bps, wei_to_eth_f64, MevOpportunity};
 use crate::mev::simulation::state_simulator::{
     AccountState, AmmState, EvmPreflightResult, StateSimulator,
 };
-use crate::rpc::RpcFleet;
+use crate::rpc::{RpcFailureKind, RpcFleet};
 use crate::storage::{ReplayCandidateRecord, Storage};
 use chrono::Timelike;
 use ethers::abi::{self, ParamType, Token};
@@ -1945,11 +1945,48 @@ async fn process_evaluation_task(
     dashboard.record_opportunity_funnel("ev_validation_pass");
     dashboard.record_reject_reason("ev_validation", ev_validation.reason);
 
-    let economic_payload = config.mev.opportunity_mode() != OpportunityMode::Scavenger
-        || scavenger_payload_has_economic_edge(&config, &payload, candidate.gas_price);
+    let payload_to_quote_diag = if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
+        Some(scavenger_economic_edge_diagnostic(
+            &config,
+            &payload,
+            candidate.gas_price,
+        ))
+    } else {
+        None
+    };
+    let economic_payload = payload_to_quote_diag
+        .as_ref()
+        .map(|diagnostic| diagnostic.pass)
+        .unwrap_or(true);
     if !economic_payload {
         dashboard.record_opportunity_funnel("payload_to_quote_reject");
-        dashboard.record_reject_reason("payload_to_quote", "scavenger_edge_below_economic_floor");
+        let diagnostic = payload_to_quote_diag
+            .as_ref()
+            .expect("scavenger payload-to-quote diagnostic");
+        let gross_native = wei_to_eth_f64(diagnostic.expected_profit_wei);
+        let gas_native = wei_to_eth_f64(diagnostic.execution_cost_wei);
+        let required_edge_native = wei_to_eth_f64(diagnostic.min_profit_wei);
+        let edge_minus_required_native = gross_native - required_edge_native;
+        dashboard.record_reject_reason("payload_to_quote", diagnostic.reason);
+        dashboard.event(
+            "warn",
+            format!(
+                "payload_to_quote reject tx={} selector={} reason={} gross={:.12} {} gas={:.12} {} required_edge={:.12} {} edge_minus_required={:.12} {} roi={}bps detail={}",
+                short_hash(tx_hash),
+                selector_hex(candidate.signal.selector),
+                diagnostic.reason,
+                gross_native,
+                config.native_asset_symbol(),
+                gas_native,
+                config.native_asset_symbol(),
+                required_edge_native,
+                config.native_asset_symbol(),
+                edge_minus_required_native,
+                config.native_asset_symbol(),
+                diagnostic.roi_bps,
+                diagnostic.detail
+            ),
+        );
     } else {
         dashboard.record_opportunity_funnel("payload_to_quote_pass");
     }
@@ -2066,8 +2103,9 @@ async fn process_evaluation_task(
 
     if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
         if !economic_payload {
-            let ev_diag =
-                scavenger_economic_edge_diagnostic(&config, &payload, candidate.gas_price);
+            let ev_diag = payload_to_quote_diag
+                .as_ref()
+                .expect("scavenger payload-to-quote diagnostic");
             dashboard.record_reject_reason("shadow_research", ev_diag.reason);
             record_selector_stage(
                 &dashboard,
@@ -2081,7 +2119,7 @@ async fn process_evaluation_task(
                 &payload,
                 candidate.gas_price,
                 "shadow_research_reject",
-                &ev_diag,
+                ev_diag,
             ));
             dashboard.event(
                 "warn",
@@ -3813,7 +3851,9 @@ async fn build_payload_with_fallback_parallel(
                     Ok(payload)
                 }
                 Err(err) => {
-                    rpc_fleet.record_failure(handle.id, RpcFleet::classify_failure(&err));
+                    if let Some(kind) = payload_builder_rpc_failure_kind(&err) {
+                        rpc_fleet.record_failure(handle.id, kind);
+                    }
                     Err(format!(
                         "rpc={} route_kind={} block={} {}",
                         handle.name,
@@ -3889,6 +3929,49 @@ fn payload_builder_unhealthy_rpc_fallback(config: &Config) -> bool {
     config.mev.opportunity_mode() == OpportunityMode::Scavenger
         && !config.allow_send
         && env_bool("MEV_PAYLOAD_BUILD_UNHEALTHY_RPC_FALLBACK", true)
+}
+
+fn payload_builder_rpc_failure_kind(error: &str) -> Option<RpcFailureKind> {
+    let lower = strip_edge_sample(error).to_ascii_lowercase();
+    if lower.contains("no positive gross")
+        || lower.contains("no roi-positive")
+        || lower.contains("victim price impact too high")
+        || lower.contains("token normalization failed")
+        || lower.contains("missing decimals/price metadata")
+        || lower.contains("v3_tick_data_missing_for_shadow_ev")
+        || lower.contains("pool after victim does not support reverse path")
+        || lower.contains("pool_token_mismatch")
+        || lower.contains("zero_reserves")
+        || lower.contains("empty_liquidity")
+        || lower.contains("liquidity_or_price")
+        || lower.contains("executor_address")
+    {
+        return None;
+    }
+
+    let rpc_like = lower.contains("deserialization error")
+        || lower.contains("eof while parsing")
+        || lower.contains("empty response")
+        || lower.contains("provider error")
+        || lower.contains("request error")
+        || lower.contains("connection")
+        || lower.contains("socket")
+        || lower.contains("dns")
+        || lower.contains("econnreset")
+        || lower.contains("broken pipe")
+        || lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("deadline exceeded")
+        || lower.contains("429")
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+        || lower.contains("throughput limit")
+        || lower.contains("capacity limit exceeded")
+        || lower.contains("quota exceeded")
+        || lower.contains("billing")
+        || lower.contains("lookup failed");
+
+    rpc_like.then(|| RpcFleet::classify_failure(&lower))
 }
 
 fn compact_payload_errors(errors: Vec<String>) -> String {
@@ -8878,9 +8961,99 @@ fn spawn_historical_profile_refresher(
 mod tests {
     use super::*;
     use ethers::abi::encode;
-    use std::sync::Mutex;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex, RwLock};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_runtime_config() -> Config {
+        Config {
+            wallets: PathBuf::from("keys.txt"),
+            network: "polygon".to_string(),
+            chain_id: 137,
+            allow_send: false,
+            tenderly_rpc_only: false,
+            alchemy_keys: Vec::new(),
+            infura_ids: Vec::new(),
+            flashbots_relay: String::new(),
+            builder_relays: Vec::new(),
+            executor_private_key:
+                "0x59c6995e998f97a5a0044966f0945382d7a7d4f6d8f1f0db6b90e6a2f17d5f52".to_string(),
+            executor_address: Address::from_low_u64_be(10),
+            vault_address: Address::from_low_u64_be(11),
+            profit_address: Address::from_low_u64_be(12),
+            control_address: Address::from_low_u64_be(13),
+            monitored_tokens: vec![MonitoredTokenConfig {
+                address: Address::from_low_u64_be(1),
+                decimals: 18,
+                price_eth: 1.0,
+            }],
+            estimated_exec_gas: 250_000,
+            estimated_bundle_overhead_gas: 25_000,
+            max_infura_endpoints: 0,
+            rpc_read_preference: crate::config::RpcPreference::Auto,
+            rpc_send_preference: crate::config::RpcPreference::Auto,
+            storage_path: PathBuf::from("test.sqlite"),
+            dashboard_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8787),
+            explicit_rpc_urls: Vec::new(),
+            mempool_ws_urls: Vec::new(),
+            mev: crate::config::MevConfig {
+                enabled: true,
+                opportunity_mode: Arc::new(RwLock::new(OpportunityMode::Scavenger)),
+                runtime_thresholds: Arc::new(RwLock::new(crate::config::OpportunityThresholds {
+                    min_large_swap_eth: 1.0,
+                    min_net_profit_eth: 0.0001,
+                    min_profit_usd: 0.01,
+                    min_liquidity_eth: 1.0,
+                })),
+                capital_eth: 0.1,
+                capital_window_secs: 90,
+                max_window_exposure_eth: 0.3,
+                max_cluster_window_exposure_eth: 0.2,
+                max_pair_window_exposure_eth: 0.2,
+                min_net_profit_eth: 0.0001,
+                min_roi_bps: 100,
+                min_large_swap_eth: 1.0,
+                gas_safety_margin_bps: 12_500,
+                max_pending_age_ms: 1500,
+                max_gas_per_tx: 300_000,
+                max_gas_price_gwei: Some(1_500),
+                max_price_impact_bps: 250,
+                slippage_protection_bps: 50,
+                min_profit_usd: 0.01,
+                eth_usd_price: 0.09,
+                min_liquidity_eth: 1.0,
+                latency_trace: false,
+                latency_trace_warn_us: 5_000,
+                pool_state_cache_ttl_ms: 120,
+                executor_min_buffer_eth: 0.1,
+                executor_target_buffer_eth: 0.3,
+                executor_max_buffer_eth: 1.0,
+                relay_fanout_count: 1,
+                rpc_fanout_count: 1,
+                gas_overpay_base_extra_bps: 500,
+                gas_overpay_miss_extra_bps: 2_500,
+                gas_overpay_revert_extra_bps: 1_200,
+                gas_overpay_submit_failure_extra_bps: 1_500,
+                gas_overpay_max_extra_bps: 5_000,
+                finality_confirmations: 1,
+                stop_loss_consecutive_losses: 3,
+                stop_loss_freeze_secs: 300,
+                context_stop_loss_consecutive_losses: 2,
+                context_stop_loss_freeze_secs: 180,
+                capital_multiplier_aggressive: 2.0,
+                capital_multiplier_neutral: 1.0,
+                capital_multiplier_defensive: 0.3,
+                capital_multiplier_priority_threshold: 0.6,
+                capital_multiplier_toxicity_threshold: 0.65,
+                uniswap_v2_factory: Some(Address::from_low_u64_be(20)),
+                uniswap_v3_factory: Some(Address::from_low_u64_be(21)),
+                mev_executor: Some(Address::from_low_u64_be(22)),
+                mev_executor_v3: Some(Address::from_low_u64_be(23)),
+            },
+        }
+    }
 
     #[test]
     fn adaptive_gas_cap_allows_positive_two_cent_edge_near_hard_cap() {
@@ -9572,25 +9745,66 @@ mod tests {
     fn scavenger_payload_builder_can_widen_rpc_fanout_for_shadow_research() {
         let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
+            std::env::set_var(
+                "EXECUTOR_PRIVATE_KEY",
+                "0x59c6995e998f97a5a0044966f0945382d7a7d4f6d8f1f0db6b90e6a2f17d5f52",
+            );
+            std::env::set_var(
+                "CONTROL_ADDRESS",
+                "0x0000000000000000000000000000000000000001",
+            );
+            std::env::set_var(
+                "VAULT_ADDRESS",
+                "0x0000000000000000000000000000000000000002",
+            );
+            std::env::set_var(
+                "PROFIT_ADDRESS",
+                "0x0000000000000000000000000000000000000003",
+            );
+            std::env::set_var("MEV_OPPORTUNITY_MODE", "scavenger");
+            std::env::set_var("ALLOW_SEND", "false");
             std::env::set_var("MEV_PAYLOAD_BUILD_FANOUT", "6");
             std::env::set_var("MEV_PAYLOAD_BUILD_UNHEALTHY_RPC_FALLBACK", "true");
         }
-        let config = Config {
-            mev: crate::config::MevConfig {
-                opportunity_mode: OpportunityMode::Scavenger.as_str().to_string(),
-                ..Default::default()
-            },
-            allow_send: false,
-            ..Default::default()
-        };
+        let config = test_runtime_config();
 
         assert_eq!(payload_build_fanout(&config), 6);
         assert!(payload_builder_unhealthy_rpc_fallback(&config));
 
         unsafe {
+            std::env::remove_var("EXECUTOR_PRIVATE_KEY");
+            std::env::remove_var("CONTROL_ADDRESS");
+            std::env::remove_var("VAULT_ADDRESS");
+            std::env::remove_var("PROFIT_ADDRESS");
+            std::env::remove_var("MEV_OPPORTUNITY_MODE");
+            std::env::remove_var("ALLOW_SEND");
             std::env::remove_var("MEV_PAYLOAD_BUILD_FANOUT");
             std::env::remove_var("MEV_PAYLOAD_BUILD_UNHEALTHY_RPC_FALLBACK");
         }
+    }
+
+    #[test]
+    fn payload_builder_economic_rejects_do_not_cool_down_rpc_endpoints() {
+        assert!(
+            payload_builder_rpc_failure_kind("no positive gross edge for scavenger payload")
+                .is_none()
+        );
+        assert!(
+            payload_builder_rpc_failure_kind("victim price impact too high: 9999bps").is_none()
+        );
+        assert!(
+            payload_builder_rpc_failure_kind(
+                "token normalization failed for borrow token 0xeb51d9a39ad5eef215dc0bf39a8821ff804a0f01: missing decimals/price metadata"
+            )
+            .is_none()
+        );
+
+        assert_eq!(
+            payload_builder_rpc_failure_kind(
+                "v2 factory 0x5757371414417b8c6caad45baef941abc7d3ab32 lookup failed token_in=0x1 token_out=0x2: Deserialization Error: EOF while parsing a value at line 1 column 0. Response:"
+            ),
+            Some(RpcFailureKind::Transport)
+        );
     }
 
     #[test]
