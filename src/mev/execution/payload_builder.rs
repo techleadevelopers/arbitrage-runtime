@@ -7,7 +7,7 @@ use crate::mev::amm::uniswap_v2::{
     amount_out_exact_in, select_best_size_candidate, SizeCandidate, V2PoolState,
 };
 use crate::mev::amm::uniswap_v3::{
-    select_best_v3_size_candidate, size_candidates_v3, V3PoolState, V3SizeCandidate,
+    V3PoolState, V3SizeCandidate,
 };
 use crate::mev::execution::contract_encoder::{EncodedSwapStep, EncodedV3SwapStep};
 use crate::mev::execution::flashloan_builder::{build_v2_flashswap_call, build_v3_flashswap_call};
@@ -457,7 +457,6 @@ impl PayloadBuilder {
             .saturating_mul(U256::from(gas_estimate))
             .saturating_mul(U256::from(config.mev.gas_safety_margin_bps))
             / U256::from(10_000u64);
-        let scavenger_zero_gas = U256::zero();
         let sizing_fractions: &[u64] = if shadow_research {
             &[25, 50, 100, 200, 350, 500, 750, 1_000, 1_500]
         } else {
@@ -466,22 +465,18 @@ impl PayloadBuilder {
         let capital_cap_token =
             native_wei_to_token_amount(config, input.token_out, input.capital_available_wei)
                 .unwrap_or(input.capital_available_wei);
-        let candidates = size_candidates_v3(
+        let candidates = normalized_v3_size_candidates(
+            config,
             &reverse_pool,
-            input.token_out,
-            input.token_in,
+            &input,
             capital_cap_token,
-            if shadow_research {
-                scavenger_zero_gas
-            } else {
-                gas_cost
-            },
+            fee_tier,
+            gas_cost,
             sizing_fractions,
         );
         let selected = if shadow_research {
             select_scavenger_v3_candidate(&candidates).ok_or_else(|| {
                 let sample = best_v3_edge_metadata(
-                    config,
                     &candidates,
                     &input,
                     post_victim.slippage_impact_bps,
@@ -502,39 +497,29 @@ impl PayloadBuilder {
                 )
             })?
         } else {
-            select_best_v3_size_candidate(
+            select_best_v3_candidate(
                 &candidates,
                 input.context_priority_score,
                 input.context_toxicity_score,
             )
             .ok_or_else(|| "no ROI-positive v3 trade size after gas".to_string())?
         };
-        let V3SizeCandidate {
-            capital_fraction_bps,
-            amount_in,
-            amount_out,
-            self_slippage_bps,
+        let NormalizedV3Candidate {
+            candidate:
+                V3SizeCandidate {
+                    capital_fraction_bps,
+                    amount_in,
+                    amount_out,
+                    self_slippage_bps,
+                    ..
+                },
+            repayment_wei,
+            amount_out_native_wei,
+            repayment_native_wei,
+            gross_profit_native_wei,
+            net_profit_native_wei,
             ..
         } = selected;
-        let repayment_wei = v3_flash_repayment_wei(amount_in, fee_tier);
-        let Some(amount_out_native_wei) = token_amount_to_native_wei(config, input.token_in, amount_out)
-        else {
-            return Err(format!(
-                "missing token metadata for v3 output token {:?}; cannot normalize profit",
-                input.token_in
-            ));
-        };
-        let Some(repayment_native_wei) =
-            token_amount_to_native_wei(config, input.token_out, repayment_wei)
-        else {
-            return Err(format!(
-                "missing token metadata for v3 borrow token {:?}; cannot normalize repayment",
-                input.token_out
-            ));
-        };
-        let gross_profit_native_wei =
-            amount_out_native_wei.saturating_sub(repayment_native_wei);
-        let net_profit_native_wei = gross_profit_native_wei.saturating_sub(gas_cost);
         if gross_profit_native_wei.is_zero() {
             return Err("no positive normalized v3 gross edge".to_string());
         }
@@ -617,42 +602,27 @@ impl PayloadBuilder {
         };
 
         if shadow_research {
-            let shadow_metrics = v3_scavenger_shadow_metrics(
-                amount_in,
-                amount_out,
-                fee_tier,
-                gas_cost,
-                path.len() == 43,
-            );
-            edge_metadata = v3_scavenger_shadow_sample(edge_metadata, shadow_metrics);
-
-            // NOVO: Permite shadow mesmo se não for unit-safe (telemetria)
             if !config.allow_send {
-                // Modo shadow: aceita qualquer V3 para coleta de dados
                 edge_metadata.status = "v3_shadow_ready".to_string();
                 edge_metadata.reason = format!(
-                    "{} shadow_payload_built=true allow_send=false unit_safe={} net_after_gas={}",
+                    "{} shadow_payload_built=true allow_send=false normalized_net_after_gas={}",
                     edge_metadata.reason,
-                    shadow_metrics.unit_safe,
-                    wei_to_eth_f64(shadow_metrics.net_after_gas)
+                    wei_to_eth_f64(net_profit_native_wei)
                 );
-                // Continua para construir o payload shadow
             } else if scavenger {
-                // Modo live: só permite se for unit-safe e com lucro positivo
-                if !shadow_metrics.unit_safe || shadow_metrics.net_after_gas.is_zero() {
+                if net_profit_native_wei.is_zero() {
                     return Err(payload_error_with_edge_sample(
-                "v3 scavenger payload blocked for live send until repayment model is unit-safe",
-                Some(edge_metadata),
-            ));
+                        "v3 scavenger payload blocked for live send: normalized net edge is zero",
+                        Some(edge_metadata),
+                    ));
                 }
                 edge_metadata.status = "v3_live_ready".to_string();
                 edge_metadata.reason = format!(
-                    "{} unit_safe=true live_send_allowed=true",
+                    "{} normalized_units=true live_send_allowed=true",
                     edge_metadata.reason
                 );
             }
         }
-
         let executor = config.mev.mev_executor_v3.or(config.mev.mev_executor).ok_or_else(|| {
             payload_error_with_edge_sample(
                 "MEV_EXECUTOR_V3_ADDRESS or MEV_EXECUTOR_ADDRESS is required to build V3 atomic payload",
@@ -742,52 +712,6 @@ fn scavenger_shadow_negative_tolerance_native(config: &Config) -> f64 {
     tolerance_usd / config.mev.eth_usd_price.max(1.0)
 }
 
-#[derive(Debug, Clone, Copy)]
-struct V3ScavengerShadowMetrics {
-    repayment: U256,
-    gross_edge: U256,
-    net_after_gas: U256,
-    unit_safe: bool,
-}
-
-fn v3_scavenger_shadow_metrics(
-    amount_in: U256,
-    amount_out: U256,
-    fee_tier: u32,
-    gas_cost: U256,
-    single_hop_path: bool,
-) -> V3ScavengerShadowMetrics {
-    let repayment = v3_flash_repayment_wei(amount_in, fee_tier);
-    let gross_edge = amount_out.saturating_sub(repayment);
-    let net_after_gas = gross_edge.saturating_sub(gas_cost);
-    let unit_safe = single_hop_path && !repayment.is_zero() && amount_out >= repayment;
-
-    V3ScavengerShadowMetrics {
-        repayment,
-        gross_edge,
-        net_after_gas,
-        unit_safe,
-    }
-}
-
-fn v3_scavenger_shadow_sample(
-    mut sample: EdgeMetadata,
-    metrics: V3ScavengerShadowMetrics,
-) -> EdgeMetadata {
-    sample.status = "v3_shadow".to_string();
-    sample.reason = format!(
-        "v3_shadow_repayment_wei={} v3_shadow_gross_edge={} v3_shadow_net_after_gas={} unit_safe={}",
-        metrics.repayment, metrics.gross_edge, metrics.net_after_gas, metrics.unit_safe
-    );
-    sample.hop_profitability_rank = vec![
-        format!("v3_shadow_repayment_wei={}", metrics.repayment),
-        format!("v3_shadow_gross_edge={}", metrics.gross_edge),
-        format!("v3_shadow_net_after_gas={}", metrics.net_after_gas),
-        format!("unit_safe={}", metrics.unit_safe),
-    ];
-    sample
-}
-
 fn v3_flash_repayment_wei(amount: U256, fee_tier: u32) -> U256 {
     if amount.is_zero() {
         return U256::zero();
@@ -798,6 +722,148 @@ fn v3_flash_repayment_wei(amount: U256, fee_tier: u32) -> U256 {
         .saturating_add(fee_denominator - U256::one())
         / fee_denominator;
     amount.saturating_add(fee)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NormalizedV3Candidate {
+    candidate: V3SizeCandidate,
+    repayment_wei: U256,
+    amount_out_native_wei: U256,
+    repayment_native_wei: U256,
+    gross_profit_native_wei: U256,
+    net_profit_native_wei: U256,
+    edge_positive: bool,
+    edge_abs_native_wei: U256,
+}
+
+fn normalized_v3_size_candidates(
+    config: &Config,
+    pool: &V3PoolState,
+    input: &FeeExtractionBuildInput,
+    capital_cap: U256,
+    fee_tier: u32,
+    gas_cost_wei: U256,
+    fractions_bps: &[u64],
+) -> Vec<NormalizedV3Candidate> {
+    if capital_cap.is_zero() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::with_capacity(fractions_bps.len());
+    for &bps in fractions_bps {
+        let amount_in = capital_cap.saturating_mul(U256::from(bps)) / U256::from(10_000u64);
+        if amount_in.is_zero() {
+            continue;
+        }
+        let Some((_, result)) = pool.simulate_exact_in(input.token_out, input.token_in, amount_in)
+        else {
+            continue;
+        };
+        let repayment_wei = v3_flash_repayment_wei(amount_in, fee_tier);
+        let Some(amount_out_native_wei) =
+            token_amount_to_native_wei(config, input.token_in, result.amount_out)
+        else {
+            continue;
+        };
+        let Some(repayment_native_wei) =
+            token_amount_to_native_wei(config, input.token_out, repayment_wei)
+        else {
+            continue;
+        };
+
+        let (edge_positive, edge_abs_native_wei, gross_profit_native_wei) =
+            if amount_out_native_wei >= repayment_native_wei {
+                let edge = amount_out_native_wei.saturating_sub(repayment_native_wei);
+                (true, edge, edge)
+            } else {
+                (
+                    false,
+                    repayment_native_wei.saturating_sub(amount_out_native_wei),
+                    U256::zero(),
+                )
+            };
+        let net_profit_native_wei = gross_profit_native_wei.saturating_sub(gas_cost_wei);
+        let roi_bps = if repayment_native_wei.is_zero() {
+            0
+        } else {
+            (net_profit_native_wei.saturating_mul(U256::from(10_000u64)) / repayment_native_wei)
+                .min(U256::from(u64::MAX))
+                .as_u64()
+        };
+
+        candidates.push(NormalizedV3Candidate {
+            candidate: V3SizeCandidate {
+                capital_fraction_bps: bps,
+                amount_in,
+                amount_out: result.amount_out,
+                gross_profit_wei: gross_profit_native_wei,
+                net_profit_wei: net_profit_native_wei,
+                roi_bps,
+                self_slippage_bps: result.price_impact_bps,
+            },
+            repayment_wei,
+            amount_out_native_wei,
+            repayment_native_wei,
+            gross_profit_native_wei,
+            net_profit_native_wei,
+            edge_positive,
+            edge_abs_native_wei,
+        });
+    }
+    candidates
+}
+
+fn select_scavenger_v3_candidate(
+    candidates: &[NormalizedV3Candidate],
+) -> Option<NormalizedV3Candidate> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            !candidate.candidate.amount_in.is_zero()
+                && candidate.edge_positive
+                && !candidate.gross_profit_native_wei.is_zero()
+                && candidate.candidate.self_slippage_bps <= 2_500
+        })
+        .max_by_key(|candidate| candidate.gross_profit_native_wei)
+}
+
+fn select_best_v3_candidate(
+    candidates: &[NormalizedV3Candidate],
+    context_priority_score: f64,
+    context_toxicity_score: f64,
+) -> Option<NormalizedV3Candidate> {
+    let priority = context_priority_score.clamp(0.0, 1.5);
+    let toxicity = context_toxicity_score.clamp(0.0, 1.0);
+    candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            candidate.edge_positive
+                && !candidate.net_profit_native_wei.is_zero()
+                && candidate.candidate.self_slippage_bps <= 2_500
+        })
+        .max_by(|left, right| {
+            normalized_v3_sizing_score(*left, priority, toxicity)
+                .total_cmp(&normalized_v3_sizing_score(*right, priority, toxicity))
+        })
+}
+
+fn normalized_v3_sizing_score(
+    candidate: NormalizedV3Candidate,
+    context_priority_score: f64,
+    context_toxicity_score: f64,
+) -> f64 {
+    let net_profit = u256_to_f64(candidate.net_profit_native_wei).unwrap_or(0.0);
+    let roi_component = candidate.candidate.roi_bps as f64 / 10_000.0;
+    let size_component = candidate.candidate.capital_fraction_bps as f64 / 10_000.0;
+    let slippage_penalty = candidate.candidate.self_slippage_bps as f64 / 10_000.0;
+    net_profit
+        * (1.0 + context_priority_score * 0.18)
+        * (1.0 + roi_component * 0.42)
+        * (1.0 + size_component * 0.10)
+        * (1.0 - context_toxicity_score * 0.46)
+        * (1.0 - slippage_penalty * 0.62)
 }
 
 fn format_optional_address(address: Option<Address>) -> String {
@@ -927,8 +993,7 @@ fn best_v2_edge_metadata(
 }
 
 fn best_v3_edge_metadata(
-    config: &Config,
-    candidates: &[V3SizeCandidate],
+    candidates: &[NormalizedV3Candidate],
     input: &FeeExtractionBuildInput,
     price_impact_bps: u64,
     status: &str,
@@ -936,20 +1001,35 @@ fn best_v3_edge_metadata(
 ) -> Option<EdgeMetadata> {
     let candidate = candidates
         .iter()
-        .max_by_key(|candidate| candidate.gross_profit_wei)?;
+        .max_by(|left, right| {
+            let left_positive_score = if left.edge_positive { 1 } else { 0 };
+            let right_positive_score = if right.edge_positive { 1 } else { 0 };
+            left_positive_score
+                .cmp(&right_positive_score)
+                .then_with(|| {
+                    if left.edge_positive {
+                        left.edge_abs_native_wei.cmp(&right.edge_abs_native_wei)
+                    } else {
+                        right.edge_abs_native_wei.cmp(&left.edge_abs_native_wei)
+                    }
+                })
+        })?;
     let fee_tier = match &input.route_kind {
         AmmRouteKind::UniswapV3 { fee_tier, .. } => *fee_tier,
         _ => 0,
     };
-    let repayment = v3_flash_repayment_wei(candidate.amount_in, fee_tier);
-    let amount_out_native_wei =
-        token_amount_to_native_wei(config, input.token_in, candidate.amount_out)
-            .unwrap_or(candidate.amount_out);
-    let repayment_native_wei =
-        token_amount_to_native_wei(config, input.token_out, repayment).unwrap_or(repayment);
-    let gross_native_wei = amount_out_native_wei.saturating_sub(repayment_native_wei);
-    let amount_out_native = wei_to_eth_f64(amount_out_native_wei);
-    let repayment_native = wei_to_eth_f64(repayment_native_wei);
+    let gross_edge_wei = if candidate.edge_positive {
+        candidate.gross_profit_native_wei.to_string()
+    } else {
+        format!("-{}", candidate.edge_abs_native_wei)
+    };
+    let gross_edge_native = if candidate.edge_positive {
+        wei_to_eth_f64(candidate.gross_profit_native_wei)
+    } else {
+        -wei_to_eth_f64(candidate.edge_abs_native_wei)
+    };
+    let amount_out_native = wei_to_eth_f64(candidate.amount_out_native_wei);
+    let repayment_native = wei_to_eth_f64(candidate.repayment_native_wei);
     Some(EdgeMetadata {
         victim_tx: String::new(),
         selector: String::new(),
@@ -966,7 +1046,7 @@ fn best_v3_edge_metadata(
         pool_imbalance_score: 0.0,
         cross_dex_deviation_bps: 0,
         gas_estimate: 0,
-        simulated_extraction_native: wei_to_eth_f64(gross_native_wei),
+        simulated_extraction_native: gross_edge_native,
         aggregator_type: "direct_router".to_string(),
         route_complexity: 1,
         split_ratio_bps: 0,
@@ -974,23 +1054,24 @@ fn best_v3_edge_metadata(
         route_inefficiency_score: 0.0,
         liquidity_distortion_score: 0.0,
         hop_profitability_rank: vec![
-            format!("amount_in={}", candidate.amount_in),
-            format!("amount_out={}", candidate.amount_out),
-            format!("repayment={repayment}"),
+            format!("amount_in={}", candidate.candidate.amount_in),
+            format!("amount_out={}", candidate.candidate.amount_out),
+            format!("repayment={}", candidate.repayment_wei),
             format!("amount_out_native={amount_out_native:.12}"),
             format!("repayment_native={repayment_native:.12}"),
-            format!("gross_edge_native_wei={gross_native_wei}"),
-            "route_kind=v3".to_string(),
+            format!("gross_edge_native_wei={}", candidate.gross_profit_native_wei),
+            format!("edge_positive={}", candidate.edge_positive),
+            format!("route_kind=v3 fee_tier={fee_tier}"),
         ],
-        best_size_bps: candidate.capital_fraction_bps,
-        amount_in_wei: candidate.amount_in.to_string(),
-        amount_out_wei: candidate.amount_out.to_string(),
-        gross_edge_wei: gross_native_wei.to_string(),
-        gross_edge_native: wei_to_eth_f64(gross_native_wei),
-        repayment_wei: repayment.to_string(),
+        best_size_bps: candidate.candidate.capital_fraction_bps,
+        amount_in_wei: candidate.candidate.amount_in.to_string(),
+        amount_out_wei: candidate.candidate.amount_out.to_string(),
+        gross_edge_wei,
+        gross_edge_native,
+        repayment_wei: candidate.repayment_wei.to_string(),
         repayment_native,
         price_impact_bps,
-        self_slippage_bps: candidate.self_slippage_bps,
+        self_slippage_bps: candidate.candidate.self_slippage_bps,
         pool: format!("{:?}", input.pair),
         factory: format_optional_address(input.factory),
         router: format!("{:?}", input.router),
@@ -1128,18 +1209,6 @@ fn v2_repayment_amount_in_profit_token(
     } else {
         Some((numerator / denominator).saturating_add(U256::one()))
     }
-}
-
-fn select_scavenger_v3_candidate(candidates: &[V3SizeCandidate]) -> Option<V3SizeCandidate> {
-    candidates
-        .iter()
-        .copied()
-        .filter(|candidate| {
-            !candidate.amount_in.is_zero()
-                && !candidate.gross_profit_wei.is_zero()
-                && candidate.self_slippage_bps <= 2_500
-        })
-        .max_by_key(|candidate| candidate.gross_profit_wei)
 }
 
 fn effective_payload_min_profit_wei(config: &Config) -> Result<U256, String> {

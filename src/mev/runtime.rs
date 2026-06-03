@@ -1792,38 +1792,28 @@ async fn process_evaluation_task(
     };
     let economic_payload = config.mev.opportunity_mode() != OpportunityMode::Scavenger
         || scavenger_payload_has_economic_edge(&config, &payload, candidate.gas_price);
-    if economic_payload {
-        dashboard.record_opportunity_funnel("payload_built");
+    dashboard.record_opportunity_funnel("payload_built");
+    dashboard.record_selector_performance(
+        &selector_hex(candidate.signal.selector),
+        &address_hex(candidate.signal.router),
+        candidate.signal.decode_source,
+        "payload_built",
+        candidate.signal.decode_confidence,
+        gas_price_gwei(candidate.gas_price),
+    );
+    if !config.allow_send {
+        dashboard.record_opportunity_funnel("shadow_payload_built");
         dashboard.record_selector_performance(
             &selector_hex(candidate.signal.selector),
             &address_hex(candidate.signal.router),
             candidate.signal.decode_source,
-            "payload_built",
+            "shadow_payload_built",
             candidate.signal.decode_confidence,
             gas_price_gwei(candidate.gas_price),
         );
-        if !config.allow_send {
-            dashboard.record_opportunity_funnel("shadow_payload_built");
-            dashboard.record_selector_performance(
-                &selector_hex(candidate.signal.selector),
-                &address_hex(candidate.signal.router),
-                candidate.signal.decode_source,
-                "shadow_payload_built",
-                candidate.signal.decode_confidence,
-                gas_price_gwei(candidate.gas_price),
-            );
-        }
-    } else {
-        dashboard.record_opportunity_funnel("payload_reject");
-        dashboard.record_selector_performance(
-            &selector_hex(candidate.signal.selector),
-            &address_hex(candidate.signal.router),
-            candidate.signal.decode_source,
-            "payload_reject",
-            candidate.signal.decode_confidence,
-            gas_price_gwei(candidate.gas_price),
-        );
-        dashboard.record_reject_reason("payload_build", "scavenger_dust_edge_shadow_only");
+    }
+    if !economic_payload {
+        dashboard.record_reject_reason("ev_gate", "scavenger_edge_below_economic_floor");
     }
     record_payload_pool_shadow(
         &dashboard,

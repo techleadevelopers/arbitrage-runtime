@@ -1,6 +1,4 @@
 use ethers::types::{Address, I256, U256};
-use tracing::debug;
-
 pub const Q96_F64: f64 = 79_228_162_514_264_337_593_543_950_336.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,99 +104,6 @@ impl V3PoolState {
             },
         ))
     }
-}
-
-pub fn size_candidates_v3(
-    pool: &V3PoolState,
-    token_in: Address,
-    token_out: Address,
-    capital_cap: U256,
-    gas_cost_wei: U256,
-    fractions_bps: &[u64],
-) -> Vec<V3SizeCandidate> {
-    if capital_cap.is_zero() {
-        return Vec::new();
-    }
-
-    let mut candidates = Vec::with_capacity(fractions_bps.len());
-    for &bps in fractions_bps {
-        let amount_in = capital_cap.saturating_mul(U256::from(bps)) / U256::from(10_000u64);
-        if amount_in.is_zero() {
-            continue;
-        }
-        let Some((_, result)) = pool.simulate_exact_in(token_in, token_out, amount_in) else {
-            continue;
-        };
-        let gross = result.amount_out.saturating_sub(amount_in);
-        if gross.is_zero() {
-            debug!(
-                pool = ?pool.pool,
-                token_in = ?token_in,
-                token_out = ?token_out,
-                fraction_bps = bps,
-                amount_in = %amount_in,
-                amount_out = %result.amount_out,
-                gas_cost_wei = %gas_cost_wei,
-                price_impact_bps = result.price_impact_bps,
-                "v3 size candidate has zero gross edge"
-            );
-        }
-        let net = gross.saturating_sub(gas_cost_wei);
-        if net.is_zero() {
-            continue;
-        }
-        let roi_bps = if amount_in.is_zero() {
-            0
-        } else {
-            (net.saturating_mul(U256::from(10_000u64)) / amount_in)
-                .min(U256::from(u64::MAX))
-                .as_u64()
-        };
-        candidates.push(V3SizeCandidate {
-            capital_fraction_bps: bps,
-            amount_in,
-            amount_out: result.amount_out,
-            gross_profit_wei: gross,
-            net_profit_wei: net,
-            roi_bps,
-            self_slippage_bps: result.price_impact_bps,
-        });
-    }
-    candidates
-}
-
-pub fn select_best_v3_size_candidate(
-    candidates: &[V3SizeCandidate],
-    context_priority_score: f64,
-    context_toxicity_score: f64,
-) -> Option<V3SizeCandidate> {
-    let priority = context_priority_score.clamp(0.0, 1.5);
-    let toxicity = context_toxicity_score.clamp(0.0, 1.0);
-    candidates.iter().copied().max_by(|left, right| {
-        v3_sizing_score(*left, priority, toxicity)
-            .total_cmp(&v3_sizing_score(*right, priority, toxicity))
-    })
-}
-
-fn v3_sizing_score(
-    candidate: V3SizeCandidate,
-    context_priority_score: f64,
-    context_toxicity_score: f64,
-) -> f64 {
-    let net_profit = candidate
-        .net_profit_wei
-        .to_string()
-        .parse::<f64>()
-        .unwrap_or(0.0);
-    let roi_component = candidate.roi_bps as f64 / 10_000.0;
-    let size_component = candidate.capital_fraction_bps as f64 / 10_000.0;
-    let slippage_penalty = candidate.self_slippage_bps as f64 / 10_000.0;
-    net_profit
-        * (1.0 + context_priority_score * 0.18)
-        * (1.0 + roi_component * 0.42)
-        * (1.0 + size_component * 0.10)
-        * (1.0 - context_toxicity_score * 0.46)
-        * (1.0 - slippage_penalty * 0.62)
 }
 
 fn apply_crossed_tick_liquidity(
