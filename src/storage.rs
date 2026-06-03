@@ -3199,11 +3199,23 @@ fn build_selector_pool_performance_snapshot(
     gas_gwei_sum: f64,
     last_seen: String,
 ) -> SelectorPoolPerformanceSnapshot {
-    let profit_samples = shadow_ev_positive.max(1);
-    let avg_expected_profit = if shadow_ev_positive == 0 {
+    let v3_shadow_ev_unverified =
+        dex_kind.eq_ignore_ascii_case("v3") && partial_replay_candidate_created == 0;
+    let trusted_shadow_ev_positive = if v3_shadow_ev_unverified {
+        0
+    } else {
+        shadow_ev_positive
+    };
+    let trusted_expected_profit_sum = if v3_shadow_ev_unverified {
         0.0
     } else {
-        expected_profit_sum / profit_samples as f64
+        expected_profit_sum
+    };
+    let profit_samples = trusted_shadow_ev_positive.max(1);
+    let avg_expected_profit = if trusted_shadow_ev_positive == 0 {
+        0.0
+    } else {
+        trusted_expected_profit_sum / profit_samples as f64
     };
     let avg_liquidity = if total == 0 {
         0.0
@@ -3215,7 +3227,9 @@ fn build_selector_pool_performance_snapshot(
     } else {
         gas_gwei_sum / total as f64
     };
-    let classification = if shadow_ev_positive > 0 {
+    let classification = if v3_shadow_ev_unverified && shadow_ev_positive > 0 {
+        "v3_shadow_ev_unverified"
+    } else if shadow_ev_positive > 0 {
         "evolve_decoder"
     } else if payload_built > 0 {
         "pool_real_payload_ready"

@@ -1603,35 +1603,56 @@ async fn process_evaluation_task(
             max_gas_price_gwei as f64,
         );
         if gas_price_gwei > adaptive_cap_gwei {
-            candidate.latency_trace.total_internal_us =
-                Some(elapsed_us(candidate.candidate_started));
-            dashboard.record_opportunity_funnel("fast_preflight_reject");
             dashboard.record_reject_reason("gas_price_cap", "victim_gas_price_above_adaptive_cap");
-            record_selector_stage(
-                &dashboard,
-                &candidate.signal,
-                "fast_preflight_reject",
-                candidate.gas_price,
-            );
-            dashboard.event(
-                "warn",
-                format!(
-                    "opportunity skipped victim={:?}: gas price {:.2} gwei above adaptive cap {:.0} gwei ev_upper={:.4}usd hard_cap={} gwei",
+            if scavenger_gas_cap_research_bypass(&config, &candidate.signal, &fast_gate) {
+                dashboard.record_reject_reason("gas_price_cap", "research_bypass_shadow_only");
+                dashboard.event(
+                    "info",
+                    format!(
+                        "opportunity gas-cap research bypass victim={:?}: gas price {:.2} gwei above adaptive cap {:.0} gwei ev_upper={:.4}usd hard_cap={} gwei shadow_only=true",
+                        tx_hash,
+                        gas_price_gwei,
+                        adaptive_cap_gwei,
+                        fast_gate.ev_upper_bound_usd,
+                        max_gas_price_gwei
+                    ),
+                );
+                record_selector_stage(
+                    &dashboard,
+                    &candidate.signal,
+                    "fast_preflight_gas_cap_research_bypass",
+                    candidate.gas_price,
+                );
+            } else {
+                dashboard.event(
+                    "warn",
+                    format!(
+                        "opportunity skipped victim={:?}: gas price {:.2} gwei above adaptive cap {:.0} gwei ev_upper={:.4}usd hard_cap={} gwei",
+                        tx_hash,
+                        gas_price_gwei,
+                        adaptive_cap_gwei,
+                        fast_gate.ev_upper_bound_usd,
+                        max_gas_price_gwei
+                    ),
+                );
+                candidate.latency_trace.total_internal_us =
+                    Some(elapsed_us(candidate.candidate_started));
+                dashboard.record_opportunity_funnel("fast_preflight_reject");
+                record_selector_stage(
+                    &dashboard,
+                    &candidate.signal,
+                    "fast_preflight_reject",
+                    candidate.gas_price,
+                );
+                candidate.latency_trace.emit(
+                    &config,
+                    &dashboard,
                     tx_hash,
-                    gas_price_gwei,
-                    adaptive_cap_gwei,
-                    fast_gate.ev_upper_bound_usd,
-                    max_gas_price_gwei
-                ),
-            );
-            candidate.latency_trace.emit(
-                &config,
-                &dashboard,
-                tx_hash,
-                "reject",
-                "gas_price_adaptive_cap",
-            );
-            return None;
+                    "reject",
+                    "gas_price_adaptive_cap",
+                );
+                return None;
+            }
         }
     }
 
@@ -4500,6 +4521,11 @@ fn record_payload_pool_shadow(
     economic_payload: bool,
     gas_gwei: f64,
 ) {
+    let v3_without_tick_ranges = matches!(
+        &payload.pool_state_before,
+        AmmState::UniswapV3(pool) if pool.initialized_ticks.is_empty()
+    );
+    let economic_payload = economic_payload && !v3_without_tick_ranges;
     let pool = payload
         .edge_metadata
         .as_ref()
@@ -4655,10 +4681,17 @@ fn record_payload_pool_reject(
     edge_sample: Option<&EdgeMetadata>,
     gas_gwei: f64,
 ) {
+    let detail = payload_detail.to_ascii_lowercase();
     if let Some(sample) = edge_sample {
         let pool = sample.pool.trim();
         if !pool.is_empty() && pool != "unknown" {
-            let expected_profit = sample.gross_edge_native.max(0.0);
+            let v3_shadow_ev_blocked =
+                detail.contains("v3_tick_data_missing") || detail.contains("shadow_v3_ev_blocked");
+            let expected_profit = if v3_shadow_ev_blocked {
+                0.0
+            } else {
+                sample.gross_edge_native.max(0.0)
+            };
             record_pool_shadow_stage(
                 dashboard,
                 signal,
@@ -4672,7 +4705,7 @@ fn record_payload_pool_reject(
                 0.0,
                 gas_gwei,
             );
-            let ev_stage = if sample.gross_edge_native > 0.0 {
+            let ev_stage = if !v3_shadow_ev_blocked && sample.gross_edge_native > 0.0 {
                 if signal.is_partial_decode() {
                     "partial_shadow_ev_positive"
                 } else {
@@ -4696,7 +4729,6 @@ fn record_payload_pool_reject(
         }
     }
 
-    let detail = payload_detail.to_ascii_lowercase();
     if detail.contains("pair_not_found")
         || detail.contains("pool_not_found")
         || detail.contains("factory_wrong_or_unavailable")
@@ -8541,14 +8573,14 @@ fn input_contains_address(input: &[u8], address: Address) -> bool {
 
 fn amount_hint_from_calldata(input: &[u8]) -> Option<U256> {
     let min = U256::from(10_000u64);
-    let max = U256::from_dec_str("1000000000000000000000000000000").ok()?;
+    let max = U256::from_dec_str("1000000000000000000000000").ok()?;
     input
         .chunks_exact(32)
         .filter_map(|word| {
             let value = U256::from_big_endian(word);
             (value >= min && value <= max).then_some(value)
         })
-        .max()
+        .min()
 }
 
 fn aggregator_slippage_hint(source: &str, tx: &Transaction) -> f64 {
@@ -9061,6 +9093,19 @@ mod tests {
         let path = partial_path_from_monitored_tokens(&monitored, &args);
 
         assert_eq!(path, vec![usdt, usdc]);
+    }
+
+    #[test]
+    fn amount_hint_uses_conservative_plausible_value() {
+        let huge = U256::from_dec_str("1000000000000000000000000000000000000").unwrap();
+        let small = U256::from(50_000u64);
+        let input = encode(&[
+            Token::Uint(huge),
+            Token::Uint(U256::from(1_000_000u64)),
+            Token::Uint(small),
+        ]);
+
+        assert_eq!(amount_hint_from_calldata(&input), Some(small));
     }
 
     #[test]
@@ -9601,6 +9646,15 @@ fn env_usize_clamped(env_name: &str, default: usize, min: usize, max: usize) -> 
         .clamp(min, max)
 }
 
+fn env_f64_clamped(env_name: &str, default: f64, min: f64, max: f64) -> f64 {
+    std::env::var(env_name)
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
 fn replay_min_confidence() -> f64 {
     std::env::var("MEV_REPLAY_MIN_CONFIDENCE")
         .ok()
@@ -9611,6 +9665,19 @@ fn replay_min_confidence() -> f64 {
 
 fn replay_min_repeat_count() -> u64 {
     env_usize_clamped("MEV_REPLAY_MIN_REPEAT_COUNT", 3, 1, 100) as u64
+}
+
+fn scavenger_gas_cap_research_bypass(
+    config: &Config,
+    signal: &SwapSignal,
+    fast_gate: &FastPreflightDecision,
+) -> bool {
+    config.mev.opportunity_mode() == OpportunityMode::Scavenger
+        && !config.allow_send
+        && env_bool("MEV_SCAVENGER_GAS_CAP_RESEARCH_BYPASS", true)
+        && signal.decode_confidence >= 0.35
+        && fast_gate.gas_ratio
+            <= env_f64_clamped("MEV_SCAVENGER_RESEARCH_MAX_GAS_RATIO", 25.0, 1.0, 100.0)
 }
 
 fn token_as_uint(token: &Token) -> Option<U256> {

@@ -193,14 +193,20 @@ impl PayloadBuilder {
         } else {
             input.v2_swap_pools.clone()
         };
-        let capital_cap_token =
-            native_wei_to_token_amount(config, input.token_out, input.capital_available_wei)
-                .ok_or_else(|| {
-                    format!(
-                "token normalization failed for borrow token {:?}: missing decimals/price metadata",
-                input.token_out
+        let capital_cap_token = v2_borrow_cap_from_native(
+            config,
+            input.token_out,
+            input.token_in,
+            input.capital_available_wei,
+            reserve_in,
+            reserve_out,
+        )
+        .ok_or_else(|| {
+            format!(
+                "token normalization failed for borrow token {:?}: missing decimals/price metadata and pool-derived fallback unavailable profit_token={:?} reserve_in={} reserve_out={}",
+                input.token_out, input.token_in, reserve_in, reserve_out
             )
-                })?;
+        })?;
         let candidates = fee_extraction_v2_size_candidates(
             config,
             reserve_in,
@@ -1304,6 +1310,24 @@ fn token_amount_to_native_wei(config: &Config, token: Address, amount: U256) -> 
     f64_to_u256_floor(native * 1e18)
 }
 
+fn v2_borrow_cap_from_native(
+    config: &Config,
+    borrow_token: Address,
+    profit_token: Address,
+    native_wei: U256,
+    borrow_reserve: U256,
+    profit_reserve: U256,
+) -> Option<U256> {
+    if let Some(amount) = native_wei_to_token_amount(config, borrow_token, native_wei) {
+        return Some(amount);
+    }
+    if borrow_reserve.is_zero() || profit_reserve.is_zero() {
+        return None;
+    }
+    let profit_amount = native_wei_to_token_amount(config, profit_token, native_wei)?;
+    Some(profit_amount.saturating_mul(borrow_reserve) / profit_reserve)
+}
+
 fn native_wei_to_token_amount(config: &Config, token: Address, native_wei: U256) -> Option<U256> {
     let metadata = token_metadata(config, token)?;
     if metadata.price_eth <= 0.0 {
@@ -1475,6 +1499,24 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("v3_tick_data_missing_for_shadow_ev"));
+    }
+
+    #[test]
+    fn v2_borrow_cap_falls_back_to_pool_ratio_when_borrow_metadata_missing() {
+        let config = test_config();
+        let borrow = Address::from_low_u64_be(2);
+        let profit = Address::from_low_u64_be(1);
+        let cap = v2_borrow_cap_from_native(
+            &config,
+            borrow,
+            profit,
+            U256::exp10(18),
+            U256::from(2_000u64),
+            U256::from(1_000u64),
+        )
+        .unwrap();
+
+        assert_eq!(cap, U256::from(2u64) * U256::exp10(18));
     }
 
     #[test]
