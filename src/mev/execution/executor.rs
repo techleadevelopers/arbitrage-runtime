@@ -569,7 +569,8 @@ impl ExecutionEngine {
                             ),
                         );
                         self.dashboard.record_opportunity_funnel("submit_succeeded");
-                        self.dashboard.record_reject_reason("submit", "rpc_submit_succeeded");
+                        self.dashboard
+                            .record_reject_reason("submit", "rpc_submit_succeeded");
                         submit_set.abort_all();
                         let realized = self
                             .observe_realized_pnl(
@@ -716,7 +717,8 @@ impl ExecutionEngine {
                         inclusion_rate: Some(relay.inclusion_rate),
                     });
                     self.dashboard.record_opportunity_funnel("submit_succeeded");
-                    self.dashboard.record_reject_reason("submit", "relay_submit_succeeded");
+                    self.dashboard
+                        .record_reject_reason("submit", "relay_submit_succeeded");
                     self.dashboard.record_latency(
                         "fee_bundle_submit",
                         submit_latency_ms as u128,

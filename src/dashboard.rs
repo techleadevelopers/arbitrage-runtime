@@ -1570,7 +1570,8 @@ impl DashboardHandle {
                 funnel.adaptive_quote_error = funnel.adaptive_quote_error.saturating_add(1)
             }
             "execution_ready_candidate" => {
-                funnel.execution_ready_candidate = funnel.execution_ready_candidate.saturating_add(1)
+                funnel.execution_ready_candidate =
+                    funnel.execution_ready_candidate.saturating_add(1)
             }
             "execution_ready" => funnel.execution_ready = funnel.execution_ready.saturating_add(1),
             "execution_ready_reject" => {
@@ -1953,15 +1954,21 @@ fn build_reject_breakdown(reasons: &[RejectReasonSnapshot]) -> Vec<RejectBreakdo
             entry.2 = reason.count;
         }
     }
-    let total = buckets.values().map(|(count, _, _)| *count).sum::<u64>().max(1);
+    let total = buckets
+        .values()
+        .map(|(count, _, _)| *count)
+        .sum::<u64>()
+        .max(1);
     let mut rows = buckets
         .into_iter()
-        .map(|(category, (count, top_reason, _))| RejectBreakdownSnapshot {
-            category: category.to_string(),
-            count,
-            pct: (count as f64 / total as f64) * 100.0,
-            top_reason,
-        })
+        .map(
+            |(category, (count, top_reason, _))| RejectBreakdownSnapshot {
+                category: category.to_string(),
+                count,
+                pct: (count as f64 / total as f64) * 100.0,
+                top_reason,
+            },
+        )
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| right.count.cmp(&left.count));
     rows.truncate(8);
@@ -1994,7 +2001,10 @@ fn reject_breakdown_category(stage: &str, reason: &str) -> &'static str {
         "decode_fail"
     } else if haystack.contains("adaptive") || haystack.contains("quote") {
         "adaptive_quote"
-    } else if haystack.contains("submit") || haystack.contains("relay") || haystack.contains("rpc_submit") {
+    } else if haystack.contains("submit")
+        || haystack.contains("relay")
+        || haystack.contains("rpc_submit")
+    {
         "submit"
     } else if haystack.contains("preflight") {
         "preflight"

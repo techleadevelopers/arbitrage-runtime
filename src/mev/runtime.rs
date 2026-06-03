@@ -73,6 +73,12 @@ const AGGREGATOR_SELECTOR_C3192F1F: [u8; 4] = [0xc3, 0x19, 0x2f, 0x1f];
 const AGGREGATOR_SELECTOR_CDD1B25D: [u8; 4] = [0xcd, 0xd1, 0xb2, 0x5d];
 const AGGREGATOR_SELECTOR_F2881E21: [u8; 4] = [0xf2, 0x88, 0x1e, 0x21];
 const BALANCER_SELECTOR_46495152: [u8; 4] = [0x46, 0x49, 0x51, 0x52];
+const PRIVATE_SEARCHER_SELECTOR_D00BA30B: [u8; 4] = [0xd0, 0x0b, 0xa3, 0x0b];
+const PRIVATE_SWAP_WRAPPER_2E35732F: [u8; 4] = [0x2e, 0x35, 0x73, 0x2f];
+const POLYMARKET_BATCH_EXECUTE: [u8; 4] = [0x02, 0x3e, 0x8d, 0x84];
+const WOOFI_WOORACLE_POST_STATE: [u8; 4] = [0x71, 0xea, 0x92, 0x05];
+const UNISWAP_V3_EXACT_INPUT_SINGLE_NO_DEADLINE: [u8; 4] = [0x04, 0xe4, 0x5a, 0xaf];
+const ALGEBRA_EXACT_INPUT_SINGLE: [u8; 4] = [0xbc, 0x65, 0x11, 0x88];
 const CONTEXT_WRAP_SELECTOR: [u8; 4] = [0x62, 0x35, 0x56, 0x38];
 const ENTRYPOINT_HANDLE_OPS: [u8; 4] = [0x76, 0x5e, 0x82, 0x7f];
 const SELECTOR_NOISE_00000008: [u8; 4] = [0x00, 0x00, 0x00, 0x08];
@@ -1792,8 +1798,6 @@ async fn process_evaluation_task(
             return None;
         }
     };
-    let economic_payload = config.mev.opportunity_mode() != OpportunityMode::Scavenger
-        || scavenger_payload_has_economic_edge(&config, &payload, candidate.gas_price);
     dashboard.record_opportunity_funnel("payload_built");
     dashboard.record_selector_performance(
         &selector_hex(candidate.signal.selector),
@@ -1814,6 +1818,83 @@ async fn process_evaluation_task(
             gas_price_gwei(candidate.gas_price),
         );
     }
+    record_payload_lifecycle(
+        &dashboard,
+        tx_hash,
+        &candidate.signal,
+        &payload,
+        candidate.gas_price,
+        "payload_built",
+        "not_attempted",
+        "",
+        "",
+        None,
+        "payload accepted by builder",
+    );
+    let ev_validation =
+        validate_payload_ev(&config, &payload, &candidate.signal, candidate.gas_price);
+    if !ev_validation.pass {
+        dashboard.record_opportunity_funnel("ev_validation_failed");
+        dashboard.record_reject_reason("ev_validation", ev_validation.reason);
+        record_selector_stage(
+            &dashboard,
+            &candidate.signal,
+            "ev_validation_failed",
+            candidate.gas_price,
+        );
+        record_payload_lifecycle(
+            &dashboard,
+            tx_hash,
+            &candidate.signal,
+            &payload,
+            candidate.gas_price,
+            "ev_validation_failed",
+            "not_attempted",
+            "ev_validation_failed",
+            "",
+            Some(match ev_validation.reason {
+                "token_decimals_unknown" | "invalid_token_metadata" => {
+                    ExecutionRejectReason::InvalidDecimals
+                }
+                "reserve_normalization_zero" | "pool_token_mismatch" | "v3_liquidity_zero" => {
+                    ExecutionRejectReason::LowLiquidity
+                }
+                "sqrt_price_x96_zero" | "tick_sqrt_price_mismatch" => {
+                    ExecutionRejectReason::InvalidNormalization
+                }
+                _ => ExecutionRejectReason::EvValidationFailed,
+            }),
+            &ev_validation.detail,
+        );
+        dashboard.event(
+            "warn",
+            format!(
+                "ev_validation_failed tx={} selector={} reason={} gross_usd={:.6} net_usd={:.6} gas_usd={:.6} roi={}bps detail={}",
+                short_hash(tx_hash),
+                selector_hex(candidate.signal.selector),
+                ev_validation.reason,
+                ev_validation.gross_edge_usd,
+                ev_validation.net_edge_usd,
+                ev_validation.gas_cost_usd,
+                ev_validation.roi_bps,
+                ev_validation.detail
+            ),
+        );
+        candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        candidate.latency_trace.emit(
+            &config,
+            &dashboard,
+            tx_hash,
+            "reject",
+            "ev_validation_failed",
+        );
+        return None;
+    }
+    dashboard.record_opportunity_funnel("ev_validation_pass");
+    dashboard.record_reject_reason("ev_validation", ev_validation.reason);
+
+    let economic_payload = config.mev.opportunity_mode() != OpportunityMode::Scavenger
+        || scavenger_payload_has_economic_edge(&config, &payload, candidate.gas_price);
     if !economic_payload {
         dashboard.record_reject_reason("ev_gate", "scavenger_edge_below_economic_floor");
     }
@@ -1933,7 +2014,12 @@ async fn process_evaluation_task(
             let ev_diag =
                 scavenger_economic_edge_diagnostic(&config, &payload, candidate.gas_price);
             dashboard.record_reject_reason("ev_gate", ev_diag.reason);
-            record_selector_stage(&dashboard, &candidate.signal, "ev_gate_reject", candidate.gas_price);
+            record_selector_stage(
+                &dashboard,
+                &candidate.signal,
+                "ev_gate_reject",
+                candidate.gas_price,
+            );
             dashboard.record_edge_sample(ev_gate_edge_sample(
                 tx_hash,
                 &candidate.signal,
@@ -1962,6 +2048,19 @@ async fn process_evaluation_task(
             candidate.latency_trace.total_internal_us =
                 Some(elapsed_us(candidate.candidate_started));
             dashboard.record_opportunity_funnel("ev_gate_reject");
+            record_payload_lifecycle(
+                &dashboard,
+                tx_hash,
+                &candidate.signal,
+                &payload,
+                candidate.gas_price,
+                "ev_gate_reject",
+                "not_attempted",
+                "economic_payload_failed",
+                "",
+                Some(ExecutionRejectReason::NegativeEdge),
+                &ev_diag.detail,
+            );
             candidate.latency_trace.emit(
                 &config,
                 &dashboard,
@@ -1978,7 +2077,12 @@ async fn process_evaluation_task(
             let ev_diag =
                 scavenger_sanity_diagnostic(&config, &payload, candidate.lookup_latency, reason);
             dashboard.record_reject_reason("ev_gate", ev_diag.reason);
-            record_selector_stage(&dashboard, &candidate.signal, "ev_gate_reject", candidate.gas_price);
+            record_selector_stage(
+                &dashboard,
+                &candidate.signal,
+                "ev_gate_reject",
+                candidate.gas_price,
+            );
             dashboard.record_edge_sample(ev_gate_edge_sample(
                 tx_hash,
                 &candidate.signal,
@@ -2008,6 +2112,26 @@ async fn process_evaluation_task(
                 Some(elapsed_us(candidate.candidate_started));
             dashboard.record_opportunity_funnel("ev_gate_reject");
             dashboard.record_reject_reason("scavenger_sanity", reason);
+            record_payload_lifecycle(
+                &dashboard,
+                tx_hash,
+                &candidate.signal,
+                &payload,
+                candidate.gas_price,
+                "execution_ready_reject",
+                "not_attempted",
+                "scavenger_sanity_failed",
+                "",
+                Some(match reason {
+                    "scavenger_gas_limit_above_cap" => ExecutionRejectReason::GasTooHigh,
+                    "scavenger_price_impact_above_cap" => ExecutionRejectReason::HighPriceImpact,
+                    "scavenger_no_positive_gross_edge" => ExecutionRejectReason::NegativeEdge,
+                    "scavenger_zero_capital" => ExecutionRejectReason::RepaymentRisk,
+                    "scavenger_missing_target" => ExecutionRejectReason::UnknownPool,
+                    _ => ExecutionRejectReason::EvValidationFailed,
+                }),
+                &ev_diag.detail,
+            );
             candidate
                 .latency_trace
                 .emit(&config, &dashboard, tx_hash, "reject", reason);
@@ -2017,8 +2141,15 @@ async fn process_evaluation_task(
         candidate.latency_trace.quality_gate_us = Some(0);
         candidate.latency_trace.adaptive_quote_us = Some(0);
         dashboard.record_opportunity_funnel("ev_gate_pass");
-        record_selector_stage(&dashboard, &candidate.signal, "ev_gate_pass", candidate.gas_price);
+        record_selector_stage(
+            &dashboard,
+            &candidate.signal,
+            "ev_gate_pass",
+            candidate.gas_price,
+        );
+        dashboard.record_opportunity_funnel("quote_attempt");
         dashboard.record_opportunity_funnel("adaptive_quote_candidate");
+        dashboard.record_opportunity_funnel("quote_success");
         dashboard.record_opportunity_funnel("adaptive_quote_pass");
         dashboard.record_opportunity_funnel("execution_ready_candidate");
 
@@ -2044,7 +2175,42 @@ async fn process_evaluation_task(
             "scavenger_sanity_fast_path",
         );
         dashboard.record_opportunity_funnel("execution_ready");
-        record_selector_stage(&dashboard, &candidate.signal, "execution_ready", candidate.gas_price);
+        record_selector_stage(
+            &dashboard,
+            &candidate.signal,
+            "execution_ready",
+            candidate.gas_price,
+        );
+        record_payload_lifecycle(
+            &dashboard,
+            tx_hash,
+            &candidate.signal,
+            opportunity.execution_payload.as_ref().expect("payload exists"),
+            candidate.gas_price,
+            "execution_ready",
+            "success",
+            "",
+            "scavenger_sanity_fast_path",
+            None,
+            &format!(
+                "quote_latency_ms=0 gross_edge_before_quote={:.12} gross_edge_after_quote={:.12} confidence_score={:.6}",
+                wei_to_eth_f64(
+                    opportunity
+                        .execution_payload
+                        .as_ref()
+                        .map(|payload| payload.expected_profit_wei)
+                        .unwrap_or_default()
+                ),
+                wei_to_eth_f64(
+                    opportunity
+                        .execution_payload
+                        .as_ref()
+                        .map(|payload| payload.expected_profit_wei)
+                        .unwrap_or_default()
+                ),
+                candidate.signal.decode_confidence
+            ),
+        );
         dashboard.record_edge_sample(execution_ready_edge_sample(
             tx_hash,
             &candidate.signal,
@@ -2102,7 +2268,12 @@ async fn process_evaluation_task(
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
         dashboard.record_opportunity_funnel("ev_gate_reject");
         dashboard.record_reject_reason("ev_gate", ev_diag.reason);
-        record_selector_stage(&dashboard, &candidate.signal, "ev_gate_reject", candidate.gas_price);
+        record_selector_stage(
+            &dashboard,
+            &candidate.signal,
+            "ev_gate_reject",
+            candidate.gas_price,
+        );
         dashboard.record_edge_sample(ev_gate_edge_sample(
             tx_hash,
             &candidate.signal,
@@ -2111,6 +2282,26 @@ async fn process_evaluation_task(
             "ev_gate_reject",
             &ev_diag,
         ));
+        record_payload_lifecycle(
+            &dashboard,
+            tx_hash,
+            &candidate.signal,
+            &payload,
+            candidate.gas_price,
+            "ev_gate_reject",
+            "not_attempted",
+            "ev_gate_failed",
+            "",
+            Some(match ev_diag.reason {
+                "ev_gas_limit_above_cap" => ExecutionRejectReason::GasTooHigh,
+                "ev_profit_below_min_wei"
+                | "ev_profit_below_min_usd"
+                | "ev_zero_expected_profit" => ExecutionRejectReason::NegativeEdge,
+                "ev_price_impact_too_low" => ExecutionRejectReason::HighPriceImpact,
+                _ => ExecutionRejectReason::EvValidationFailed,
+            }),
+            &ev_diag.detail,
+        );
         dashboard.event(
             "warn",
             format!(
@@ -2133,7 +2324,12 @@ async fn process_evaluation_task(
         return None;
     }
     dashboard.record_opportunity_funnel("ev_gate_pass");
-    record_selector_stage(&dashboard, &candidate.signal, "ev_gate_pass", candidate.gas_price);
+    record_selector_stage(
+        &dashboard,
+        &candidate.signal,
+        "ev_gate_pass",
+        candidate.gas_price,
+    );
     candidate.latency_trace.ev_gate_us = Some(elapsed_us(ev_gate_started));
 
     let execution_cost_wei = candidate
@@ -2158,6 +2354,27 @@ async fn process_evaluation_task(
             "quality_gate_reject",
             &quality_diag,
         ));
+        record_payload_lifecycle(
+            &dashboard,
+            tx_hash,
+            &candidate.signal,
+            &payload,
+            candidate.gas_price,
+            "execution_ready_reject",
+            "not_attempted",
+            "quality_gate_failed",
+            "",
+            Some(match quality_diag.reason {
+                "quality_price_impact_above_cap" | "quality_impact_score_above_cap" => {
+                    ExecutionRejectReason::HighPriceImpact
+                }
+                "quality_zero_expected_profit" | "quality_roi_below_min" => {
+                    ExecutionRejectReason::NegativeEdge
+                }
+                _ => ExecutionRejectReason::EvValidationFailed,
+            }),
+            &quality_diag.detail,
+        );
         candidate
             .latency_trace
             .emit(&config, &dashboard, tx_hash, "reject", quality_diag.reason);
@@ -2166,6 +2383,7 @@ async fn process_evaluation_task(
     candidate.latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
 
     let adaptive_quote_started = Instant::now();
+    dashboard.record_opportunity_funnel("quote_attempt");
     dashboard.record_opportunity_funnel("adaptive_quote_candidate");
     let quote = if let Ok(mut model) = adaptive.lock() {
         model.quote_for_relays(
@@ -2187,11 +2405,30 @@ async fn process_evaluation_task(
         )
     } else {
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        dashboard.record_opportunity_funnel("quote_failure");
         dashboard.record_opportunity_funnel("adaptive_quote_error");
-        record_selector_stage(&dashboard, &candidate.signal, "adaptive_quote_error", candidate.gas_price);
+        record_selector_stage(
+            &dashboard,
+            &candidate.signal,
+            "adaptive_quote_error",
+            candidate.gas_price,
+        );
         dashboard.record_opportunity_funnel("execution_ready_candidate");
         dashboard.record_opportunity_funnel("execution_ready_reject");
         dashboard.record_reject_reason("adaptive", "adaptive_model_lock_failed");
+        record_payload_lifecycle(
+            &dashboard,
+            tx_hash,
+            &candidate.signal,
+            &payload,
+            candidate.gas_price,
+            "adaptive_quote_error",
+            "failure",
+            "adaptive_model_lock_failed",
+            "",
+            Some(ExecutionRejectReason::QuoteFailed),
+            "quote_latency_ms=0",
+        );
         dashboard.record_edge_sample(adaptive_quote_edge_sample(
             tx_hash,
             &candidate.signal,
@@ -2218,13 +2455,40 @@ async fn process_evaluation_task(
     let mode_override = should_override_adaptive_reject(&config, &quote);
     if !quote.should_execute && !mode_override {
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        dashboard.record_opportunity_funnel("quote_failure");
         dashboard.record_opportunity_funnel("adaptive_quote_reject");
-        record_selector_stage(&dashboard, &candidate.signal, "adaptive_quote_reject", candidate.gas_price);
+        record_selector_stage(
+            &dashboard,
+            &candidate.signal,
+            "adaptive_quote_reject",
+            candidate.gas_price,
+        );
         dashboard.record_opportunity_funnel("execution_ready_candidate");
         dashboard.record_opportunity_funnel("execution_ready_reject");
         if let Some(reason) = quote.reject_reason {
             dashboard.record_reject_reason("adaptive", reason);
         }
+        record_payload_lifecycle(
+            &dashboard,
+            tx_hash,
+            &candidate.signal,
+            &payload,
+            candidate.gas_price,
+            "adaptive_quote_reject",
+            "failure",
+            quote.reject_reason.as_deref().unwrap_or("adaptive_reject"),
+            "",
+            Some(ExecutionRejectReason::AdaptiveRejected),
+            &format!(
+                "quote_latency_ms={} gross_edge_before_quote={:.12} gross_edge_after_quote={:.12} gas_cost_usd={:.6} price_impact_bps={} confidence_score={:.6}",
+                adaptive_quote_started.elapsed().as_millis(),
+                wei_to_eth_f64(payload.expected_profit_wei),
+                quote.ev_real_usd / config.mev.eth_usd_price.max(0.000_001),
+                wei_to_eth_f64(execution_cost_wei) * config.mev.eth_usd_price,
+                payload.price_impact_bps,
+                candidate.signal.decode_confidence
+            ),
+        );
         dashboard.record_edge_sample(adaptive_quote_edge_sample(
             tx_hash,
             &candidate.signal,
@@ -2245,8 +2509,36 @@ async fn process_evaluation_task(
         );
         return None;
     }
+    dashboard.record_opportunity_funnel("quote_success");
     dashboard.record_opportunity_funnel("adaptive_quote_pass");
-    record_selector_stage(&dashboard, &candidate.signal, "adaptive_quote_pass", candidate.gas_price);
+    record_selector_stage(
+        &dashboard,
+        &candidate.signal,
+        "adaptive_quote_pass",
+        candidate.gas_price,
+    );
+    record_payload_lifecycle(
+        &dashboard,
+        tx_hash,
+        &candidate.signal,
+        &payload,
+        candidate.gas_price,
+        "adaptive_quote_pass",
+        "success",
+        "",
+        "adaptive_passed",
+        None,
+        &format!(
+            "quote_latency_ms={} gross_edge_before_quote={:.12} gross_edge_after_quote={:.12} gas_cost_usd={:.6} price_impact_bps={} liquidity_depth={:.12} confidence_score={:.6}",
+            adaptive_quote_started.elapsed().as_millis(),
+            wei_to_eth_f64(payload.expected_profit_wei),
+            quote.ev_real_usd / config.mev.eth_usd_price.max(0.000_001),
+            wei_to_eth_f64(execution_cost_wei) * config.mev.eth_usd_price,
+            payload.price_impact_bps,
+            payload_pool_liquidity(&payload),
+            candidate.signal.decode_confidence
+        ),
+    );
     dashboard.record_edge_sample(adaptive_quote_edge_sample(
         tx_hash,
         &candidate.signal,
@@ -2327,7 +2619,34 @@ async fn process_evaluation_task(
     );
     dashboard.record_opportunity_funnel("execution_ready_candidate");
     dashboard.record_opportunity_funnel("execution_ready");
-    record_selector_stage(&dashboard, &candidate.signal, "execution_ready", candidate.gas_price);
+    record_selector_stage(
+        &dashboard,
+        &candidate.signal,
+        "execution_ready",
+        candidate.gas_price,
+    );
+    record_payload_lifecycle(
+        &dashboard,
+        tx_hash,
+        &candidate.signal,
+        opportunity
+            .execution_payload
+            .as_ref()
+            .expect("payload exists"),
+        candidate.gas_price,
+        "execution_ready",
+        "success",
+        "",
+        "adaptive_passed",
+        None,
+        &format!(
+            "quote_latency_ms={} ev_real_usd={:.6} p_positive={:.6} selected_relay={}",
+            adaptive_quote_started.elapsed().as_millis(),
+            quote.ev_real_usd,
+            quote.p_positive,
+            quote.selected_relay.as_deref().unwrap_or("unknown")
+        ),
+    );
     dashboard.record_edge_sample(execution_ready_edge_sample(
         tx_hash,
         &candidate.signal,
@@ -2401,6 +2720,50 @@ struct GateDiagnostic {
     roi_bps: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ExecutionRejectReason {
+    GasTooHigh,
+    NegativeEdge,
+    LowLiquidity,
+    HighPriceImpact,
+    QuoteFailed,
+    RepaymentRisk,
+    UnknownPool,
+    InvalidDecimals,
+    InvalidNormalization,
+    EvValidationFailed,
+    AdaptiveRejected,
+}
+
+impl ExecutionRejectReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::GasTooHigh => "GasTooHigh",
+            Self::NegativeEdge => "NegativeEdge",
+            Self::LowLiquidity => "LowLiquidity",
+            Self::HighPriceImpact => "HighPriceImpact",
+            Self::QuoteFailed => "QuoteFailed",
+            Self::RepaymentRisk => "RepaymentRisk",
+            Self::UnknownPool => "UnknownPool",
+            Self::InvalidDecimals => "InvalidDecimals",
+            Self::InvalidNormalization => "InvalidNormalization",
+            Self::EvValidationFailed => "EvValidationFailed",
+            Self::AdaptiveRejected => "AdaptiveRejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EvValidationReport {
+    pass: bool,
+    reason: &'static str,
+    detail: String,
+    gross_edge_usd: f64,
+    net_edge_usd: f64,
+    gas_cost_usd: f64,
+    roi_bps: u64,
+}
+
 fn quality_gate_diagnostic(
     config: &Config,
     payload: &crate::mev::execution::payload_builder::ExecutionPayload,
@@ -2463,6 +2826,195 @@ fn quality_gate_diagnostic(
         net_ev_usd: wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price,
         roi_bps: roi,
     }
+}
+
+fn validate_payload_ev(
+    config: &Config,
+    payload: &ExecutionPayload,
+    signal: &SwapSignal,
+    gas_price: U256,
+) -> EvValidationReport {
+    let gas_cost_wei = gas_price
+        .saturating_mul(U256::from(payload.gas_limit))
+        .saturating_mul(U256::from(config.mev.gas_safety_margin_bps))
+        / U256::from(10_000u64);
+    let gross_edge_usd = wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price;
+    let gas_cost_usd = wei_to_eth_f64(gas_cost_wei) * config.mev.eth_usd_price;
+    let net_edge_usd = gross_edge_usd - gas_cost_usd;
+    let roi = roi_bps(payload.expected_profit_wei, gas_cost_wei);
+
+    let profit_meta = config
+        .monitored_tokens
+        .iter()
+        .find(|token| token.address == payload.profit_token);
+    let Some(profit_meta) = profit_meta else {
+        return EvValidationReport {
+            pass: false,
+            reason: "token_decimals_unknown",
+            detail: format!(
+                "profit_token={:?} selector={}",
+                payload.profit_token,
+                selector_hex(signal.selector)
+            ),
+            gross_edge_usd,
+            net_edge_usd,
+            gas_cost_usd,
+            roi_bps: roi,
+        };
+    };
+    if profit_meta.decimals > 30
+        || !profit_meta.price_eth.is_finite()
+        || profit_meta.price_eth <= 0.0
+    {
+        return EvValidationReport {
+            pass: false,
+            reason: "invalid_token_metadata",
+            detail: format!(
+                "profit_token={:?} decimals={} price_eth={}",
+                payload.profit_token, profit_meta.decimals, profit_meta.price_eth
+            ),
+            gross_edge_usd,
+            net_edge_usd,
+            gas_cost_usd,
+            roi_bps: roi,
+        };
+    }
+    if !gross_edge_usd.is_finite() || !net_edge_usd.is_finite() || !gas_cost_usd.is_finite() {
+        return EvValidationReport {
+            pass: false,
+            reason: "non_finite_ev",
+            detail: format!(
+                "gross_edge_usd={gross_edge_usd} net_edge_usd={net_edge_usd} gas_cost_usd={gas_cost_usd}"
+            ),
+            gross_edge_usd,
+            net_edge_usd,
+            gas_cost_usd,
+            roi_bps: roi,
+        };
+    }
+    if gross_edge_usd > 10_000.0 || roi > 100_000 {
+        return EvValidationReport {
+            pass: false,
+            reason: "ev_outlier_profit_or_roi",
+            detail: format!(
+                "gross_edge_usd={gross_edge_usd:.6} net_edge_usd={net_edge_usd:.6} gas_cost_usd={gas_cost_usd:.6} roi_bps={roi} expected_profit_wei={} capital_wei={}",
+                payload.expected_profit_wei, payload.capital_committed_wei
+            ),
+            gross_edge_usd,
+            net_edge_usd,
+            gas_cost_usd,
+            roi_bps: roi,
+        };
+    }
+    if payload.capital_committed_wei.is_zero() {
+        return EvValidationReport {
+            pass: false,
+            reason: "capital_usage_zero",
+            detail: "payload capital_committed_wei is zero".to_string(),
+            gross_edge_usd,
+            net_edge_usd,
+            gas_cost_usd,
+            roi_bps: roi,
+        };
+    }
+
+    match &payload.pool_state_before {
+        AmmState::UniswapV2(pool) => {
+            if pool.reserve0.is_zero() || pool.reserve1.is_zero() {
+                return EvValidationReport {
+                    pass: false,
+                    reason: "reserve_normalization_zero",
+                    detail: format!(
+                        "pool={:?} reserve0={} reserve1={} token0={:?} token1={:?}",
+                        pool.pair, pool.reserve0, pool.reserve1, pool.token0, pool.token1
+                    ),
+                    gross_edge_usd,
+                    net_edge_usd,
+                    gas_cost_usd,
+                    roi_bps: roi,
+                };
+            }
+            if signal.path.len() >= 2
+                && pool.reserves_for(signal.path[0], signal.path[1]).is_none()
+                && pool.reserves_for(signal.path[1], signal.path[0]).is_none()
+            {
+                return EvValidationReport {
+                    pass: false,
+                    reason: "pool_token_mismatch",
+                    detail: format!(
+                        "pool={:?} token0={:?} token1={:?} path={:?}",
+                        pool.pair, pool.token0, pool.token1, signal.path
+                    ),
+                    gross_edge_usd,
+                    net_edge_usd,
+                    gas_cost_usd,
+                    roi_bps: roi,
+                };
+            }
+        }
+        AmmState::UniswapV3(pool) => {
+            if pool.liquidity.is_zero() {
+                return EvValidationReport {
+                    pass: false,
+                    reason: "v3_liquidity_zero",
+                    detail: format!("pool={:?} liquidity=0", pool.pool),
+                    gross_edge_usd,
+                    net_edge_usd,
+                    gas_cost_usd,
+                    roi_bps: roi,
+                };
+            }
+            if pool.sqrt_price_x96.is_zero() {
+                return EvValidationReport {
+                    pass: false,
+                    reason: "sqrt_price_x96_zero",
+                    detail: format!("pool={:?} sqrtPriceX96=0", pool.pool),
+                    gross_edge_usd,
+                    net_edge_usd,
+                    gas_cost_usd,
+                    roi_bps: roi,
+                };
+            }
+            if let Some(derived_tick) = tick_from_sqrt_price_x96(pool.sqrt_price_x96) {
+                if (derived_tick - pool.current_tick).abs() > 250 {
+                    return EvValidationReport {
+                        pass: false,
+                        reason: "tick_sqrt_price_mismatch",
+                        detail: format!(
+                            "pool={:?} current_tick={} derived_tick={} sqrtPriceX96={}",
+                            pool.pool, pool.current_tick, derived_tick, pool.sqrt_price_x96
+                        ),
+                        gross_edge_usd,
+                        net_edge_usd,
+                        gas_cost_usd,
+                        roi_bps: roi,
+                    };
+                }
+            }
+        }
+    }
+
+    EvValidationReport {
+        pass: true,
+        reason: "ev_validation_pass",
+        detail: format!(
+            "gross_edge_usd={gross_edge_usd:.6} net_edge_usd={net_edge_usd:.6} gas_cost_usd={gas_cost_usd:.6} roi_bps={roi} price_impact_bps={} capital_wei={}",
+            payload.price_impact_bps, payload.capital_committed_wei
+        ),
+        gross_edge_usd,
+        net_edge_usd,
+        gas_cost_usd,
+        roi_bps: roi,
+    }
+}
+
+fn tick_from_sqrt_price_x96(value: U256) -> Option<i32> {
+    let sqrt = value.to_string().parse::<f64>().ok()? / crate::mev::amm::uniswap_v3::Q96_F64;
+    if !sqrt.is_finite() || sqrt <= 0.0 {
+        return None;
+    }
+    let price = sqrt * sqrt;
+    Some((price.ln() / 1.0001_f64.ln()).floor() as i32)
 }
 
 fn passes_scavenger_sanity_gate(
@@ -3546,9 +4098,10 @@ fn adaptive_quote_edge_sample(
     pass: bool,
     override_used: bool,
 ) -> EdgeMetadata {
-    let mut sample = payload.edge_metadata.clone().unwrap_or_else(|| {
-        payload_reject_edge_sample(tx_hash, signal, status, reason, gas_price)
-    });
+    let mut sample = payload
+        .edge_metadata
+        .clone()
+        .unwrap_or_else(|| payload_reject_edge_sample(tx_hash, signal, status, reason, gas_price));
     sample.victim_tx = short_hash(tx_hash);
     sample.selector = selector_hex(signal.selector);
     sample.status = status.to_string();
@@ -3569,10 +4122,7 @@ fn adaptive_quote_edge_sample(
     }
     sample.hops = sample.hops.max(signal.path_len().saturating_sub(1) as u64);
 
-    let gas_native = wei_to_eth_f64(
-        gas_price
-            .saturating_mul(U256::from(payload.gas_limit))
-    );
+    let gas_native = wei_to_eth_f64(gas_price.saturating_mul(U256::from(payload.gas_limit)));
     let gross_native = wei_to_eth_f64(payload.expected_profit_wei);
     let net_after_gas_native = gross_native - gas_native;
     let roi = roi_bps(
@@ -3628,9 +4178,10 @@ fn execution_ready_edge_sample(
     let Some(payload) = payload else {
         return payload_reject_edge_sample(tx_hash, signal, status, reason, gas_price);
     };
-    let mut sample = payload.edge_metadata.clone().unwrap_or_else(|| {
-        payload_reject_edge_sample(tx_hash, signal, status, reason, gas_price)
-    });
+    let mut sample = payload
+        .edge_metadata
+        .clone()
+        .unwrap_or_else(|| payload_reject_edge_sample(tx_hash, signal, status, reason, gas_price));
     sample.victim_tx = short_hash(tx_hash);
     sample.selector = selector_hex(signal.selector);
     sample.status = status.to_string();
@@ -3663,7 +4214,10 @@ fn execution_ready_edge_sample(
         "floor_native=0.000000000000".to_string(),
         format!("edge_minus_floor_native={gross_native:.12}"),
         format!("net_after_gas_native={net_after_gas_native:.12}"),
-        format!("roi_bps={}", roi_bps(payload.expected_profit_wei, gas_cost_wei)),
+        format!(
+            "roi_bps={}",
+            roi_bps(payload.expected_profit_wei, gas_cost_wei)
+        ),
         format!("final_size_wei={}", payload.capital_committed_wei),
         format!("gas_limit={}", payload.gas_limit),
         format!("gas_price_gwei={:.6}", gas_price_gwei(gas_price)),
@@ -3953,6 +4507,99 @@ fn record_payload_pool_shadow(
         liquidity,
         gas_gwei,
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_payload_lifecycle(
+    dashboard: &DashboardHandle,
+    tx_hash: H256,
+    signal: &SwapSignal,
+    payload: &ExecutionPayload,
+    gas_price: U256,
+    status: &str,
+    quote_result: &str,
+    quote_failure_reason: &str,
+    execution_ready_reason: &str,
+    execution_reject_reason: Option<ExecutionRejectReason>,
+    extra_detail: &str,
+) {
+    let gas_cost_wei = gas_price.saturating_mul(U256::from(payload.gas_limit));
+    let gross_edge_native = wei_to_eth_f64(payload.expected_profit_wei);
+    let gas_cost_native = wei_to_eth_f64(gas_cost_wei);
+    let net_edge_native = gross_edge_native - gas_cost_native;
+    let liquidity_depth = payload_pool_liquidity(payload);
+    let payload_id = format!("{}:{}", short_hash(tx_hash), selector_hex(signal.selector));
+    let mut sample = payload.edge_metadata.clone().unwrap_or_else(|| {
+        payload_reject_edge_sample(tx_hash, signal, status, extra_detail, gas_price)
+    });
+    sample.victim_tx = short_hash(tx_hash);
+    sample.selector = selector_hex(signal.selector);
+    sample.status = status.to_string();
+    sample.reason = format!(
+        "payload_id={} quote_result={} quote_failure_reason={} execution_ready_reason={} execution_reject_reason={} {}",
+        payload_id,
+        quote_result,
+        empty_reason(quote_failure_reason),
+        empty_reason(execution_ready_reason),
+        execution_reject_reason
+            .map(ExecutionRejectReason::as_str)
+            .unwrap_or("none"),
+        extra_detail
+    );
+    sample.gas_estimate = payload.gas_limit;
+    sample.simulated_extraction_native = gross_edge_native;
+    sample.gross_edge_wei = payload.expected_profit_wei.to_string();
+    sample.gross_edge_native = gross_edge_native;
+    sample.price_impact_bps = payload.price_impact_bps;
+    sample.pool = format!("{:?}", payload.pair);
+    sample.router = format!("{:?}", signal.router);
+    sample.hops = sample.hops.max(signal.path_len().saturating_sub(1) as u64);
+    if sample.path.is_empty() {
+        sample.path = signal
+            .path
+            .iter()
+            .map(|address| format!("{address:?}"))
+            .collect();
+    }
+    sample.hop_profitability_rank = vec![
+        format!("payload_id={payload_id}"),
+        format!("selector={}", selector_hex(signal.selector)),
+        format!("route_kind={}", sample.route_kind),
+        format!("gross_edge_wei={}", payload.expected_profit_wei),
+        format!("gross_edge_native={gross_edge_native:.12}"),
+        format!("net_edge_native={net_edge_native:.12}"),
+        format!("gas_cost_wei={gas_cost_wei}"),
+        format!("gas_cost_native={gas_cost_native:.12}"),
+        format!("slippage_bps={}", sample.self_slippage_bps),
+        format!("liquidity_depth_native={liquidity_depth:.12}"),
+        format!("price_impact_bps={}", payload.price_impact_bps),
+        format!("quote_result={quote_result}"),
+        format!(
+            "quote_failure_reason={}",
+            empty_reason(quote_failure_reason)
+        ),
+        format!(
+            "execution_ready_reason={}",
+            empty_reason(execution_ready_reason)
+        ),
+        format!(
+            "execution_reject_reason={}",
+            execution_reject_reason
+                .map(ExecutionRejectReason::as_str)
+                .unwrap_or("none")
+        ),
+        format!("confidence_score={:.6}", signal.decode_confidence),
+        extra_detail.to_string(),
+    ];
+    dashboard.record_edge_sample(sample);
+}
+
+fn empty_reason(value: &str) -> &str {
+    if value.trim().is_empty() {
+        "none"
+    } else {
+        value
+    }
 }
 
 fn record_payload_pool_reject(
@@ -4287,15 +4934,9 @@ fn known_target_label(address: Address) -> Option<&'static str> {
         "0xd216153c06e857cd7f72665e0af1d7d82172f494" => {
             Some("unknown_high_frequency_polygon_target")
         }
-        "0x278d858f05b94576c1e6f73285886876ff6ef8d2" => {
-            Some("private_mev_executor_polygon_a")
-        }
-        "0xc37184b6ab8d18be826af019cfa6bb71c6a0ab39" => {
-            Some("private_mev_executor_polygon_b")
-        }
-        "0xab45c5a4b0c941a2f231c04c3f49182e1a254052" => {
-            Some("private_mev_executor_polygon_c")
-        }
+        "0x278d858f05b94576c1e6f73285886876ff6ef8d2" => Some("private_mev_executor_polygon_a"),
+        "0xc37184b6ab8d18be826af019cfa6bb71c6a0ab39" => Some("private_mev_executor_polygon_b"),
+        "0xab45c5a4b0c941a2f231c04c3f49182e1a254052" => Some("private_mev_executor_polygon_c"),
         "0xada100db00ca00073811820692005400218fce1f" => Some("safe_inner_target"),
         _ => None,
     }
@@ -5101,45 +5742,12 @@ fn decode_swap_signal(
             }
         }
         V3_EXACT_INPUT_SINGLE => {
-            let decoded = abi::decode(
-                &[ParamType::Tuple(vec![
-                    ParamType::Address,
-                    ParamType::Address,
-                    ParamType::Uint(24),
-                    ParamType::Address,
-                    ParamType::Uint(256),
-                    ParamType::Uint(256),
-                    ParamType::Uint(256),
-                    ParamType::Uint(160),
-                ])],
-                args,
-            )
-            .ok()?;
-            let params = decoded.first()?;
-            let Token::Tuple(values) = params else {
-                return None;
-            };
-            let token_in = token_as_address(values.first()?)?;
-            let token_out = token_as_address(values.get(1)?)?;
-            let fee_tier = token_as_uint(values.get(2)?)?.as_u32();
-            let amount_in = token_as_uint(values.get(5)?)?;
-            SwapSignal {
-                selector,
-                amount_in,
-                amount_out_min: values.get(6).and_then(token_as_uint),
-                notional_wei: U256::zero(),
-                path: vec![token_in, token_out],
-                router,
-                kind: SwapKind::V3 {
-                    fee_tier,
-                    encoded_path: encode_v3_path(token_out, fee_tier, token_in),
-                    hops: 1,
-                    exact_out: false,
-                },
-                decode_confidence: 1.0,
-                decode_source: "abi",
-            }
+            decode_v3_exact_input_single_with_deadline(selector, router, args)?
         }
+        UNISWAP_V3_EXACT_INPUT_SINGLE_NO_DEADLINE => {
+            decode_v3_exact_input_single_no_deadline(selector, router, args)?
+        }
+        ALGEBRA_EXACT_INPUT_SINGLE => decode_algebra_exact_input_single(selector, router, args)?,
         V3_EXACT_INPUT => {
             let decoded = abi::decode(
                 &[ParamType::Tuple(vec![
@@ -5189,6 +5797,12 @@ fn decode_swap_signal(
         }
         ZERO_EX_SELL_TO_UNISWAP => decode_zero_ex_sell_to_uniswap(selector, router, args)?,
         SAFE_EXEC_TRANSACTION => decode_safe_exec_transaction_swap(router, args, monitored_tokens)?,
+        PRIVATE_SWAP_WRAPPER_2E35732F => {
+            decode_private_swap_wrapper(selector, router, value, args, monitored_tokens)?
+        }
+        POLYMARKET_BATCH_EXECUTE => {
+            decode_batch_execute_nested_swap(selector, router, value, args, monitored_tokens)?
+        }
         _ => decode_known_aggregator_partial(selector, router, value, args, monitored_tokens)?,
     };
     Some(signal)
@@ -5235,6 +5849,241 @@ fn decode_safe_exec_transaction_swap(
             monitored_tokens,
         )
     })
+}
+
+fn decode_v3_exact_input_single_with_deadline(
+    selector: [u8; 4],
+    router: Address,
+    args: &[u8],
+) -> Option<SwapSignal> {
+    let decoded = abi::decode(
+        &[ParamType::Tuple(vec![
+            ParamType::Address,
+            ParamType::Address,
+            ParamType::Uint(24),
+            ParamType::Address,
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Uint(160),
+        ])],
+        args,
+    )
+    .ok()?;
+    let Token::Tuple(values) = decoded.first()? else {
+        return None;
+    };
+    decode_v3_exact_input_single_values(selector, router, values, 5, 6, 1.0, "abi")
+}
+
+fn decode_v3_exact_input_single_no_deadline(
+    selector: [u8; 4],
+    router: Address,
+    args: &[u8],
+) -> Option<SwapSignal> {
+    let decoded = abi::decode(
+        &[ParamType::Tuple(vec![
+            ParamType::Address,
+            ParamType::Address,
+            ParamType::Uint(24),
+            ParamType::Address,
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Uint(160),
+        ])],
+        args,
+    )
+    .ok()?;
+    let Token::Tuple(values) = decoded.first()? else {
+        return None;
+    };
+    decode_v3_exact_input_single_values(
+        selector,
+        router,
+        values,
+        4,
+        5,
+        0.98,
+        "uniswap_v3_exact_input_single_no_deadline",
+    )
+}
+
+fn decode_algebra_exact_input_single(
+    selector: [u8; 4],
+    router: Address,
+    args: &[u8],
+) -> Option<SwapSignal> {
+    let decoded = abi::decode(
+        &[ParamType::Tuple(vec![
+            ParamType::Address,
+            ParamType::Address,
+            ParamType::Address,
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Uint(160),
+        ])],
+        args,
+    )
+    .ok()?;
+    let Token::Tuple(values) = decoded.first()? else {
+        return None;
+    };
+    let token_in = token_as_address(values.first()?)?;
+    let token_out = token_as_address(values.get(1)?)?;
+    let amount_in = token_as_uint(values.get(3)?)?;
+    let fee_tier = 3_000;
+    Some(SwapSignal {
+        selector,
+        amount_in,
+        amount_out_min: values.get(4).and_then(token_as_uint),
+        notional_wei: U256::zero(),
+        path: vec![token_in, token_out],
+        router,
+        kind: SwapKind::V3 {
+            fee_tier,
+            encoded_path: encode_v3_path(token_out, fee_tier, token_in),
+            hops: 1,
+            exact_out: false,
+        },
+        decode_confidence: 0.86,
+        decode_source: "algebra_exact_input_single",
+    })
+}
+
+fn decode_v3_exact_input_single_values(
+    selector: [u8; 4],
+    router: Address,
+    values: &[Token],
+    amount_in_index: usize,
+    amount_out_min_index: usize,
+    confidence: f64,
+    source: &'static str,
+) -> Option<SwapSignal> {
+    let token_in = token_as_address(values.first()?)?;
+    let token_out = token_as_address(values.get(1)?)?;
+    let fee_tier = token_as_uint(values.get(2)?)?.as_u32();
+    let amount_in = token_as_uint(values.get(amount_in_index)?)?;
+    Some(SwapSignal {
+        selector,
+        amount_in,
+        amount_out_min: values.get(amount_out_min_index).and_then(token_as_uint),
+        notional_wei: U256::zero(),
+        path: vec![token_in, token_out],
+        router,
+        kind: SwapKind::V3 {
+            fee_tier,
+            encoded_path: encode_v3_path(token_out, fee_tier, token_in),
+            hops: 1,
+            exact_out: false,
+        },
+        decode_confidence: confidence,
+        decode_source: source,
+    })
+}
+
+fn decode_private_swap_wrapper(
+    selector: [u8; 4],
+    router: Address,
+    value: U256,
+    args: &[u8],
+    monitored_tokens: &[MonitoredTokenConfig],
+) -> Option<SwapSignal> {
+    decode_nested_swap_from_calldata(router, value, args, monitored_tokens).map(|mut signal| {
+        signal.selector = selector;
+        signal.decode_confidence = signal.decode_confidence.min(0.88);
+        signal.decode_source = "private_swap_wrapper_nested";
+        signal
+    })
+}
+
+fn decode_batch_execute_nested_swap(
+    selector: [u8; 4],
+    router: Address,
+    value: U256,
+    args: &[u8],
+    monitored_tokens: &[MonitoredTokenConfig],
+) -> Option<SwapSignal> {
+    let call_array = ParamType::Array(Box::new(ParamType::Tuple(vec![
+        ParamType::Address,
+        ParamType::Uint(256),
+        ParamType::Bytes,
+    ])));
+    if let Ok(decoded) = abi::decode(&[call_array], args) {
+        if let Some(Token::Array(calls)) = decoded.first() {
+            for call in calls {
+                let Token::Tuple(fields) = call else {
+                    continue;
+                };
+                let Some(target) = fields.first().and_then(token_as_address) else {
+                    continue;
+                };
+                let call_value = fields.get(1).and_then(token_as_uint).unwrap_or_default();
+                let Some(Token::Bytes(calldata)) = fields.get(2) else {
+                    continue;
+                };
+                if calldata.len() < 4 {
+                    continue;
+                }
+                let child_selector = [calldata[0], calldata[1], calldata[2], calldata[3]];
+                if let Some(mut signal) = decode_swap_signal(
+                    child_selector,
+                    target,
+                    call_value,
+                    &calldata[4..],
+                    monitored_tokens,
+                ) {
+                    signal.selector = selector;
+                    signal.decode_confidence = signal.decode_confidence.min(0.82);
+                    signal.decode_source = "batch_execute_nested";
+                    return Some(signal);
+                }
+            }
+        }
+    }
+    decode_nested_swap_from_calldata(router, value, args, monitored_tokens).map(|mut signal| {
+        signal.selector = selector;
+        signal.decode_confidence = signal.decode_confidence.min(0.58);
+        signal.decode_source = "batch_execute_selector_scan";
+        signal
+    })
+}
+
+fn decode_nested_swap_from_calldata(
+    router: Address,
+    value: U256,
+    input: &[u8],
+    monitored_tokens: &[MonitoredTokenConfig],
+) -> Option<SwapSignal> {
+    const CHILD_SELECTORS: [[u8; 4]; 5] = [
+        V3_EXACT_INPUT_SINGLE,
+        UNISWAP_V3_EXACT_INPUT_SINGLE_NO_DEADLINE,
+        ALGEBRA_EXACT_INPUT_SINGLE,
+        SWAP_EXACT_TOKENS_FOR_TOKENS,
+        SWAP_EXACT_TOKENS_FOR_TOKENS_SUPPORTING_FEE,
+    ];
+    for offset in 0..input.len().saturating_sub(3) {
+        let child_selector = [
+            input[offset],
+            input[offset + 1],
+            input[offset + 2],
+            input[offset + 3],
+        ];
+        if !CHILD_SELECTORS.contains(&child_selector) {
+            continue;
+        }
+        if let Some(signal) = decode_swap_signal(
+            child_selector,
+            router,
+            value,
+            &input[offset + 4..],
+            monitored_tokens,
+        ) {
+            if path_contains_monitored_token(&signal.path, monitored_tokens) {
+                return Some(signal);
+            }
+        }
+    }
+    None
 }
 
 fn decode_safe_inner_aggregator_partial(
@@ -5333,8 +6182,38 @@ fn decode_known_aggregator_partial(
                     )
                 })
         }
+        PRIVATE_SEARCHER_SELECTOR_D00BA30B => {
+            decode_private_searcher_fingerprint(selector, router, value, args, monitored_tokens)
+        }
         _ => None,
     }
+}
+
+fn decode_private_searcher_fingerprint(
+    selector: [u8; 4],
+    router: Address,
+    value: U256,
+    args: &[u8],
+    monitored_tokens: &[MonitoredTokenConfig],
+) -> Option<SwapSignal> {
+    decode_nested_swap_from_calldata(router, value, args, monitored_tokens)
+        .map(|mut signal| {
+            signal.selector = selector;
+            signal.decode_confidence = signal.decode_confidence.min(0.62);
+            signal.decode_source = "private_searcher_nested_fingerprint";
+            signal
+        })
+        .or_else(|| {
+            decode_partial_swap_from_monitored_tokens(
+                selector,
+                router,
+                value,
+                args,
+                monitored_tokens,
+                0.42,
+                "private_searcher_token_fingerprint",
+            )
+        })
 }
 
 fn decode_swap_exact_eth_for_token_partial(
@@ -6230,11 +7109,18 @@ fn diagnose_decode_reject(
             | SWAP_EXACT_TOKENS_FOR_TOKENS_SUPPORTING_FEE
             | SWAP_EXACT_TOKENS_FOR_ETH_SUPPORTING_FEE
             | V3_EXACT_INPUT_SINGLE
+            | UNISWAP_V3_EXACT_INPUT_SINGLE_NO_DEADLINE
+            | ALGEBRA_EXACT_INPUT_SINGLE
             | V3_EXACT_INPUT
             | UNIVERSAL_ROUTER_EXECUTE
             | UNIVERSAL_ROUTER_EXECUTE_NO_DEADLINE
             | ZERO_EX_SELL_TO_UNISWAP
             | SAFE_EXEC_TRANSACTION
+            | PRIVATE_SEARCHER_SELECTOR_D00BA30B
+            | PRIVATE_SWAP_WRAPPER_2E35732F
+            | POLYMARKET_BATCH_EXECUTE
+            | SAFE_INNER_SELECTOR_9E7212AD
+            | WOOFI_WOORACLE_POST_STATE
             | TRANSIT_SWAP_V5
             | TRANSIT_EXACT_INPUT_V3_SWAP
             | TRANSIT_EXACT_INPUT_V2_SWAP
@@ -6342,6 +7228,19 @@ fn diagnose_decode_reject(
                 ),
             }],
         };
+    }
+
+    if matches!(
+        selector,
+        SAFE_INNER_SELECTOR_9E7212AD | WOOFI_WOORACLE_POST_STATE
+    ) {
+        return diagnose_classified_non_swap(
+            tx,
+            tx_hash,
+            selector,
+            selector_text.as_str(),
+            path_hint,
+        );
     }
 
     if selector == SAFE_EXEC_TRANSACTION {
@@ -6470,6 +7369,50 @@ fn diagnose_balancer_decode(
             "Balancer route detected; current payload builder only supports V2/V3 factory pool discovery".to_string(),
             "blocked before pool discovery to avoid false Uniswap pair paths".to_string(),
         ],
+    }
+}
+
+fn diagnose_classified_non_swap(
+    tx: &Transaction,
+    tx_hash: H256,
+    selector: [u8; 4],
+    selector_text: &str,
+    path_hint: Vec<String>,
+) -> DecodeRejectDiagnostic {
+    let (reason, intent, hint) = match selector {
+        SAFE_INNER_SELECTOR_9E7212AD => (
+            "conditional_tokens_merge",
+            "prediction_market_ctf",
+            "Gnosis/Polymarket mergePositions classified; excluded from AMM quote path",
+        ),
+        WOOFI_WOORACLE_POST_STATE => (
+            "woofi_wooracle_post_state",
+            "oracle_update",
+            "WOOFi Wooracle postState classified; excluded unless WOOFi state simulation is enabled",
+        ),
+        _ => (
+            "classified_non_swap",
+            "non_swap",
+            "selector classified but not replayable as AMM swap",
+        ),
+    };
+    DecodeRejectDiagnostic {
+        reason,
+        detail: format!(
+            "tx={} selector={} to={} intent={} monitored_token_hint={} input_bytes={} calldata_prefix={}",
+            short_hash(tx_hash),
+            selector_text,
+            format_target(tx.to),
+            intent,
+            if path_hint.is_empty() {
+                "none".to_string()
+            } else {
+                path_hint.join(",")
+            },
+            tx.input.as_ref().len(),
+            calldata_prefix_hex(tx.input.as_ref())
+        ),
+        hints: vec![hint.to_string()],
     }
 }
 
@@ -8093,6 +9036,173 @@ mod tests {
             "swap_exact_eth_for_token_path_partial"
         );
         assert!(matches!(signal.kind, SwapKind::V2));
+    }
+
+    #[test]
+    fn uniswap_v3_no_deadline_selector_decodes_exact_input_single() {
+        let router = Address::from_low_u64_be(10);
+        let token_in = Address::from_low_u64_be(1);
+        let token_out = Address::from_low_u64_be(2);
+        let args = encode(&[Token::Tuple(vec![
+            Token::Address(token_in),
+            Token::Address(token_out),
+            Token::Uint(U256::from(500u64)),
+            Token::Address(Address::from_low_u64_be(99)),
+            Token::Uint(U256::from(1_000u64)),
+            Token::Uint(U256::from(900u64)),
+            Token::Uint(U256::zero()),
+        ])]);
+
+        let signal = decode_swap_signal(
+            UNISWAP_V3_EXACT_INPUT_SINGLE_NO_DEADLINE,
+            router,
+            U256::zero(),
+            &args,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(signal.path, vec![token_in, token_out]);
+        assert_eq!(signal.amount_in, U256::from(1_000u64));
+        assert_eq!(signal.amount_out_min, Some(U256::from(900u64)));
+        assert_eq!(
+            signal.decode_source,
+            "uniswap_v3_exact_input_single_no_deadline"
+        );
+    }
+
+    #[test]
+    fn algebra_selector_decodes_exact_input_single() {
+        let router = Address::from_low_u64_be(10);
+        let token_in = Address::from_low_u64_be(1);
+        let token_out = Address::from_low_u64_be(2);
+        let args = encode(&[Token::Tuple(vec![
+            Token::Address(token_in),
+            Token::Address(token_out),
+            Token::Address(Address::from_low_u64_be(99)),
+            Token::Uint(U256::from(1_000u64)),
+            Token::Uint(U256::from(900u64)),
+            Token::Uint(U256::zero()),
+        ])]);
+
+        let signal =
+            decode_swap_signal(ALGEBRA_EXACT_INPUT_SINGLE, router, U256::zero(), &args, &[])
+                .unwrap();
+
+        assert_eq!(signal.path, vec![token_in, token_out]);
+        assert_eq!(signal.amount_in, U256::from(1_000u64));
+        assert_eq!(signal.decode_source, "algebra_exact_input_single");
+    }
+
+    #[test]
+    fn private_swap_wrapper_extracts_nested_v3_selector() {
+        let router = Address::from_low_u64_be(10);
+        let token_in = Address::from_low_u64_be(1);
+        let token_out = Address::from_low_u64_be(2);
+        let nested_args = encode(&[Token::Tuple(vec![
+            Token::Address(token_in),
+            Token::Address(token_out),
+            Token::Uint(U256::from(500u64)),
+            Token::Address(Address::from_low_u64_be(99)),
+            Token::Uint(U256::from(1_000u64)),
+            Token::Uint(U256::from(900u64)),
+            Token::Uint(U256::zero()),
+        ])]);
+        let args = [
+            vec![0u8; 32],
+            UNISWAP_V3_EXACT_INPUT_SINGLE_NO_DEADLINE.to_vec(),
+            nested_args,
+        ]
+        .concat();
+        let monitored = vec![MonitoredTokenConfig {
+            address: token_in,
+            decimals: 18,
+            price_eth: 1.0,
+        }];
+
+        let signal = decode_swap_signal(
+            PRIVATE_SWAP_WRAPPER_2E35732F,
+            router,
+            U256::zero(),
+            &args,
+            &monitored,
+        )
+        .unwrap();
+
+        assert_eq!(signal.selector, PRIVATE_SWAP_WRAPPER_2E35732F);
+        assert_eq!(signal.path, vec![token_in, token_out]);
+        assert_eq!(signal.decode_source, "private_swap_wrapper_nested");
+    }
+
+    #[test]
+    fn batch_execute_expands_child_calls_to_same_registry() {
+        let wallet = Address::from_low_u64_be(20);
+        let router = Address::from_low_u64_be(10);
+        let token_in = Address::from_low_u64_be(1);
+        let token_out = Address::from_low_u64_be(2);
+        let child_args = encode(&[Token::Tuple(vec![
+            Token::Address(token_in),
+            Token::Address(token_out),
+            Token::Uint(U256::from(500u64)),
+            Token::Address(Address::from_low_u64_be(99)),
+            Token::Uint(U256::from(1_000u64)),
+            Token::Uint(U256::from(900u64)),
+            Token::Uint(U256::zero()),
+        ])]);
+        let child_calldata = [
+            UNISWAP_V3_EXACT_INPUT_SINGLE_NO_DEADLINE.to_vec(),
+            child_args,
+        ]
+        .concat();
+        let args = encode(&[Token::Array(vec![Token::Tuple(vec![
+            Token::Address(router),
+            Token::Uint(U256::zero()),
+            Token::Bytes(child_calldata),
+        ])])]);
+
+        let signal =
+            decode_swap_signal(POLYMARKET_BATCH_EXECUTE, wallet, U256::zero(), &args, &[]).unwrap();
+
+        assert_eq!(signal.selector, POLYMARKET_BATCH_EXECUTE);
+        assert_eq!(signal.router, router);
+        assert_eq!(signal.path, vec![token_in, token_out]);
+        assert_eq!(signal.decode_source, "batch_execute_nested");
+    }
+
+    #[test]
+    fn private_searcher_selector_uses_token_fingerprint_without_fake_signature() {
+        let router = Address::from_low_u64_be(10);
+        let usdc: Address = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
+            .parse()
+            .unwrap();
+        let wpol: Address = "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270"
+            .parse()
+            .unwrap();
+        let args = [
+            vec![0u8; 11],
+            usdc.as_bytes().to_vec(),
+            vec![7u8; 9],
+            wpol.as_bytes().to_vec(),
+        ]
+        .concat();
+        let monitored = vec![MonitoredTokenConfig {
+            address: usdc,
+            decimals: 6,
+            price_eth: 0.0003,
+        }];
+
+        let signal = decode_known_aggregator_partial(
+            PRIVATE_SEARCHER_SELECTOR_D00BA30B,
+            router,
+            U256::zero(),
+            &args,
+            &monitored,
+        )
+        .unwrap();
+
+        assert_eq!(signal.selector, PRIVATE_SEARCHER_SELECTOR_D00BA30B);
+        assert_eq!(signal.path, vec![usdc, wpol]);
+        assert_eq!(signal.decode_source, "private_searcher_token_fingerprint");
     }
 
     #[test]
