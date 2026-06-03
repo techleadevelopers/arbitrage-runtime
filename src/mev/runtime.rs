@@ -1603,7 +1603,14 @@ async fn process_evaluation_task(
         if gas_price_gwei > adaptive_cap_gwei {
             candidate.latency_trace.total_internal_us =
                 Some(elapsed_us(candidate.candidate_started));
+            dashboard.record_opportunity_funnel("fast_preflight_reject");
             dashboard.record_reject_reason("gas_price_cap", "victim_gas_price_above_adaptive_cap");
+            record_selector_stage(
+                &dashboard,
+                &candidate.signal,
+                "fast_preflight_reject",
+                candidate.gas_price,
+            );
             dashboard.event(
                 "warn",
                 format!(
@@ -1835,12 +1842,27 @@ async fn process_evaluation_task(
         validate_payload_ev(&config, &payload, &candidate.signal, candidate.gas_price);
     if !ev_validation.pass {
         dashboard.record_opportunity_funnel("ev_validation_failed");
+        dashboard.record_opportunity_funnel("ev_gate_reject");
         dashboard.record_reject_reason("ev_validation", ev_validation.reason);
+        dashboard.record_reject_reason("ev_gate", ev_validation.reason);
         record_selector_stage(
             &dashboard,
             &candidate.signal,
             "ev_validation_failed",
             candidate.gas_price,
+        );
+        record_selector_stage(
+            &dashboard,
+            &candidate.signal,
+            "ev_gate_reject",
+            candidate.gas_price,
+        );
+        record_payload_pool_shadow(
+            &dashboard,
+            &candidate.signal,
+            &payload,
+            false,
+            gas_price_gwei(candidate.gas_price),
         );
         record_payload_lifecycle(
             &dashboard,
