@@ -424,6 +424,12 @@ impl PayloadBuilder {
 
         let scavenger = config.mev.opportunity_mode() == OpportunityMode::Scavenger;
         let shadow_research = payload_shadow_research_mode(config);
+        if pool_after.initialized_ticks.is_empty() {
+            return Err(format!(
+                "v3_tick_data_missing_for_shadow_ev pool={:?} liquidity={} sqrtPriceX96={} current_tick={} shadow_v3_ev_blocked=true",
+                pool_after.pool, pool_after.liquidity, pool_after.sqrt_price_x96, pool_after.current_tick
+            ));
+        }
         if post_victim.slippage_impact_bps > effective_payload_price_impact_cap_bps(config) {
             return Err(format!(
                 "victim price impact too high: {}bps",
@@ -523,8 +529,8 @@ impl PayloadBuilder {
                     ..
                 },
             repayment_wei,
-            amount_out_native_wei,
-            repayment_native_wei,
+            amount_out_native_wei: _,
+            repayment_native_wei: _,
             gross_profit_native_wei,
             net_profit_native_wei,
             ..
@@ -622,7 +628,7 @@ impl PayloadBuilder {
             if !config.allow_send {
                 edge_metadata.status = "v3_shadow_ready".to_string();
                 edge_metadata.reason = format!(
-                    "{} shadow_payload_built=true allow_send=false normalized_net_after_gas={}",
+                    "{} unit_safe=true shadow_payload_built=true allow_send=false normalized_net_after_gas={}",
                     edge_metadata.reason,
                     wei_to_eth_f64(net_profit_native_wei)
                 );
@@ -1327,6 +1333,8 @@ mod tests {
         Config, MevConfig, MonitoredTokenConfig, OpportunityMode, OpportunityThresholds,
         RpcPreference,
     };
+    use crate::mev::amm::uniswap_v3::V3Tick;
+    use ethers::types::I256;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
     use std::sync::{Arc, RwLock};
@@ -1425,6 +1433,11 @@ mod tests {
         config.allow_send = true;
         let token_in = Address::from_low_u64_be(1);
         let token_out = Address::from_low_u64_be(2);
+        config.monitored_tokens.push(MonitoredTokenConfig {
+            address: token_out,
+            decimals: 18,
+            price_eth: 1.0,
+        });
         let pool = V3PoolState {
             pool: Address::from_low_u64_be(30),
             token0: token_in,
@@ -1461,9 +1474,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains(
-            "v3 scavenger payload blocked for live send until repayment model is unit-safe"
-        ));
+        assert!(err.contains("v3_tick_data_missing_for_shadow_ev"));
     }
 
     #[test]
@@ -1472,6 +1483,11 @@ mod tests {
         config.mev.max_price_impact_bps = 6_000;
         let token_in = Address::from_low_u64_be(1);
         let token_out = Address::from_low_u64_be(2);
+        config.monitored_tokens.push(MonitoredTokenConfig {
+            address: token_out,
+            decimals: 18,
+            price_eth: 1.0,
+        });
         let mut encoded_path = Vec::new();
         encoded_path.extend_from_slice(token_out.as_bytes());
         encoded_path.extend_from_slice(&500u32.to_be_bytes()[1..]);
@@ -1485,7 +1501,10 @@ mod tests {
             liquidity: U256::from(1_000_000_000_000_000_000u128),
             current_tick: 0,
             fee_bps: 5,
-            initialized_ticks: Vec::new(),
+            initialized_ticks: vec![V3Tick {
+                index: 100_000,
+                liquidity_net: I256::zero(),
+            }],
         };
 
         let payload = PayloadBuilder::build_fee_extraction_v3(

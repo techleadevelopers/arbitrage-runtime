@@ -1491,7 +1491,9 @@ impl DashboardHandle {
                 }
                 _ => {}
             }
-            entry.expected_profit_sum += expected_profit.max(0.0);
+            if matches!(stage, "shadow_ev_positive" | "partial_shadow_ev_positive") {
+                entry.expected_profit_sum += expected_profit.max(0.0);
+            }
             entry.liquidity_sum += liquidity.max(0.0);
             entry.gas_gwei_sum += gas_gwei.max(0.0);
             entry.samples = entry.samples.saturating_add(1);

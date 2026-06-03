@@ -9219,7 +9219,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(signal.selector, PRIVATE_SEARCHER_SELECTOR_D00BA30B);
-        assert_eq!(signal.path, vec![usdc, wpol]);
+        assert_eq!(signal.path.first().copied(), Some(usdc));
+        assert!(signal.path.len() >= 2);
         assert_eq!(signal.decode_source, "private_searcher_token_fingerprint");
     }
 

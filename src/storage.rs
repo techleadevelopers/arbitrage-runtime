@@ -3199,10 +3199,11 @@ fn build_selector_pool_performance_snapshot(
     gas_gwei_sum: f64,
     last_seen: String,
 ) -> SelectorPoolPerformanceSnapshot {
-    let avg_expected_profit = if total == 0 {
+    let profit_samples = shadow_ev_positive.max(1);
+    let avg_expected_profit = if shadow_ev_positive == 0 {
         0.0
     } else {
-        expected_profit_sum / total as f64
+        expected_profit_sum / profit_samples as f64
     };
     let avg_liquidity = if total == 0 {
         0.0
