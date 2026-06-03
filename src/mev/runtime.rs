@@ -1859,7 +1859,7 @@ async fn process_evaluation_task(
                 "reserve_normalization_zero" | "pool_token_mismatch" | "v3_liquidity_zero" => {
                     ExecutionRejectReason::LowLiquidity
                 }
-                "sqrt_price_x96_zero" | "tick_sqrt_price_mismatch" => {
+                "sqrt_price_x96_zero" | "tick_sqrt_price_mismatch" | "v3_tick_data_missing" => {
                     ExecutionRejectReason::InvalidNormalization
                 }
                 _ => ExecutionRejectReason::EvValidationFailed,
@@ -2958,6 +2958,24 @@ fn validate_payload_ev(
                     pass: false,
                     reason: "v3_liquidity_zero",
                     detail: format!("pool={:?} liquidity=0", pool.pool),
+                    gross_edge_usd,
+                    net_edge_usd,
+                    gas_cost_usd,
+                    roi_bps: roi,
+                };
+            }
+            if pool.initialized_ticks.is_empty() {
+                return EvValidationReport {
+                    pass: false,
+                    reason: "v3_tick_data_missing",
+                    detail: format!(
+                        "pool={:?} liquidity={} sqrtPriceX96={} current_tick={} route_selector={} shadow_v3_ev_blocked=true",
+                        pool.pool,
+                        pool.liquidity,
+                        pool.sqrt_price_x96,
+                        pool.current_tick,
+                        selector_hex(signal.selector)
+                    ),
                     gross_edge_usd,
                     net_edge_usd,
                     gas_cost_usd,

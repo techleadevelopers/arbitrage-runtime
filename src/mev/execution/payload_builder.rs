@@ -533,9 +533,19 @@ impl PayloadBuilder {
             return Err("no positive normalized v3 gross edge".to_string());
         }
         let amount_out_native = token_amount_to_native_f64(config, input.token_in, amount_out)
-            .unwrap_or_else(|| wei_to_eth_f64(amount_out_native_wei));
+            .ok_or_else(|| {
+                format!(
+                    "token normalization failed for v3 output token {:?}: missing decimals/price metadata",
+                    input.token_in
+                )
+            })?;
         let repayment_native = token_amount_to_native_f64(config, input.token_out, repayment_wei)
-            .unwrap_or_else(|| wei_to_eth_f64(repayment_native_wei));
+            .ok_or_else(|| {
+                format!(
+                    "token normalization failed for v3 repayment token {:?}: missing decimals/price metadata",
+                    input.token_out
+                )
+            })?;
         let gross_edge_native = wei_to_eth_f64(gross_profit_native_wei);
 
         let simulated_profit_wei = if shadow_research {
@@ -933,8 +943,10 @@ fn best_v2_edge_metadata(
                 -wei_to_eth_f64(edge_native_wei),
             )
         };
-        let repayment_native = token_amount_to_native_f64(config, input.token_in, repayment)
-            .unwrap_or_else(|| wei_to_eth_f64(repayment));
+        let Some(repayment_native) = token_amount_to_native_f64(config, input.token_in, repayment)
+        else {
+            continue;
+        };
         let self_slippage_bps = crate::mev::amm::uniswap_v2::price_impact_bps(
             amount_in,
             amount_out,
