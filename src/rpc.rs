@@ -350,6 +350,9 @@ impl RpcFleet {
             || lower.contains("dns")
             || lower.contains("econnreset")
             || lower.contains("broken pipe")
+            || lower.contains("eof while parsing")
+            || lower.contains("empty response")
+            || lower.contains("response:")
         {
             RpcFailureKind::Transport
         } else {
@@ -461,7 +464,7 @@ impl RpcFleet {
                 .ok()
                 .and_then(|value| value.trim().parse::<usize>().ok())
                 .unwrap_or(1)
-                .clamp(1, 3)
+                .clamp(1, 6)
                 .min(candidates.len())
         };
         if top_n > 1 {

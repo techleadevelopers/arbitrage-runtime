@@ -471,6 +471,8 @@ pub struct OpportunityFunnelSnapshot {
     pub payload_built: u64,
     pub shadow_payload_built: u64,
     pub payload_reject: u64,
+    pub payload_to_quote_pass: u64,
+    pub payload_to_quote_reject: u64,
     pub ev_gate_pass: u64,
     pub ev_gate_reject: u64,
     pub adaptive_quote_candidate: u64,
@@ -1557,6 +1559,12 @@ impl DashboardHandle {
                 funnel.shadow_payload_built = funnel.shadow_payload_built.saturating_add(1)
             }
             "payload_reject" => funnel.payload_reject = funnel.payload_reject.saturating_add(1),
+            "payload_to_quote_pass" => {
+                funnel.payload_to_quote_pass = funnel.payload_to_quote_pass.saturating_add(1)
+            }
+            "payload_to_quote_reject" => {
+                funnel.payload_to_quote_reject = funnel.payload_to_quote_reject.saturating_add(1)
+            }
             "ev_gate_pass" => funnel.ev_gate_pass = funnel.ev_gate_pass.saturating_add(1),
             "ev_gate_reject" => funnel.ev_gate_reject = funnel.ev_gate_reject.saturating_add(1),
             "adaptive_quote_candidate" => {

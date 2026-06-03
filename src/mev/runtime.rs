@@ -1948,7 +1948,10 @@ async fn process_evaluation_task(
     let economic_payload = config.mev.opportunity_mode() != OpportunityMode::Scavenger
         || scavenger_payload_has_economic_edge(&config, &payload, candidate.gas_price);
     if !economic_payload {
-        dashboard.record_reject_reason("ev_gate", "scavenger_edge_below_economic_floor");
+        dashboard.record_opportunity_funnel("payload_to_quote_reject");
+        dashboard.record_reject_reason("payload_to_quote", "scavenger_edge_below_economic_floor");
+    } else {
+        dashboard.record_opportunity_funnel("payload_to_quote_pass");
     }
     record_payload_pool_shadow(
         &dashboard,
@@ -3769,7 +3772,11 @@ async fn build_payload_with_fallback_parallel(
     block_number: u64,          // NOVO
 ) -> Result<ExecutionPayload, String> {
     let mut join_set = JoinSet::new();
-    let handles = rpc_fleet.read_candidates(payload_build_fanout(&config));
+    let fanout = payload_build_fanout(&config);
+    let mut handles = rpc_fleet.read_candidates(fanout);
+    if handles.is_empty() && payload_builder_unhealthy_rpc_fallback(&config) {
+        handles = rpc_fleet.all_handles().into_iter().take(fanout).collect();
+    }
     if handles.is_empty() {
         return Err(format!(
             "payload_builder_no_rpc_read_candidates route_kind={} amount_in={} path={} block={}",
@@ -3867,15 +3874,21 @@ fn signal_path_label(signal: &SwapSignal) -> String {
 fn payload_build_fanout(config: &Config) -> usize {
     if let Ok(value) = std::env::var("MEV_PAYLOAD_BUILD_FANOUT") {
         if let Ok(parsed) = value.trim().parse::<usize>() {
-            return parsed.clamp(1, 3);
+            return parsed.clamp(1, 6);
         }
     }
 
     if config.mev.opportunity_mode() == OpportunityMode::Scavenger {
-        1
+        3
     } else {
         3
     }
+}
+
+fn payload_builder_unhealthy_rpc_fallback(config: &Config) -> bool {
+    config.mev.opportunity_mode() == OpportunityMode::Scavenger
+        && !config.allow_send
+        && env_bool("MEV_PAYLOAD_BUILD_UNHEALTHY_RPC_FALLBACK", true)
 }
 
 fn compact_payload_errors(errors: Vec<String>) -> String {
@@ -9552,6 +9565,31 @@ mod tests {
 
         unsafe {
             std::env::remove_var("MEV_PRE_DECODE_GAS_CAP_MULTIPLIER");
+        }
+    }
+
+    #[test]
+    fn scavenger_payload_builder_can_widen_rpc_fanout_for_shadow_research() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("MEV_PAYLOAD_BUILD_FANOUT", "6");
+            std::env::set_var("MEV_PAYLOAD_BUILD_UNHEALTHY_RPC_FALLBACK", "true");
+        }
+        let config = Config {
+            mev: crate::config::MevConfig {
+                opportunity_mode: OpportunityMode::Scavenger.as_str().to_string(),
+                ..Default::default()
+            },
+            allow_send: false,
+            ..Default::default()
+        };
+
+        assert_eq!(payload_build_fanout(&config), 6);
+        assert!(payload_builder_unhealthy_rpc_fallback(&config));
+
+        unsafe {
+            std::env::remove_var("MEV_PAYLOAD_BUILD_FANOUT");
+            std::env::remove_var("MEV_PAYLOAD_BUILD_UNHEALTHY_RPC_FALLBACK");
         }
     }
 
