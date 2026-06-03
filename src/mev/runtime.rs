@@ -2232,7 +2232,6 @@ async fn process_evaluation_task(
         }
         candidate.latency_trace.ev_gate_us = Some(elapsed_us(sanity_started));
         candidate.latency_trace.quality_gate_us = Some(0);
-        candidate.latency_trace.adaptive_quote_us = Some(0);
         dashboard.record_opportunity_funnel("ev_gate_pass");
         record_selector_stage(
             &dashboard,
@@ -2240,14 +2239,92 @@ async fn process_evaluation_task(
             "ev_gate_pass",
             candidate.gas_price,
         );
+        let scavenger_quote_started = Instant::now();
         dashboard.record_opportunity_funnel("quote_attempt");
         dashboard.record_opportunity_funnel("adaptive_quote_candidate");
+        let quote_diag = scavenger_war_quote_diagnostic(
+            &config,
+            &payload,
+            &candidate.signal,
+            candidate.gas_price,
+            payload_to_quote_diag
+                .as_ref()
+                .expect("scavenger payload-to-quote diagnostic"),
+        );
+        candidate.latency_trace.adaptive_quote_us = Some(elapsed_us(scavenger_quote_started));
+        if !quote_diag.pass {
+            candidate.latency_trace.total_internal_us =
+                Some(elapsed_us(candidate.candidate_started));
+            dashboard.record_opportunity_funnel("quote_failure");
+            dashboard.record_opportunity_funnel("adaptive_quote_reject");
+            dashboard.record_opportunity_funnel("execution_ready_candidate");
+            dashboard.record_opportunity_funnel("execution_ready_reject");
+            dashboard.record_reject_reason("scavenger_quote", quote_diag.reason);
+            record_selector_stage(
+                &dashboard,
+                &candidate.signal,
+                "adaptive_quote_reject",
+                candidate.gas_price,
+            );
+            dashboard.record_edge_sample(ev_gate_edge_sample(
+                tx_hash,
+                &candidate.signal,
+                &payload,
+                candidate.gas_price,
+                "scavenger_quote_reject",
+                &quote_diag,
+            ));
+            record_payload_lifecycle(
+                &dashboard,
+                tx_hash,
+                &candidate.signal,
+                &payload,
+                candidate.gas_price,
+                "adaptive_quote_reject",
+                "failure",
+                quote_diag.reason,
+                "",
+                Some(match quote_diag.reason {
+                    "scavenger_quote_price_impact_above_cap" => {
+                        ExecutionRejectReason::HighPriceImpact
+                    }
+                    "scavenger_quote_invalid_pool_state" => ExecutionRejectReason::LowLiquidity,
+                    "scavenger_quote_roi_below_min"
+                    | "scavenger_quote_net_after_gas_not_positive"
+                    | "scavenger_quote_edge_below_safety_floor" => {
+                        ExecutionRejectReason::NegativeEdge
+                    }
+                    _ => ExecutionRejectReason::AdaptiveRejected,
+                }),
+                &quote_diag.detail,
+            );
+            dashboard.event(
+                "warn",
+                format!(
+                    "scavenger quote reject tx={} selector={} reason={} gross={:.12} {} safety_gas={:.12} {} required_edge={:.12} {} roi={}bps detail={}",
+                    short_hash(tx_hash),
+                    selector_hex(candidate.signal.selector),
+                    quote_diag.reason,
+                    wei_to_eth_f64(quote_diag.expected_profit_wei),
+                    config.native_asset_symbol(),
+                    wei_to_eth_f64(quote_diag.execution_cost_wei),
+                    config.native_asset_symbol(),
+                    wei_to_eth_f64(quote_diag.min_profit_wei),
+                    config.native_asset_symbol(),
+                    quote_diag.roi_bps,
+                    quote_diag.detail
+                ),
+            );
+            candidate
+                .latency_trace
+                .emit(&config, &dashboard, tx_hash, "reject", quote_diag.reason);
+            return None;
+        }
         dashboard.record_opportunity_funnel("quote_success");
         dashboard.record_opportunity_funnel("adaptive_quote_pass");
         dashboard.record_opportunity_funnel("execution_ready_candidate");
 
-        let expected_profit_usd =
-            wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price;
+        let expected_profit_usd = quote_diag.net_ev_usd.max(0.0);
         let opportunity = build_opportunity(&candidate.tx, &candidate.signal, payload, None);
         let capital_efficiency = opportunity
             .execution_payload
@@ -3269,6 +3346,93 @@ fn scavenger_economic_edge_diagnostic(
         net_ev_usd: wei_to_eth_f64(payload.expected_profit_wei.saturating_sub(gas_cost_wei))
             * config.mev.eth_usd_price,
         roi_bps: roi_bps(payload.expected_profit_wei, gas_cost_wei),
+    }
+}
+
+fn scavenger_war_quote_diagnostic(
+    config: &Config,
+    payload: &crate::mev::execution::payload_builder::ExecutionPayload,
+    signal: &SwapSignal,
+    gas_price: U256,
+    economic: &GateDiagnostic,
+) -> GateDiagnostic {
+    let safety_gas_cost_wei = gas_price
+        .saturating_mul(U256::from(payload.gas_limit))
+        .saturating_mul(U256::from(config.mev.gas_safety_margin_bps))
+        / U256::from(10_000u64);
+    let economic_floor_wei = economic
+        .min_profit_wei
+        .saturating_sub(economic.execution_cost_wei);
+    let required_edge = safety_gas_cost_wei.saturating_add(economic_floor_wei);
+    let net_after_safety_gas = payload
+        .expected_profit_wei
+        .saturating_sub(safety_gas_cost_wei);
+    let roi = roi_bps(payload.expected_profit_wei, safety_gas_cost_wei);
+    let min_roi = config.mev.effective_min_roi_bps();
+
+    let pool_state_valid = match &payload.pool_state_before {
+        AmmState::UniswapV2(pool) => {
+            !pool.reserve0.is_zero()
+                && !pool.reserve1.is_zero()
+                && signal.path.len() >= 2
+                && (pool.reserves_for(signal.path[0], signal.path[1]).is_some()
+                    || pool.reserves_for(signal.path[1], signal.path[0]).is_some())
+        }
+        AmmState::UniswapV3(pool) => {
+            !pool.liquidity.is_zero()
+                && !pool.sqrt_price_x96.is_zero()
+                && !pool.initialized_ticks.is_empty()
+        }
+    };
+
+    let pass = economic.pass
+        && pool_state_valid
+        && payload.expected_profit_wei > safety_gas_cost_wei
+        && payload.expected_profit_wei >= required_edge
+        && roi >= min_roi
+        && payload.price_impact_bps <= scavenger_quality_price_impact_cap_bps(config);
+
+    let reason = if !economic.pass {
+        economic.reason
+    } else if !pool_state_valid {
+        "scavenger_quote_invalid_pool_state"
+    } else if payload.expected_profit_wei <= safety_gas_cost_wei {
+        "scavenger_quote_net_after_gas_not_positive"
+    } else if payload.expected_profit_wei < required_edge {
+        "scavenger_quote_edge_below_safety_floor"
+    } else if roi < min_roi {
+        "scavenger_quote_roi_below_min"
+    } else if payload.price_impact_bps > scavenger_quality_price_impact_cap_bps(config) {
+        "scavenger_quote_price_impact_above_cap"
+    } else {
+        "scavenger_quote_pass"
+    };
+
+    GateDiagnostic {
+        pass,
+        reason,
+        detail: format!(
+            "expected_profit_wei={} required_edge_wei={} safety_gas_cost_wei={} economic_floor_wei={} raw_gas_cost_wei={} gas_safety_margin_bps={} net_after_safety_gas_wei={} roi_bps={} min_roi_bps={} price_impact_bps={} impact_cap_bps={} pool_state_valid={} economic_reason={} economic_detail={}",
+            payload.expected_profit_wei,
+            required_edge,
+            safety_gas_cost_wei,
+            economic_floor_wei,
+            economic.execution_cost_wei,
+            config.mev.gas_safety_margin_bps,
+            net_after_safety_gas,
+            roi,
+            min_roi,
+            payload.price_impact_bps,
+            scavenger_quality_price_impact_cap_bps(config),
+            pool_state_valid,
+            economic.reason,
+            economic.detail
+        ),
+        expected_profit_wei: payload.expected_profit_wei,
+        execution_cost_wei: safety_gas_cost_wei,
+        min_profit_wei: required_edge,
+        net_ev_usd: wei_to_eth_f64(net_after_safety_gas) * config.mev.eth_usd_price,
+        roi_bps: roi,
     }
 }
 
