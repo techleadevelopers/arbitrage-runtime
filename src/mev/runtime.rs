@@ -79,6 +79,8 @@ const POLYMARKET_BATCH_EXECUTE: [u8; 4] = [0x02, 0x3e, 0x8d, 0x84];
 const WOOFI_WOORACLE_POST_STATE: [u8; 4] = [0x71, 0xea, 0x92, 0x05];
 const UNISWAP_V3_EXACT_INPUT_SINGLE_NO_DEADLINE: [u8; 4] = [0x04, 0xe4, 0x5a, 0xaf];
 const ALGEBRA_EXACT_INPUT_SINGLE: [u8; 4] = [0xbc, 0x65, 0x11, 0x88];
+const MULTICALL_BYTES: [u8; 4] = [0xac, 0x96, 0x50, 0xd8];
+const MULTICALL_DEADLINE_BYTES: [u8; 4] = [0x5a, 0xe4, 0x01, 0xdc];
 const CONTEXT_WRAP_SELECTOR: [u8; 4] = [0x62, 0x35, 0x56, 0x38];
 const ENTRYPOINT_HANDLE_OPS: [u8; 4] = [0x76, 0x5e, 0x82, 0x7f];
 const SELECTOR_NOISE_00000008: [u8; 4] = [0x00, 0x00, 0x00, 0x08];
@@ -3880,6 +3882,8 @@ fn human_payload_error(error: &str) -> String {
         "no RPC builder available"
     } else if lower.contains("payload_builder_no_result") {
         "payload builder returned no result"
+    } else if lower.contains("v3_tick_data_missing_for_shadow_ev") {
+        "v3 tick data missing"
     } else if lower.contains("no positive gross") {
         "no exploitable micro edge"
     } else if lower.contains("no roi-positive") {
@@ -3945,6 +3949,8 @@ fn payload_error_detail(error: &str, signal: &SwapSignal) -> String {
         "payload_builder_no_result"
     } else if lower.contains("victim price impact too high") {
         "victim_price_impact_too_high"
+    } else if lower.contains("v3_tick_data_missing_for_shadow_ev") {
+        "v3_tick_data_missing_for_shadow_ev"
     } else if lower.contains("no positive gross") {
         "economic_no_positive_gross_edge"
     } else if lower.contains("no roi-positive") {
@@ -5837,6 +5843,9 @@ fn decode_swap_signal(
         }
         ZERO_EX_SELL_TO_UNISWAP => decode_zero_ex_sell_to_uniswap(selector, router, args)?,
         SAFE_EXEC_TRANSACTION => decode_safe_exec_transaction_swap(router, args, monitored_tokens)?,
+        MULTICALL_BYTES | MULTICALL_DEADLINE_BYTES => {
+            decode_multicall_nested_swap(selector, router, value, args, monitored_tokens)?
+        }
         PRIVATE_SWAP_WRAPPER_2E35732F => {
             decode_private_swap_wrapper(selector, router, value, args, monitored_tokens)?
         }
@@ -6018,6 +6027,64 @@ fn decode_v3_exact_input_single_values(
         },
         decode_confidence: confidence,
         decode_source: source,
+    })
+}
+
+fn decode_multicall_nested_swap(
+    selector: [u8; 4],
+    router: Address,
+    value: U256,
+    args: &[u8],
+    monitored_tokens: &[MonitoredTokenConfig],
+) -> Option<SwapSignal> {
+    let calls = if selector == MULTICALL_BYTES {
+        let decoded = abi::decode(&[ParamType::Array(Box::new(ParamType::Bytes))], args).ok()?;
+        match decoded.first()? {
+            Token::Array(values) => values.clone(),
+            _ => return None,
+        }
+    } else {
+        let decoded = abi::decode(
+            &[
+                ParamType::Uint(256),
+                ParamType::Array(Box::new(ParamType::Bytes)),
+            ],
+            args,
+        )
+        .ok()?;
+        match decoded.get(1)? {
+            Token::Array(values) => values.clone(),
+            _ => return None,
+        }
+    };
+
+    for call in calls {
+        let Token::Bytes(calldata) = call else {
+            continue;
+        };
+        if calldata.len() < 4 {
+            continue;
+        }
+        let child_selector = [calldata[0], calldata[1], calldata[2], calldata[3]];
+        if let Some(mut signal) = decode_swap_signal(
+            child_selector,
+            router,
+            value,
+            &calldata[4..],
+            monitored_tokens,
+        ) {
+            signal.selector = selector;
+            signal.decode_confidence = signal.decode_confidence.min(0.92);
+            signal.decode_source = "multicall_nested";
+            return Some(signal);
+        }
+    }
+
+    decode_nested_swap_from_calldata(router, value, args, monitored_tokens).map(|mut signal| {
+        signal.selector = selector;
+        signal.decode_confidence = signal.decode_confidence.min(0.68);
+        signal.decode_source = "multicall_selector_scan";
+        signal
     })
 }
 
@@ -7156,6 +7223,8 @@ fn diagnose_decode_reject(
             | UNIVERSAL_ROUTER_EXECUTE_NO_DEADLINE
             | ZERO_EX_SELL_TO_UNISWAP
             | SAFE_EXEC_TRANSACTION
+            | MULTICALL_BYTES
+            | MULTICALL_DEADLINE_BYTES
             | PRIVATE_SEARCHER_SELECTOR_D00BA30B
             | PRIVATE_SWAP_WRAPPER_2E35732F
             | POLYMARKET_BATCH_EXECUTE
@@ -9207,6 +9276,35 @@ mod tests {
         assert_eq!(signal.router, router);
         assert_eq!(signal.path, vec![token_in, token_out]);
         assert_eq!(signal.decode_source, "batch_execute_nested");
+    }
+
+    #[test]
+    fn multicall_bytes_expands_child_calls_to_same_registry() {
+        let router = Address::from_low_u64_be(10);
+        let token_in = Address::from_low_u64_be(1);
+        let token_out = Address::from_low_u64_be(2);
+        let child_args = encode(&[Token::Tuple(vec![
+            Token::Address(token_in),
+            Token::Address(token_out),
+            Token::Uint(U256::from(500u64)),
+            Token::Address(Address::from_low_u64_be(99)),
+            Token::Uint(U256::from(1_000u64)),
+            Token::Uint(U256::from(900u64)),
+            Token::Uint(U256::zero()),
+        ])]);
+        let child_calldata = [
+            UNISWAP_V3_EXACT_INPUT_SINGLE_NO_DEADLINE.to_vec(),
+            child_args,
+        ]
+        .concat();
+        let args = encode(&[Token::Array(vec![Token::Bytes(child_calldata)])]);
+
+        let signal = decode_swap_signal(MULTICALL_BYTES, router, U256::zero(), &args, &[]).unwrap();
+
+        assert_eq!(signal.selector, MULTICALL_BYTES);
+        assert_eq!(signal.router, router);
+        assert_eq!(signal.path, vec![token_in, token_out]);
+        assert_eq!(signal.decode_source, "multicall_nested");
     }
 
     #[test]
