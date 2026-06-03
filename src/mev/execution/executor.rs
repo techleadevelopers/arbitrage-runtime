@@ -568,6 +568,7 @@ impl ExecutionEngine {
                             ),
                         );
                         self.dashboard.record_opportunity_funnel("submit_succeeded");
+                        self.dashboard.record_reject_reason("submit", "rpc_submit_succeeded");
                         submit_set.abort_all();
                         let realized = self
                             .observe_realized_pnl(
@@ -622,6 +623,14 @@ impl ExecutionEngine {
                         self.rpc_fleet
                             .record_failure(endpoint_id, RpcFleet::classify_failure(&err_text));
                         self.dashboard.record_opportunity_funnel("submit_failed");
+                        self.dashboard.record_reject_reason(
+                            "submit",
+                            if is_insufficient_funds_error(&err_text) {
+                                "rpc_submit_insufficient_funds"
+                            } else {
+                                "rpc_submit_failed"
+                            },
+                        );
                         last_submit_error = Some(err_text);
                     }
                 }
@@ -705,6 +714,7 @@ impl ExecutionEngine {
                         inclusion_rate: Some(relay.inclusion_rate),
                     });
                     self.dashboard.record_opportunity_funnel("submit_succeeded");
+                    self.dashboard.record_reject_reason("submit", "relay_submit_succeeded");
                     self.dashboard.record_latency(
                         "fee_bundle_submit",
                         submit_latency_ms as u128,
@@ -751,6 +761,8 @@ impl ExecutionEngine {
                 }
                 Err((relay, submit_latency_ms, err_text)) => {
                     self.dashboard.record_opportunity_funnel("submit_failed");
+                    self.dashboard
+                        .record_reject_reason("submit", "relay_submit_failed");
                     warn!(
                         "fee extraction bundle failed via {}: {}",
                         relay.relay, err_text

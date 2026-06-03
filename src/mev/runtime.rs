@@ -2013,7 +2013,9 @@ async fn process_evaluation_task(
         candidate.latency_trace.quality_gate_us = Some(0);
         candidate.latency_trace.adaptive_quote_us = Some(0);
         dashboard.record_opportunity_funnel("ev_gate_pass");
+        dashboard.record_opportunity_funnel("adaptive_quote_candidate");
         dashboard.record_opportunity_funnel("adaptive_quote_pass");
+        dashboard.record_opportunity_funnel("execution_ready_candidate");
 
         let expected_profit_usd =
             wei_to_eth_f64(payload.expected_profit_wei) * config.mev.eth_usd_price;
@@ -2037,6 +2039,17 @@ async fn process_evaluation_task(
             "scavenger_sanity_fast_path",
         );
         dashboard.record_opportunity_funnel("execution_ready");
+        dashboard.record_edge_sample(execution_ready_edge_sample(
+            tx_hash,
+            &candidate.signal,
+            opportunity.execution_payload.as_ref(),
+            candidate.gas_price,
+            "execution_ready",
+            "scavenger_sanity_fast_path",
+            expected_profit_usd,
+            1.0,
+            "scavenger",
+        ));
         dashboard.event(
             "info",
             format!(
@@ -2126,6 +2139,8 @@ async fn process_evaluation_task(
     if !quality_diag.pass {
         candidate.latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        dashboard.record_opportunity_funnel("execution_ready_candidate");
+        dashboard.record_opportunity_funnel("execution_ready_reject");
         dashboard.record_reject_reason("quality_gate", quality_diag.reason);
         dashboard.record_edge_sample(ev_gate_edge_sample(
             tx_hash,
@@ -2143,6 +2158,7 @@ async fn process_evaluation_task(
     candidate.latency_trace.quality_gate_us = Some(elapsed_us(quality_gate_started));
 
     let adaptive_quote_started = Instant::now();
+    dashboard.record_opportunity_funnel("adaptive_quote_candidate");
     let quote = if let Ok(mut model) = adaptive.lock() {
         model.quote_for_relays(
             AdaptiveQuoteInput {
@@ -2162,6 +2178,29 @@ async fn process_evaluation_task(
             &config.builder_relays,
         )
     } else {
+        candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
+        dashboard.record_opportunity_funnel("adaptive_quote_error");
+        dashboard.record_opportunity_funnel("execution_ready_candidate");
+        dashboard.record_opportunity_funnel("execution_ready_reject");
+        dashboard.record_reject_reason("adaptive", "adaptive_model_lock_failed");
+        dashboard.record_edge_sample(adaptive_quote_edge_sample(
+            tx_hash,
+            &candidate.signal,
+            &payload,
+            candidate.gas_price,
+            "adaptive_quote_error",
+            None,
+            "adaptive_model_lock_failed",
+            false,
+            false,
+        ));
+        candidate.latency_trace.emit(
+            &config,
+            &dashboard,
+            tx_hash,
+            "reject",
+            "adaptive_model_lock_failed",
+        );
         return None;
     };
     candidate.latency_trace.adaptive_quote_us = Some(elapsed_us(adaptive_quote_started));
@@ -2171,9 +2210,22 @@ async fn process_evaluation_task(
     if !quote.should_execute && !mode_override {
         candidate.latency_trace.total_internal_us = Some(elapsed_us(candidate.candidate_started));
         dashboard.record_opportunity_funnel("adaptive_quote_reject");
+        dashboard.record_opportunity_funnel("execution_ready_candidate");
+        dashboard.record_opportunity_funnel("execution_ready_reject");
         if let Some(reason) = quote.reject_reason {
             dashboard.record_reject_reason("adaptive", reason);
         }
+        dashboard.record_edge_sample(adaptive_quote_edge_sample(
+            tx_hash,
+            &candidate.signal,
+            &payload,
+            candidate.gas_price,
+            "adaptive_quote_reject",
+            Some(&quote),
+            quote.reject_reason.as_deref().unwrap_or("adaptive_reject"),
+            false,
+            mode_override,
+        ));
         candidate.latency_trace.emit(
             &config,
             &dashboard,
@@ -2184,6 +2236,21 @@ async fn process_evaluation_task(
         return None;
     }
     dashboard.record_opportunity_funnel("adaptive_quote_pass");
+    dashboard.record_edge_sample(adaptive_quote_edge_sample(
+        tx_hash,
+        &candidate.signal,
+        &payload,
+        candidate.gas_price,
+        "adaptive_quote_pass",
+        Some(&quote),
+        if mode_override && !quote.should_execute {
+            "adaptive_override"
+        } else {
+            "adaptive_pass"
+        },
+        true,
+        mode_override,
+    ));
     if !quote.should_execute && mode_override {
         if config.mev.opportunity_mode() != OpportunityMode::Scavenger {
             dashboard.event(
@@ -2247,7 +2314,19 @@ async fn process_evaluation_task(
         "execution_ready",
         "adaptive_passed",
     );
+    dashboard.record_opportunity_funnel("execution_ready_candidate");
     dashboard.record_opportunity_funnel("execution_ready");
+    dashboard.record_edge_sample(execution_ready_edge_sample(
+        tx_hash,
+        &candidate.signal,
+        opportunity.execution_payload.as_ref(),
+        candidate.gas_price,
+        "execution_ready",
+        "adaptive_passed",
+        quote.ev_real_usd,
+        quote.p_positive,
+        quote.selected_relay.as_deref().unwrap_or("unknown"),
+    ));
 
     Some(PendingExecutionCandidate {
         opportunity,
@@ -3440,6 +3519,145 @@ fn ev_gate_edge_sample(
         format!("net_ev_usd={:.6}", diagnostic.net_ev_usd),
         format!("roi_bps={}", diagnostic.roi_bps),
         diagnostic.detail.clone(),
+    ];
+    sample
+}
+
+fn adaptive_quote_edge_sample(
+    tx_hash: H256,
+    signal: &SwapSignal,
+    payload: &ExecutionPayload,
+    gas_price: U256,
+    status: &str,
+    quote: Option<&crate::mev::adaptive::AdaptiveQuote>,
+    reason: &str,
+    pass: bool,
+    override_used: bool,
+) -> EdgeMetadata {
+    let mut sample = payload.edge_metadata.clone().unwrap_or_else(|| {
+        payload_reject_edge_sample(tx_hash, signal, status, reason, gas_price)
+    });
+    sample.victim_tx = short_hash(tx_hash);
+    sample.selector = selector_hex(signal.selector);
+    sample.status = status.to_string();
+    sample.reason = reason.to_string();
+    sample.gas_estimate = payload.gas_limit;
+    sample.simulated_extraction_native = wei_to_eth_f64(payload.expected_profit_wei);
+    sample.gross_edge_wei = payload.expected_profit_wei.to_string();
+    sample.gross_edge_native = wei_to_eth_f64(payload.expected_profit_wei);
+    sample.price_impact_bps = payload.price_impact_bps;
+    sample.pool = format!("{:?}", payload.pair);
+    sample.router = format!("{:?}", signal.router);
+    if sample.path.is_empty() {
+        sample.path = signal
+            .path
+            .iter()
+            .map(|address| format!("{address:?}"))
+            .collect();
+    }
+    sample.hops = sample.hops.max(signal.path_len().saturating_sub(1) as u64);
+
+    let gas_native = wei_to_eth_f64(
+        gas_price
+            .saturating_mul(U256::from(payload.gas_limit))
+    );
+    let gross_native = wei_to_eth_f64(payload.expected_profit_wei);
+    let net_after_gas_native = gross_native - gas_native;
+    let roi = roi_bps(
+        payload.expected_profit_wei,
+        gas_price.saturating_mul(U256::from(payload.gas_limit)),
+    );
+
+    let mut rank = vec![
+        format!("gate_reason={reason}"),
+        format!("quote_pass={pass}"),
+        format!("override_used={override_used}"),
+        format!("gross_edge_native={gross_native:.12}"),
+        format!("gas_cost_native={gas_native:.12}"),
+        "floor_native=0.000000000000".to_string(),
+        format!("edge_minus_floor_native={gross_native:.12}"),
+        format!("net_after_gas_native={net_after_gas_native:.12}"),
+        format!("roi_bps={roi}"),
+        format!("gas_limit={}", payload.gas_limit),
+        format!("gas_price_gwei={:.6}", gas_price_gwei(gas_price)),
+    ];
+    if let Some(quote) = quote {
+        rank.extend([
+            format!("quote_ev_real_usd={:.6}", quote.ev_real_usd),
+            format!("quote_threshold_usd={:.6}", quote.threshold_dynamic_usd),
+            format!("quote_p_positive={:.6}", quote.p_positive),
+            format!("quote_competition_score={:.6}", quote.competition_score),
+            format!("quote_risk_score={:.6}", quote.risk_score),
+            format!("quote_builder_pressure={:.6}", quote.builder_pressure),
+            format!("quote_gas_pressure={:.6}", quote.gas_pressure),
+            format!(
+                "quote_selected_relay={}",
+                quote.selected_relay.as_deref().unwrap_or("unknown")
+            ),
+            format!("quote_regime={}", quote.regime.as_str()),
+        ]);
+    }
+    sample.hop_profitability_rank = rank;
+    sample
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execution_ready_edge_sample(
+    tx_hash: H256,
+    signal: &SwapSignal,
+    payload: Option<&ExecutionPayload>,
+    gas_price: U256,
+    status: &str,
+    reason: &str,
+    ev_real_usd: f64,
+    confidence: f64,
+    selected_path: &str,
+) -> EdgeMetadata {
+    let Some(payload) = payload else {
+        return payload_reject_edge_sample(tx_hash, signal, status, reason, gas_price);
+    };
+    let mut sample = payload.edge_metadata.clone().unwrap_or_else(|| {
+        payload_reject_edge_sample(tx_hash, signal, status, reason, gas_price)
+    });
+    sample.victim_tx = short_hash(tx_hash);
+    sample.selector = selector_hex(signal.selector);
+    sample.status = status.to_string();
+    sample.reason = reason.to_string();
+    sample.gas_estimate = payload.gas_limit;
+    sample.simulated_extraction_native = wei_to_eth_f64(payload.expected_profit_wei);
+    sample.gross_edge_wei = payload.expected_profit_wei.to_string();
+    sample.gross_edge_native = wei_to_eth_f64(payload.expected_profit_wei);
+    sample.price_impact_bps = payload.price_impact_bps;
+    sample.pool = format!("{:?}", payload.pair);
+    sample.router = format!("{:?}", signal.router);
+    if sample.path.is_empty() {
+        sample.path = signal
+            .path
+            .iter()
+            .map(|address| format!("{address:?}"))
+            .collect();
+    }
+    sample.hops = sample.hops.max(signal.path_len().saturating_sub(1) as u64);
+
+    let gas_cost_wei = gas_price.saturating_mul(U256::from(payload.gas_limit));
+    let gross_native = wei_to_eth_f64(payload.expected_profit_wei);
+    let gas_native = wei_to_eth_f64(gas_cost_wei);
+    let net_after_gas_native = gross_native - gas_native;
+    sample.hop_profitability_rank = vec![
+        format!("gate_reason={reason}"),
+        format!("ready_reason={reason}"),
+        format!("final_gross_native={gross_native:.12}"),
+        format!("gas_cost_native={gas_native:.12}"),
+        "floor_native=0.000000000000".to_string(),
+        format!("edge_minus_floor_native={gross_native:.12}"),
+        format!("net_after_gas_native={net_after_gas_native:.12}"),
+        format!("roi_bps={}", roi_bps(payload.expected_profit_wei, gas_cost_wei)),
+        format!("final_size_wei={}", payload.capital_committed_wei),
+        format!("gas_limit={}", payload.gas_limit),
+        format!("gas_price_gwei={:.6}", gas_price_gwei(gas_price)),
+        format!("ev_real_usd={ev_real_usd:.6}"),
+        format!("confidence={confidence:.6}"),
+        format!("selected_path={selected_path}"),
     ];
     sample
 }

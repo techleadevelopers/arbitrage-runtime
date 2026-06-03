@@ -465,9 +465,13 @@ pub struct OpportunityFunnelSnapshot {
     pub payload_reject: u64,
     pub ev_gate_pass: u64,
     pub ev_gate_reject: u64,
+    pub adaptive_quote_candidate: u64,
     pub adaptive_quote_pass: u64,
     pub adaptive_quote_reject: u64,
+    pub adaptive_quote_error: u64,
+    pub execution_ready_candidate: u64,
     pub execution_ready: u64,
+    pub execution_ready_reject: u64,
     pub submit_attempted: u64,
     pub submit_succeeded: u64,
     pub submit_failed: u64,
@@ -1542,13 +1546,25 @@ impl DashboardHandle {
             "payload_reject" => funnel.payload_reject = funnel.payload_reject.saturating_add(1),
             "ev_gate_pass" => funnel.ev_gate_pass = funnel.ev_gate_pass.saturating_add(1),
             "ev_gate_reject" => funnel.ev_gate_reject = funnel.ev_gate_reject.saturating_add(1),
+            "adaptive_quote_candidate" => {
+                funnel.adaptive_quote_candidate = funnel.adaptive_quote_candidate.saturating_add(1)
+            }
             "adaptive_quote_pass" => {
                 funnel.adaptive_quote_pass = funnel.adaptive_quote_pass.saturating_add(1)
             }
             "adaptive_quote_reject" => {
                 funnel.adaptive_quote_reject = funnel.adaptive_quote_reject.saturating_add(1)
             }
+            "adaptive_quote_error" => {
+                funnel.adaptive_quote_error = funnel.adaptive_quote_error.saturating_add(1)
+            }
+            "execution_ready_candidate" => {
+                funnel.execution_ready_candidate = funnel.execution_ready_candidate.saturating_add(1)
+            }
             "execution_ready" => funnel.execution_ready = funnel.execution_ready.saturating_add(1),
+            "execution_ready_reject" => {
+                funnel.execution_ready_reject = funnel.execution_ready_reject.saturating_add(1)
+            }
             "submit_attempted" => {
                 funnel.submit_attempted = funnel.submit_attempted.saturating_add(1)
             }
